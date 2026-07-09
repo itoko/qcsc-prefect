@@ -299,3 +299,19 @@ class FlowParameters(BaseModel):
         ),
         title="OO Re-solve RDMs (rigorous, self-consistent)",
     )
+    oo_resolve_maxdim: int = Field(
+        default=4_000_000,
+        description=(
+            "Max CI subspace size (net alpha*beta configurations) used for the in-process "
+            "solve_fermion re-solves when oo_resolve_rdms=True. A full production subspace "
+            "(millions of configs) makes each dense selected-CI re-solve minutes-to-hours; since "
+            "the orbital rotation is well-determined by the dominant low-excitation determinants, "
+            "the orbitals are converged on a truncated subspace of ~sqrt(oo_resolve_maxdim) "
+            "determinants per spin (ranked by excitation level from HF) and the resulting rotated "
+            "basis is applied to the full SQD run. Standard MCSCF active-space economy. Default "
+            "4e6 (~2000 dets/spin -> seconds per re-solve). Raise for more accuracy, lower for "
+            "speed; set to a huge value to effectively disable truncation."
+        ),
+        title="OO Re-solve Max Subspace",
+        ge=1,
+    )

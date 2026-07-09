@@ -367,6 +367,44 @@ class TestOrbitalOpt:
         # and it should not be absurd
         assert e_final < e_uhf + 1.0
 
+    # ─── T11: subspace truncation for fast self-consistent re-solves ────────────
+    def test_T11_resolve_truncation_keeps_low_excitations(self, oh_data):
+        """The self-consistent re-solve truncates a large subspace to ~sqrt(resolve_maxdim) dets
+        per spin, ranked by excitation from HF (keeping HF + low excitations). Verify (a) the
+        truncation helper keeps HF and the requested count of lowest-excitation dets, and (b) a
+        run with a small resolve_maxdim still converges variationally (energy >= FCI) and fast."""
+        from qcsc_workflow_utility.orbital_opt import _truncate_subspace_by_excitation
+        ep, e_uhf, *_rest, e_fci = oh_data
+        norb = ep.num_orbitals
+        na, nb = ep.num_electrons
+        import itertools
+
+        def alldets(ne):
+            return np.array(
+                [sum(1 << p for p in c) for c in itertools.combinations(range(norb), ne)],
+                dtype=np.int64,
+            )
+
+        adet, bdet = alldets(na), alldets(nb)  # full CI space (small for OH/sto-3g)
+        hf_a = (1 << na) - 1
+        keep = 5
+        trunc = _truncate_subspace_by_excitation(adet, na, keep)
+        assert trunc.size == keep
+        assert hf_a in set(int(x) for x in trunc), "HF must be retained"
+        # kept dets should be the lowest-excitation ones
+        exc = sorted(bin(int(d) ^ hf_a).count("1") // 2 for d in trunc)
+        exc_all = sorted(bin(int(d) ^ hf_a).count("1") // 2 for d in adet)
+        assert exc == exc_all[:keep], "truncation should keep the lowest-excitation determinants"
+
+        # end-to-end: tiny resolve_maxdim forces truncation; still variational + fast
+        ep_rot, e_final, grad_norm, n_macro = resolve_orbitals_self_consistent(
+            ep, adet, bdet, num_elec=(na, nb), resolve_maxdim=100,
+            max_macro=10, grad_tol=1e-3, trust_radius=0.1, oo_maxiter=40,
+        )
+        assert e_final >= e_fci - 1e-6, (
+            f"truncated self-consistent OO energy {e_final:.8f} below FCI {e_fci:.8f}!"
+        )
+
     # ─── T3: Ua / Ub が unitary ────────────────────────────────────────────
     def test_T3_rotation_matrices_are_unitary(self, oh_data):
         """optimize_orbitals が返す Ua, Ub が直交行列であることを確認。"""

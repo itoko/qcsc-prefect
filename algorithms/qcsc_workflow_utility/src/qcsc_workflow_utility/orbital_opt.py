@@ -536,11 +536,34 @@ def rotate_electronic_properties(
 # Public API — resolve_orbitals_self_consistent  (oo_resolve_rdms path)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _truncate_subspace_by_excitation(
+    dets: np.ndarray, num_elec: int, keep: int
+) -> np.ndarray:
+    """Keep the ``keep`` determinants closest to Hartree-Fock by excitation level.
+
+    For a near-HF state the CI weight is concentrated in low excitations (HF, singles, doubles,
+    ...), and the Hamiltonian only couples HF to singles/doubles (Slater-Condon). Ranking by
+    excitation level from HF is therefore a cheap, solve-free proxy for CI weight -- good enough to
+    converge the ORBITALS on a small representative subspace, after which the rotated basis is
+    applied to the full SQD run. Ties (same excitation level) are broken by determinant value for
+    reproducibility. HF is always kept.
+    """
+    dets = np.asarray(dets, dtype=np.int64)
+    if keep >= dets.size:
+        return dets
+    hf = (1 << num_elec) - 1
+    exc = np.array([bin(int(d) ^ hf).count("1") // 2 for d in dets], dtype=np.int64)
+    order = np.lexsort((dets, exc))  # primary: excitation level asc; secondary: det value
+    return np.sort(dets[order[:keep]])
+
+
 def resolve_orbitals_self_consistent(
     elec_props: "ElectronicProperties",
     alphadets: np.ndarray,
     betadets: np.ndarray | None,
     *,
+    num_elec: tuple[int, int] | None = None,
+    resolve_maxdim: int | None = 4_000_000,
     max_macro: int = 20,
     grad_tol: float = 1e-3,
     energy_tol: float = 1e-7,
@@ -578,8 +601,32 @@ def resolve_orbitals_self_consistent(
 
     if betadets is None:
         betadets = alphadets
-    ci = (np.asarray(alphadets), np.asarray(betadets))
+    adet = np.asarray(alphadets, dtype=np.int64)
+    bdet = np.asarray(betadets, dtype=np.int64)
     open_shell = bool(elec_props.unrestricted)
+
+    # Truncate the CI subspace used for the ORBITAL optimization to keep the in-process
+    # solve_fermion re-solves fast. A full production subspace (e.g. sqrt(sqd_dim) ~ thousands of
+    # dets/spin -> millions of configs) makes each dense selected-CI re-solve minutes-to-hours;
+    # since the orbital rotation is well-determined by the dominant (low-excitation) determinants,
+    # we converge the orbitals on a truncated subspace (keep ~sqrt(resolve_maxdim) per spin, ranked
+    # by excitation level from HF) and then apply the rotated basis to the full SQD run downstream.
+    # This is the standard MCSCF active-space economy. resolve_maxdim=None disables truncation.
+    if resolve_maxdim is not None and adet.size * bdet.size > resolve_maxdim:
+        if num_elec is None:
+            num_elec = elec_props.num_electrons
+        na, nb = num_elec
+        keep = max(int(resolve_maxdim ** 0.5), 1)
+        a_full, b_full = adet.size, bdet.size
+        adet = _truncate_subspace_by_excitation(adet, na, keep)
+        bdet = _truncate_subspace_by_excitation(bdet, nb, keep)
+        if logger is not None:
+            logger.info(
+                "  [OO-SC] truncated OO subspace for fast re-solve: alpha %d->%d, beta %d->%d "
+                "(net %d -> %d configs).",
+                a_full, adet.size, b_full, bdet.size, a_full * b_full, adet.size * bdet.size,
+            )
+    ci = (adet, bdet)
     # solve_fermion returns the ELECTRONIC energy only; add the (rotation-invariant) nuclear
     # repulsion to compare against total energies / references. Rotating orbitals never changes it.
     nuc = float(elec_props.nuclear_repulsion_energy)

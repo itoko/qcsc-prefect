@@ -217,6 +217,8 @@ def riken_sqd_de(
                             elec_props,
                             best_sbd_result.alphadets,
                             best_sbd_result.betadets,
+                            num_elec=elec_props.num_electrons,
+                            resolve_maxdim=getattr(parameters, "oo_resolve_maxdim", 4_000_000),
                             grad_tol=getattr(parameters, "oo_grad_tol", 1e-3),
                             trust_radius=getattr(parameters, "oo_trust_radius", 0.1),
                             oo_maxiter=getattr(parameters, "oo_maxiter", 40),
