@@ -257,6 +257,7 @@ def optimize_orbitals(
     ftol: float = 1e-15,
     gtol: float = 1e-10,
     rdm2_notation: str = "pqrs",
+    use_jax: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Find the orbital rotation that minimizes the SCI energy expectation value.
 
@@ -293,6 +294,12 @@ def optimize_orbitals(
             rdm2[p,r,q,s] = <p†r†sq>, correct contraction is
             ``einsum('pqrs,prqs->', h2_chem, rdm2)``.
         ``solve_fermion`` and PySCF ``make_rdm2s`` return pqrs-storage.
+    use_jax : bool or None
+        Control the gradient backend used by the L-BFGS-B optimizer.
+        ``None`` (default): use JAX analytical gradient if JAX is importable,
+            otherwise fall back to NumPy finite-difference.
+        ``True``: require JAX; raises ``ImportError`` if JAX is unavailable.
+        ``False``: always use NumPy finite-difference, even when JAX is installed.
 
     Returns
     -------
@@ -336,15 +343,25 @@ def optimize_orbitals(
     n_p = norb * (norb - 1) // 2  # parameters per spin channel
     x0 = np.zeros(2 * n_p, dtype=np.float64)
 
-    # Try JAX analytical gradient first (UHF only — fast path); fall back to NumPy
-    obj_jax, grad_jax = _make_jax_uhf_obj_and_grad(
-        norb, n_p,
-        rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
-        h1_a, h1_b, h2_aa, h2_ab, h2_bb, nuc,
-    )
-    use_jax = (obj_jax is not None) and (method.upper() in ("L-BFGS-B", "BFGS", "CG"))
+    # Resolve JAX availability and user preference
+    _gradient_methods = ("L-BFGS-B", "BFGS", "CG")
+    if use_jax is False:
+        # User explicitly requested NumPy — skip JAX entirely
+        obj_jax, grad_jax = None, None
+    else:
+        obj_jax, grad_jax = _make_jax_uhf_obj_and_grad(
+            norb, n_p,
+            rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
+            h1_a, h1_b, h2_aa, h2_ab, h2_bb, nuc,
+        )
+        if use_jax is True and obj_jax is None:
+            raise ImportError(
+                "use_jax=True was requested but JAX is not importable. "
+                "Install JAX or pass use_jax=False."
+            )
+    _use_jax = (obj_jax is not None) and (method.upper() in _gradient_methods)
 
-    if use_jax:
+    if _use_jax:
         log.info("  [OrbOpt] Using JAX analytical gradient")
         eval_obj = obj_jax
     else:
@@ -368,7 +385,7 @@ def optimize_orbitals(
         method=method,
         options={"maxiter": maxiter, "ftol": ftol, "gtol": gtol},
     )
-    if use_jax:
+    if _use_jax:
         minimize_kwargs["jac"] = grad_jax
 
     res = scipy.optimize.minimize(**minimize_kwargs)
