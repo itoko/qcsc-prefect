@@ -201,7 +201,7 @@ def riken_sqd_de(
                     i, elec_props.num_orbitals, unrestricted,
                 )
                 try:
-                    Ua, Ub, e_opt = optimize_orbitals(
+                    Ua, Ub, e_opt, grad_norm = optimize_orbitals(
                         elec_props=elec_props,
                         rdm1_aa=rdm1_aa,
                         rdm1_bb=rdm1_bb,
@@ -214,16 +214,43 @@ def riken_sqd_de(
                         # wrong transpose -> unphysical energy (~-159 Ha for OH). Must be "prqs".
                         rdm2_notation="prqs",
                     )
-                    # Hard gate: the OrbOpt e_before (rebuilt from the read RDMs at U=I) is logged
-                    # inside optimize_orbitals; if it disagrees with the solver Davidson energy the
-                    # RDM output/notation is wrong. Compare against the best walker's energy here.
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
                     logger.info(
-                        "Trial %d: orbital optimization energy = %.10f Ha (solver best = %s)",
-                        i, e_opt, f"{e_solver:.10f}" if e_solver is not None else "n/a",
+                        "Trial %d: orbital optimization energy = %.10f Ha  |grad|=%.3e "
+                        "(solver best = %s)",
+                        i, e_opt, grad_norm,
+                        f"{e_solver:.10f}" if e_solver is not None else "n/a",
                     )
-                    elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
-                    logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+
+                    # ── Two-step MCSCF stopping logic (reference-free, CASSCF-style) ──────────
+                    # (1) Macro-convergence: orbital gradient ~0 => orbitals are stationary
+                    #     (generalized Brillouin condition, the criterion CASSCF codes use). No
+                    #     external DMRG/FCI floor needed -> valid for large systems.
+                    # (2) Self-consistency guard: the orbital-optimization energy is computed on
+                    #     the PREVIOUS trial's FIXED RDMs. If it runs far below the solver energy
+                    #     of the SAME state, the fixed RDMs have decoupled from the rotated
+                    #     Hamiltonian (non-variational artifact). Detect that divergence and stop
+                    #     rotating rather than propagate a spurious basis.
+                    oo_gtol = getattr(parameters, "oo_grad_tol", 1e-3)
+                    oo_sc_tol = getattr(parameters, "oo_selfconsistency_tol", 0.05)  # 50 mHa
+                    diverged = (e_solver is not None) and (e_opt < e_solver - oo_sc_tol)
+                    if diverged:
+                        logger.warning(
+                            "Trial %d: OO energy %.6f is %.1f mHa below the solver energy %.6f "
+                            "-> fixed-RDM decoupling (non-variational). NOT rotating; stopping OO.",
+                            i, e_opt, (e_solver - e_opt) * 1000.0, e_solver,
+                        )
+                        do_orbital_opt = False  # freeze the basis; keep running DE without OO
+                    else:
+                        elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
+                        logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+                        if grad_norm < oo_gtol:
+                            logger.info(
+                                "Trial %d: orbital gradient |g|=%.3e < %.1e -> orbitals converged "
+                                "(Brillouin). Freezing basis for remaining trials.",
+                                i, grad_norm, oo_gtol,
+                            )
+                            do_orbital_opt = False
                 except Exception:
                     logger.exception(
                         "Trial %d: orbital optimization failed; keeping current integrals.", i

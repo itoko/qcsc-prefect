@@ -264,7 +264,7 @@ class TestOrbitalOpt:
         """
         ep, e_uhf, rdm1_aa, rdm1_bb, rdm2_aa_pqrs, rdm2_ab_pqrs, rdm2_bb_pqrs, e_fci = oh_data
 
-        Ua, Ub, e_after = optimize_orbitals(
+        Ua, Ub, e_after, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa_pqrs, rdm2_ab_pqrs, rdm2_bb_pqrs,
             rdm2_notation="pqrs", maxiter=200,
@@ -287,13 +287,50 @@ class TestOrbitalOpt:
         )
         assert e_after > -1000.0, f"Unphysical energy: {e_after:.4f} Ha"
 
+    # ─── T8: gradient norm returned + small at convergence (MCSCF stopping) ─────
+    def test_T8_grad_norm_returned_and_small_at_convergence(self, oh_data):
+        """optimize_orbitals returns a 4th value (orbital gradient norm), and at a converged
+        minimum that gradient is small -- the reference-free CASSCF stopping signal (Brillouin
+        g -> 0). We converge tightly (maxiter large) and assert |grad| is below a loose bound."""
+        ep, _, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, _ = oh_data
+        out = optimize_orbitals(
+            ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
+            rdm2_notation="pqrs", maxiter=500, gtol=1e-10,
+        )
+        assert len(out) == 4, "optimize_orbitals must return (Ua, Ub, energy, grad_norm)"
+        Ua, Ub, e_after, grad_norm = out
+        assert np.isfinite(grad_norm) and grad_norm >= 0.0
+        # At a converged orbital minimum the gradient should be small (well below the 1e-3
+        # production stopping threshold; use a loose bound to stay robust across BLAS/JAX).
+        assert grad_norm < 1e-2, f"|grad| at convergence too large: {grad_norm:.3e}"
+
+    # ─── T9: trust radius caps the orbital step ────────────────────────────────
+    def test_T9_trust_radius_caps_step(self, oh_data):
+        """A finite trust_radius restricts each rotation parameter to +/- trust_radius, so the
+        returned rotation cannot exceed the cap. This is the MCSCF step-restriction safeguard
+        that prevents over-rotation on fixed (approximate) RDMs. We check the log-map of the
+        returned Ua has all |parameters| <= trust_radius (within tolerance)."""
+        import scipy.linalg
+        ep, _, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, _ = oh_data
+        tr = 0.1
+        Ua, Ub, _, _ = optimize_orbitals(
+            ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
+            rdm2_notation="pqrs", maxiter=200, trust_radius=tr,
+        )
+        # log(U) is skew-symmetric; its strict-upper-triangle entries are the rotation params.
+        A = scipy.linalg.logm(Ua).real
+        params = A[np.triu_indices(ep.num_orbitals, k=1)]
+        assert np.all(np.abs(params) <= tr + 1e-6), (
+            f"trust_radius={tr} not enforced: max|param|={np.max(np.abs(params)):.4f}"
+        )
+
     # ─── T3: Ua / Ub が unitary ────────────────────────────────────────────
     def test_T3_rotation_matrices_are_unitary(self, oh_data):
         """optimize_orbitals が返す Ua, Ub が直交行列であることを確認。"""
         ep, _, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, _ = oh_data
         norb = ep.num_orbitals
 
-        Ua, Ub, _ = optimize_orbitals(
+        Ua, Ub, _, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa, rdm2_ab, rdm2_bb,
             rdm2_notation="pqrs", maxiter=50,
@@ -313,12 +350,12 @@ class TestOrbitalOpt:
         rdm2_ab_prqs = rdm2_ab_pqrs.transpose(0, 2, 1, 3)
         rdm2_bb_prqs = rdm2_bb_pqrs.transpose(0, 2, 1, 3)
 
-        _, _, e_pqrs = optimize_orbitals(
+        _, _, e_pqrs, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa_pqrs, rdm2_ab_pqrs, rdm2_bb_pqrs,
             rdm2_notation="pqrs", maxiter=30,
         )
-        _, _, e_prqs = optimize_orbitals(
+        _, _, e_prqs, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa_prqs, rdm2_ab_prqs, rdm2_bb_prqs,
             rdm2_notation="prqs", maxiter=30,
@@ -335,7 +372,7 @@ class TestOrbitalOpt:
         """
         ep, _, rdm1_aa, rdm1_bb, rdm2_aa_pqrs, rdm2_ab_pqrs, rdm2_bb_pqrs, _ = oh_data
 
-        Ua, Ub, e_opt = optimize_orbitals(
+        Ua, Ub, e_opt, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa_pqrs, rdm2_ab_pqrs, rdm2_bb_pqrs,
             rdm2_notation="pqrs", maxiter=100,
@@ -372,7 +409,7 @@ class TestOrbitalOpt:
         norb = ep.num_orbitals
 
         # RHF パス: rdm1_aa=dm1, rdm1_bb=dm1（同じスピン分を渡す）
-        Ua, Ub, e_after = optimize_orbitals(
+        Ua, Ub, e_after, _ = optimize_orbitals(
             ep, dm1_pqrs, dm1_pqrs,
             dm2_pqrs,
             rdm2_notation="pqrs", maxiter=100,
@@ -464,14 +501,14 @@ class TestOrbitalOpt:
         ep, _, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, _ = oh_data
 
         # JAX パス: use_jax=True で明示
-        _, _, e_jax = optimize_orbitals(
+        _, _, e_jax, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa, rdm2_ab, rdm2_bb,
             rdm2_notation="pqrs", maxiter=300, use_jax=True,
         )
 
         # NumPy パス: use_jax=False で JAX を明示的に無効化
-        _, _, e_np = optimize_orbitals(
+        _, _, e_np, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa, rdm2_ab, rdm2_bb,
             rdm2_notation="pqrs", maxiter=300, use_jax=False,
@@ -583,7 +620,7 @@ def run_report(out_json: str | None = None) -> dict:
                 print(f"  E_FCI  = {e_fci:.8f} Ha")
 
                 # --- optimize_orbitals ---
-                Ua, Ub, e_opt = optimize_orbitals(
+                Ua, Ub, e_opt, _ = optimize_orbitals(
                     ep, rdm1_aa, rdm1_bb,
                     rdm2_aa, rdm2_ab, rdm2_bb,
                     rdm2_notation="pqrs", maxiter=300,
@@ -656,7 +693,7 @@ def run_report(out_json: str | None = None) -> dict:
                 print(f"  E_RHF  = {e_rhf:.8f} Ha")
                 print(f"  E_FCI  = {e_fci:.8f} Ha")
 
-                Ua, Ub, e_opt = optimize_orbitals(
+                Ua, Ub, e_opt, _ = optimize_orbitals(
                     ep, dm1, dm1, dm2_pqrs,
                     rdm2_notation="pqrs", maxiter=200,
                 )

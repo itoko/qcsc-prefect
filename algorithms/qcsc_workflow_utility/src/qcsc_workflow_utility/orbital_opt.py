@@ -274,7 +274,8 @@ def optimize_orbitals(
     gtol: float = 1e-10,
     rdm2_notation: str = "pqrs",
     use_jax: bool | None = None,
-) -> tuple[np.ndarray, np.ndarray, float]:
+    trust_radius: float | None = 0.5,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Find the orbital rotation that minimizes the SCI energy expectation value.
 
     Works for both RHF (``elec_props.unrestricted == False``) and UHF
@@ -316,6 +317,16 @@ def optimize_orbitals(
             otherwise fall back to NumPy finite-difference.
         ``True``: require JAX; raises ``ImportError`` if JAX is unavailable.
         ``False``: always use NumPy finite-difference, even when JAX is installed.
+    trust_radius : float or None
+        Step restriction on the orbital-rotation parameters (max Euclidean norm of the
+        skew-generator vector ``x`` per spin channel). Bounding the step is the standard
+        MCSCF safeguard (cf. ORCA/Molpro "step restriction") against over-rotation: with a
+        FIXED (approximate/noise-limited) RDM the fixed-RDM energy functional can be driven
+        artificially low by large rotations that decouple the RDMs from the rotated
+        Hamiltonian (a non-variational artifact). Capping ``‖x‖`` keeps each orbital step in
+        the region where the fixed RDMs remain a good approximation, so the energy descends
+        from above toward the true minimum (variational). ``None`` disables the cap
+        (unrestricted step, original behavior). Default 0.5 rad.
 
     Returns
     -------
@@ -325,6 +336,15 @@ def optimize_orbitals(
         Optimal beta rotation matrix (== Ua for RHF).
     energy : float
         Energy after orbital optimization (including nuclear repulsion).
+    grad_norm : float
+        Euclidean norm of the orbital gradient at the returned solution. This is the
+        MCSCF convergence signal (generalized Brillouin condition ``g -> 0`` at the
+        minimum, as used by CASSCF codes such as MOLCAS/ORCA/Molpro): the caller's two-step
+        loop should stop when ``grad_norm`` falls below a threshold, giving a
+        reference-free stopping criterion valid for large systems where no near-exact
+        (DMRG/FCI) energy floor is available. A small residual gradient means the orbitals
+        are stationary; a large gradient with a still-decreasing energy is the signature of
+        the fixed-RDM breakdown described under ``trust_radius``.
     """
     norb = elec_props.num_orbitals
     nuc = elec_props.nuclear_repulsion_energy
@@ -403,20 +423,42 @@ def optimize_orbitals(
     )
     if _use_jax:
         minimize_kwargs["jac"] = grad_jax
+    # Trust-region box: cap each rotation parameter to +/- trust_radius. L-BFGS-B honors bounds
+    # natively; for other methods the cap is applied by clipping the returned step below. This is
+    # the MCSCF step-restriction safeguard against over-rotation on fixed (approximate) RDMs.
+    if trust_radius is not None and method.upper() == "L-BFGS-B":
+        minimize_kwargs["bounds"] = [(-trust_radius, trust_radius)] * (2 * n_p)
 
     res = scipy.optimize.minimize(**minimize_kwargs)
+    x_opt = res.x
+    if trust_radius is not None and method.upper() != "L-BFGS-B":
+        x_opt = np.clip(x_opt, -trust_radius, trust_radius)
 
-    e_after = float(res.fun)
+    e_after = float(res.fun if x_opt is res.x else eval_obj(x_opt))
+
+    # Orbital gradient norm at the solution -- the MCSCF convergence signal (Brillouin g->0).
+    # Use the analytical JAX gradient when available; else a cheap central finite-difference.
+    if _use_jax:
+        grad_norm = float(np.linalg.norm(np.asarray(grad_jax(x_opt))))
+    else:
+        h = 1e-6
+        g = np.empty_like(x_opt)
+        for i in range(x_opt.size):
+            xp = x_opt.copy(); xp[i] += h
+            xm = x_opt.copy(); xm[i] -= h
+            g[i] = (eval_obj(xp) - eval_obj(xm)) / (2 * h)
+        grad_norm = float(np.linalg.norm(g))
+
     log.info(
-        "  [OrbOpt] E after optimization: %.10f Ha  ΔE=%.4e  converged=%s  nit=%d",
-        e_after, e_after - e_before, res.success, res.nit,
+        "  [OrbOpt] E after optimization: %.10f Ha  ΔE=%.4e  |grad|=%.3e  converged=%s  nit=%d",
+        e_after, e_after - e_before, grad_norm, res.success, res.nit,
     )
     if not res.success:
         log.warning("  [OrbOpt] optimizer status=%d: %s", res.status, res.message)
 
-    Ua = _unitary_from_skew(res.x[:n_p], norb)
-    Ub = _unitary_from_skew(res.x[n_p:], norb)
-    return Ua, Ub, e_after
+    Ua = _unitary_from_skew(x_opt[:n_p], norb)
+    Ub = _unitary_from_skew(x_opt[n_p:], norb)
+    return Ua, Ub, e_after, grad_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -226,3 +226,50 @@ class FlowParameters(BaseModel):
         default="sbd_solver_job/davidson-solver",
         description="Solver block reference in '<block_type_slug>/<block_document_name>' format.",
     )
+
+    # ── Orbital-optimization (two-step MCSCF) controls ───────────────────────────────────────
+    # Orbital optimization runs between DE trials when the solver writes RDMs (solver.do_rdm != 0).
+    # These govern the CASSCF-style stopping so the run halts at the physical minimum on its own.
+    oo_grad_tol: float = Field(
+        default=1e-3,
+        description=(
+            "Orbital-gradient convergence threshold for the two-step MCSCF loop. When the orbital "
+            "gradient norm returned by optimize_orbitals falls below this, the orbitals are "
+            "stationary (generalized Brillouin condition, g -> 0) and the basis is frozen for the "
+            "remaining DE trials. This is the reference-free convergence criterion used by CASSCF "
+            "codes (MOLCAS/ORCA/Molpro) -- it needs no near-exact (DMRG/FCI) energy floor, so it "
+            "works for large systems. Default 1e-3 (ORCA-like)."
+        ),
+        title="OO Gradient Tolerance",
+        gt=0.0,
+    )
+    oo_selfconsistency_tol: float = Field(
+        default=0.05,
+        description=(
+            "Self-consistency guard (Ha) for the two-step MCSCF loop. The orbital-optimization "
+            "energy is evaluated on the PREVIOUS trial's FIXED RDMs; if it drops more than this "
+            "below the solver energy of the same state, the fixed RDMs have decoupled from the "
+            "rotated Hamiltonian (a non-variational artifact -- the energy would appear to fall "
+            "below the true ground state). The loop then stops rotating and freezes the basis. "
+            "Default 0.05 Ha (50 mHa)."
+        ),
+        title="OO Self-Consistency Tolerance",
+        gt=0.0,
+    )
+    oo_resolve_rdms: bool = Field(
+        default=False,
+        description=(
+            "DOCUMENTED OPTION (not yet enabled by default). Fully self-consistent inner loop: "
+            "after each orbital rotation, RE-RUN the SQD diagonalization in the rotated basis to "
+            "obtain FRESH RDMs before the next orbital step, instead of reusing the previous "
+            "trial's fixed RDMs. This removes the fixed-RDM approximation entirely and makes the "
+            "optimization rigorously variational (the energy descends onto the true minimum from "
+            "above, as in coupled/one-step CASSCF), at the cost of an extra SQD solve per orbital "
+            "iteration -- much slower on quantum-sampled subspaces. The default two-step scheme "
+            "(oo_resolve_rdms=False) refreshes RDMs once per DE trial and relies on the "
+            "trust-radius + gradient/self-consistency stopping above to stay physical, which is "
+            "the standard, faster production choice. Set True for maximum rigor on small systems "
+            "or a final refinement. (Currently a documented flag; the re-solve wiring is a TODO.)"
+        ),
+        title="OO Re-solve RDMs (rigorous, slow)",
+    )

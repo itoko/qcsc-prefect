@@ -195,7 +195,7 @@ class TestNotationContract:
         rdm2_ab_prqs = np.asarray(dm2s[1]).transpose(0, 2, 1, 3)
         rdm2_bb_prqs = np.asarray(dm2s[2]).transpose(0, 2, 1, 3)
 
-        Ua, Ub, e_opt = optimize_orbitals(
+        Ua, Ub, e_opt, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa_prqs, rdm2_ab_prqs, rdm2_bb_prqs,
             rdm2_notation="prqs", maxiter=200,
@@ -247,7 +247,7 @@ class TestFullLocalPipeline:
         """solve_fermion returns pqrs-storage → optimize_orbitals(rdm2_notation='pqrs') is correct."""
         ep, e_uhf, nuc, norb, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, sci_e, _ = oh_pipeline
 
-        Ua, Ub, e_opt = optimize_orbitals(
+        Ua, Ub, e_opt, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa, rdm2_ab, rdm2_bb,
             rdm2_notation="pqrs", maxiter=200,
@@ -262,7 +262,7 @@ class TestFullLocalPipeline:
         """E(H_new, rdm_orig) == E_opt after rotate_electronic_properties."""
         ep, e_uhf, nuc, norb, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb, sci_e, _ = oh_pipeline
 
-        Ua, Ub, e_opt = optimize_orbitals(
+        Ua, Ub, e_opt, _ = optimize_orbitals(
             ep, rdm1_aa, rdm1_bb,
             rdm2_aa, rdm2_ab, rdm2_bb,
             rdm2_notation="pqrs", maxiter=100,
@@ -344,7 +344,7 @@ def run_report(out_json: str | None = None) -> dict:
                                   "e_wrong": float(e_wrong)})
 
             # ── T_PRQS: prqs-notation path (solver_job convention) ─────────
-            Ua_p, Ub_p, e_prqs = optimize_orbitals(
+            Ua_p, Ub_p, e_prqs, _ = optimize_orbitals(
                 ep, rdm1_aa, rdm1_bb,
                 *rdm2_prqs, rdm2_notation="prqs", maxiter=200,
             )
@@ -361,7 +361,7 @@ def run_report(out_json: str | None = None) -> dict:
             print(f"      E_opt (prqs) = {e_prqs:.8f} Ha  (FCI = {e_fci:.8f})")
 
             # ── T_PQRS: pqrs-notation path (solve_fermion convention) ──────
-            Ua_q, Ub_q, e_pqrs = optimize_orbitals(
+            Ua_q, Ub_q, e_pqrs, _ = optimize_orbitals(
                 ep, rdm1_aa, rdm1_bb,
                 *rdm2_pqrs, rdm2_notation="pqrs", maxiter=200,
             )
