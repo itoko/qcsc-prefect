@@ -50,6 +50,15 @@ class SBDResult:
     carryover_bitstrings_b: np.ndarray | None = None
     """Beta carryover bitstrings (UHF only). None for RHF; alpha lives in carryover_bitstrings."""
 
+    alphadets: np.ndarray | None = None
+    """The alpha CI determinant list (integer strings) of the diagonalized subspace. Carried so a
+    self-consistent orbital optimization (oo_resolve_rdms) can re-diagonalize this SAME fixed
+    subspace in a rotated basis in-process (via solve_fermion) to get fresh RDMs -- fast, no GPU
+    re-solve, no re-sampling."""
+
+    betadets: np.ndarray | None = None
+    """The beta CI determinant list. Equals alphadets for RHF/closed-shell; distinct for UHF."""
+
     @property
     def sci_state(self):
         raise NotImplementedError("SBD Prefect integration doesn't reconstruct sci_state object.")

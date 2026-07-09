@@ -200,6 +200,44 @@ def riken_sqd_de(
                     "Trial %d: running orbital optimization (norb=%d, unrestricted=%s) ...",
                     i, elec_props.num_orbitals, unrestricted,
                 )
+
+                # ── Self-consistent path (oo_resolve_rdms): re-diagonalize the fixed CI subspace
+                # in the rotated basis each orbital step (fresh RDMs) so the gradient is the TRUE
+                # MCSCF gradient and convergence is meaningful/variational. Requires the subspace
+                # (alpha/beta determinant lists) carried on the SBDResult. Falls back to the
+                # fixed-RDM path if unavailable.
+                if getattr(parameters, "oo_resolve_rdms", False) and (
+                    getattr(best_sbd_result, "alphadets", None) is not None
+                ):
+                    try:
+                        from qcsc_workflow_utility.orbital_opt import (
+                            resolve_orbitals_self_consistent,
+                        )
+                        elec_props, e_sc, grad_sc, n_macro = resolve_orbitals_self_consistent(
+                            elec_props,
+                            best_sbd_result.alphadets,
+                            best_sbd_result.betadets,
+                            grad_tol=getattr(parameters, "oo_grad_tol", 1e-3),
+                            trust_radius=getattr(parameters, "oo_trust_radius", 0.1),
+                            oo_maxiter=getattr(parameters, "oo_maxiter", 40),
+                            logger=logger,
+                        )
+                        logger.info(
+                            "Trial %d: self-consistent OO converged E=%.10f Ha |grad|=%.3e "
+                            "(%d macro-iters). Hamiltonian rotated for next trial.",
+                            i, e_sc, grad_sc, n_macro,
+                        )
+                        if grad_sc < getattr(parameters, "oo_grad_tol", 1e-3):
+                            logger.info(
+                                "Trial %d: orbitals stationary (|grad| < tol) -> freezing basis.", i
+                            )
+                            do_orbital_opt = False
+                    except Exception:
+                        logger.exception(
+                            "Trial %d: self-consistent OO failed; keeping current integrals.", i
+                        )
+                    continue  # skip the fixed-RDM path below
+
                 try:
                     Ua, Ub, e_opt, grad_norm = optimize_orbitals(
                         elec_props=elec_props,

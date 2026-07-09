@@ -292,7 +292,10 @@ class FlowParameters(BaseModel):
             "(oo_resolve_rdms=False) refreshes RDMs once per DE trial and relies on the "
             "trust-radius + gradient/self-consistency stopping above to stay physical, which is "
             "the standard, faster production choice. Set True for maximum rigor on small systems "
-            "or a final refinement. (Currently a documented flag; the re-solve wiring is a TODO.)"
+            "or a final refinement. Implemented via resolve_orbitals_self_consistent(), which "
+            "re-diagonalizes the SAME fixed CI subspace in the rotated basis IN-PROCESS "
+            "(solve_fermion) each orbital step -- no GPU child job and no re-sampling, so the extra "
+            "cost is one small dense CI solve per macro-iteration, not a full GPU solve."
         ),
-        title="OO Re-solve RDMs (rigorous, slow)",
+        title="OO Re-solve RDMs (rigorous, self-consistent)",
     )

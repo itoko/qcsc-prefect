@@ -530,3 +530,135 @@ def rotate_electronic_properties(
         t2_ab=elec_props.t2_ab,
         t2_bb=elec_props.t2_bb,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API — resolve_orbitals_self_consistent  (oo_resolve_rdms path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_orbitals_self_consistent(
+    elec_props: "ElectronicProperties",
+    alphadets: np.ndarray,
+    betadets: np.ndarray | None,
+    *,
+    max_macro: int = 20,
+    grad_tol: float = 1e-3,
+    energy_tol: float = 1e-7,
+    trust_radius: float = 0.1,
+    oo_maxiter: int = 40,
+    use_jax: bool | None = None,
+    logger=None,
+) -> tuple["ElectronicProperties", float, float, int]:
+    """Fully self-consistent two-step MCSCF on a FIXED CI subspace (the oo_resolve_rdms path).
+
+    This is the rigorous alternative to reusing the previous trial's stale RDMs. Each macro
+    iteration:
+      1. re-diagonalizes the SAME fixed determinant subspace (alphadets, betadets) in the CURRENT
+         (rotated) integral basis via ``qiskit_addon_sqd.fermion.solve_fermion`` -- fully in-process,
+         NO GPU child job and NO re-sampling, so it is fast (one small dense CI solve on a fixed
+         subspace);
+      2. builds fresh 1-/2-RDMs from that solution (so the RDMs always match the current orbitals);
+      3. takes one trust-region orbital step (``optimize_orbitals`` with a small trust radius and a
+         short L-BFGS budget) using those fresh RDMs;
+      4. rotates the integrals by the returned U.
+    It repeats until the orbital gradient is below ``grad_tol`` (Brillouin stationarity) or the
+    energy stops changing. Because the RDMs are refreshed every step, the orbital gradient is the
+    TRUE MCSCF gradient (unlike the fixed-RDM path, where it is not), so gradient-based convergence
+    is meaningful and the energy descends onto the minimum from above (variational).
+
+    Why this is fast: solve_fermion projects H onto the fixed subspace (dimension = len(alphadets) x
+    len(betadets)) and diagonalizes it directly in NumPy/PySCF -- the same subspace the GPU solver
+    used, but re-diagonalized in-process. No new determinants, no sampling, no scheduler round-trip.
+
+    Returns ``(rotated_elec_props, final_energy, final_grad_norm, n_macro)``.
+
+    References: two-step MCSCF of Kreplin/Knowles/Werner, J. Chem. Phys. 152, 074102 (2020).
+    """
+    from qiskit_addon_sqd.fermion import solve_fermion
+
+    if betadets is None:
+        betadets = alphadets
+    ci = (np.asarray(alphadets), np.asarray(betadets))
+    open_shell = bool(elec_props.unrestricted)
+    # solve_fermion returns the ELECTRONIC energy only; add the (rotation-invariant) nuclear
+    # repulsion to compare against total energies / references. Rotating orbitals never changes it.
+    nuc = float(elec_props.nuclear_repulsion_energy)
+
+    ep = elec_props
+    prev_e = None
+    e = float("nan")
+    grad_norm = float("inf")
+    macro = 0
+    for macro in range(1, max_macro + 1):
+        # (1)+(2) re-diagonalize the fixed subspace in the current basis -> fresh energy + RDMs.
+        # solve_fermion returns (energy, SCIState, avg_occupancies, spin_sq); SCIState.rdm(rank,
+        # spin_summed=False) gives the per-spin blocks in pqrs-storage.
+        e, sci, _occ, _s2 = solve_fermion(
+            ci, ep.one_body_tensor, ep.two_body_tensor, open_shell=open_shell,
+        )
+        e = float(e) + nuc
+        rdm1 = sci.rdm(rank=1, spin_summed=False)   # shape (2, norb, norb) -> alpha, beta
+        rdm2 = sci.rdm(rank=2, spin_summed=False)   # shape (3 or 4, norb, norb, norb, norb)
+        rdm1_aa, rdm1_bb = rdm1[0], rdm1[1]
+        # qiskit-addon-sqd 2-RDM spin blocks: [aa, ab, bb] (spin_summed=False).
+        rdm2_aa, rdm2_ab, rdm2_bb = rdm2[0], rdm2[1], rdm2[-1]
+
+        if logger is not None:
+            logger.info(
+                "  [OO-SC] macro %d/%d: E(fixed-subspace, current basis) = %.10f Ha",
+                macro, max_macro, e,
+            )
+
+        # Convergence on the TRUE (re-solved) energy between macro-iterations.
+        if prev_e is not None and abs(e - prev_e) < energy_tol:
+            if logger is not None:
+                logger.info("  [OO-SC] converged: |dE|=%.2e < %.1e (macro %d).",
+                            abs(e - prev_e), energy_tol, macro)
+            break
+
+        # (3) propose an orbital step on the FRESH RDMs, then ACCEPT/REJECT by the TRUE re-solved
+        # energy (line search / trust-region). The orbital-step functional value (e_oo) can dip
+        # non-variationally below the real energy; the authoritative quantity is solve_fermion's
+        # energy in the rotated basis. We shrink the trust radius until a rotation actually lowers
+        # the true energy (or give up and stop). This is what keeps the loop strictly variational.
+        tr = trust_radius
+        accepted = False
+        for _ls in range(6):
+            Ua, Ub, e_oo, grad_norm = optimize_orbitals(
+                ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
+                rdm2_notation="pqrs", trust_radius=tr, maxiter=oo_maxiter, use_jax=use_jax,
+            )
+            ep_try = rotate_electronic_properties(ep, Ua, Ub)
+            e_try, _sci2, _o2, _s2b = solve_fermion(
+                ci, ep_try.one_body_tensor, ep_try.two_body_tensor, open_shell=open_shell,
+            )
+            e_try = float(e_try) + nuc
+            if e_try <= e + 1e-12:  # true energy decreased -> accept
+                ep = ep_try
+                accepted = True
+                if logger is not None:
+                    logger.info(
+                        "  [OO-SC] macro %d: accepted step (tr=%.3f) E %.10f -> %.10f  |grad|=%.3e",
+                        macro, tr, e, e_try, grad_norm,
+                    )
+                break
+            tr *= 0.4  # reject: shrink trust radius and retry a smaller step
+        if not accepted:
+            if logger is not None:
+                logger.info("  [OO-SC] macro %d: no step lowered the true energy -> stop (|grad|=%.3e).",
+                            macro, grad_norm)
+            break
+
+        # Gradient stationarity (Brillouin) on the accepted step -> converged.
+        if grad_norm < grad_tol:
+            if logger is not None:
+                logger.info("  [OO-SC] converged: |grad|=%.3e < %.1e (macro %d).",
+                            grad_norm, grad_tol, macro)
+            break
+        prev_e = e
+
+    # Final re-solve in the (accepted) basis for the reported energy -- RDMs consistent with H.
+    e_final, _sci, _occ, _s2 = solve_fermion(
+        ci, ep.one_body_tensor, ep.two_body_tensor, open_shell=open_shell,
+    )
+    return ep, float(e_final) + nuc, float(grad_norm), macro

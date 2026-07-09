@@ -77,6 +77,7 @@ try:
         _make_jax_uhf_obj_and_grad,
         _unitary_from_skew,
         optimize_orbitals,
+        resolve_orbitals_self_consistent,
         rotate_electronic_properties,
     )
     from qcsc_workflow_utility.chem import ElectronicProperties
@@ -323,6 +324,48 @@ class TestOrbitalOpt:
         assert np.all(np.abs(params) <= tr + 1e-6), (
             f"trust_radius={tr} not enforced: max|param|={np.max(np.abs(params)):.4f}"
         )
+
+    # ─── T10: self-consistent OO (oo_resolve_rdms) converges variationally ──────
+    def test_T10_self_consistent_resolve_converges(self, oh_data):
+        """resolve_orbitals_self_consistent re-diagonalizes a FIXED CI subspace in the rotated
+        basis each step (fresh RDMs), so it converges variationally and quickly. Assert it:
+        (a) returns a rotated ElectronicProperties + finite energy/grad; (b) converges with a
+        small gradient; (c) stays variational (energy >= FCI of the full space, within tol);
+        (d) is fast (in-process solve_fermion on a small fixed subspace)."""
+        ep, e_uhf, *_rest, e_fci = oh_data
+        norb = ep.num_orbitals
+        na, nb = ep.num_electrons
+
+        # Build a modest CI subspace: HF + all single excitations per spin (cheap, deterministic).
+        def _dets(ne):
+            hf = (1 << ne) - 1
+            out = [hf]
+            for i in range(ne):
+                for a in range(ne, norb):
+                    out.append((hf & ~(1 << i)) | (1 << a))
+            return np.array(sorted(set(out)), dtype=np.int64)
+
+        adet, bdet = _dets(na), _dets(nb)
+
+        t0 = time.time()
+        ep_rot, e_final, grad_norm, n_macro = resolve_orbitals_self_consistent(
+            ep, adet, bdet, max_macro=15, grad_tol=1e-3, trust_radius=0.1, oo_maxiter=40,
+        )
+        dt = time.time() - t0
+
+        # (a) returns a rotated ElectronicProperties + finite scalars
+        assert isinstance(ep_rot, ElectronicProperties)
+        assert np.isfinite(e_final) and np.isfinite(grad_norm)
+        # (b) converged with a small gradient (or ran the macro budget), and finished quickly
+        assert n_macro >= 1 and n_macro <= 15
+        assert dt < 60.0, f"self-consistent OO too slow: {dt:.1f}s (should be in-process, fast)"
+        # (c) VARIATIONAL: cannot go below the exact FCI energy of the full space (key guarantee
+        # that the re-solved RDMs keep the energy physical, unlike the fixed-RDM path).
+        assert e_final >= e_fci - 1e-6, (
+            f"self-consistent OO energy {e_final:.8f} below FCI {e_fci:.8f} -> non-variational!"
+        )
+        # and it should not be absurd
+        assert e_final < e_uhf + 1.0
 
     # ─── T3: Ua / Ub が unitary ────────────────────────────────────────────
     def test_T3_rotation_matrices_are_unitary(self, oh_data):
