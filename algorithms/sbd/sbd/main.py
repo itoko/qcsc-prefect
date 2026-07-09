@@ -213,6 +213,8 @@ def riken_sqd_de(
                         # to "pqrs"; passing "pqrs"-stored data as prqs (or vice versa) applies a
                         # wrong transpose -> unphysical energy (~-159 Ha for OH). Must be "prqs".
                         rdm2_notation="prqs",
+                        trust_radius=getattr(parameters, "oo_trust_radius", 0.5),
+                        maxiter=getattr(parameters, "oo_maxiter", 300),
                     )
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
                     logger.info(

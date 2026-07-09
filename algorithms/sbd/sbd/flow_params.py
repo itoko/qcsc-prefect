@@ -243,6 +243,29 @@ class FlowParameters(BaseModel):
         title="OO Gradient Tolerance",
         gt=0.0,
     )
+    oo_trust_radius: float = Field(
+        default=0.5,
+        description=(
+            "Trust radius (max |rotation parameter| per spin channel) passed to optimize_orbitals "
+            "each DE trial. Small values (e.g. 0.05) force small orbital steps so the two-step "
+            "loop takes many micro-moves and the gradient can decrease gradually toward "
+            "oo_grad_tol without over-rotating on the fixed RDMs; large values allow bigger steps "
+            "but risk the fixed-RDM decoupling artifact. Default 0.5 rad."
+        ),
+        title="OO Trust Radius",
+        gt=0.0,
+    )
+    oo_maxiter: int = Field(
+        default=300,
+        description=(
+            "Max L-BFGS iterations inside a single optimize_orbitals call (one DE trial). Small "
+            "values (e.g. 20-50) keep each orbital step short so RDMs are refreshed frequently by "
+            "the next SQD trial (closer to proper micro/macro-iteration MCSCF); large values let a "
+            "single trial optimize the orbitals fully against the fixed RDMs. Default 300."
+        ),
+        title="OO Max Iterations",
+        ge=1,
+    )
     oo_selfconsistency_tol: float = Field(
         default=0.05,
         description=(
