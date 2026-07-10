@@ -176,7 +176,11 @@ def find_optimal_layout(
     return final_sabre_layout
 
 
-@task
+# NOT a Prefect @task: it receives a live qiskit_ibm_runtime IBMBackend, which holds a
+# _thread.lock and is neither JSON- nor pickle-serializable. Prefect hashes task arguments for
+# caching, so wrapping this in @task raises HashError on the backend. The transpilation is
+# deterministic CPU work with no need for task-level caching/retries, so a plain function called
+# inside the flow is correct (logging + artifact creation still work in the flow's run context).
 def transpile_lucj_error_aware(
     circuit: QuantumCircuit,
     backend: BackendV2,
