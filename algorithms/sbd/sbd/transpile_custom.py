@@ -4,12 +4,13 @@
 
 from time import perf_counter
 
-from ffsim.qiskit import PRE_INIT
+from ffsim.qiskit import PRE_INIT, generate_lucj_pass_manager
 from prefect import task
 from prefect.artifacts import create_table_artifact
 from prefect.cache_policies import RUN_ID
 from prefect.logging import get_run_logger
 from qiskit import QuantumCircuit
+from qiskit.providers import BackendV2
 from qiskit.passmanager import ConditionalController
 from qiskit.transpiler import Layout, Target, generate_preset_pass_manager
 from qiskit.transpiler.passes import (
@@ -173,3 +174,88 @@ def find_optimal_layout(
     )
 
     return final_sabre_layout
+
+
+@task
+def transpile_lucj_error_aware(
+    circuit: QuantumCircuit,
+    backend: BackendV2,
+    norb: int,
+    aa_indices: list[tuple[int, int]],
+    ab_indices: list[tuple[int, int]],
+    bb_indices: list[tuple[int, int]] | None,
+    connectivity: str,
+    two_qubit_error_threshold: float,
+    readout_error_threshold: float,
+    optimization_level: int,
+) -> QuantumCircuit:
+    """Map the LUCJ circuit with ffsim's LUCJ-aware, error-aware pass manager.
+
+    Replaces the noise-only Sabre search (find_optimal_layout + transpile_circuit). ffsim's
+    generate_lucj_pass_manager lays the ansatz onto the heavy-hex/square topology honoring the
+    aa/ab/bb interaction structure, *requests* the ab (alpha-beta) coupling pairs in priority
+    order (dropping the lowest-priority ones the hardware cannot accommodate), drops
+    coupling-graph edges with 2q error >= two_qubit_error_threshold and qubits with readout
+    error >= readout_error_threshold, and runs VF2PostLayout for a noise-aware isomorphic
+    subgraph search. This is the modern replacement for line/SatMapper mapping: it minimizes
+    2q + readout error *and* preserves/densifies alpha-beta coupling.
+
+    Reference: Motta, Sung, Whaley, Head-Gordon, Shee, "Bridging physical intuition and
+    hardware efficiency ... the local unitary cluster Jastrow ansatz." (2023),
+    https://pubs.rsc.org/en/content/articlehtml/2023/sc/d3sc02516k
+    """
+    logger = get_run_logger()
+    interaction_pairs = (
+        aa_indices,
+        ab_indices,
+        bb_indices if bb_indices is not None else aa_indices,
+    )
+    start = perf_counter()
+    pass_manager, realized_ab = generate_lucj_pass_manager(
+        backend=backend,
+        norb=norb,
+        connectivity=connectivity,
+        interaction_pairs=interaction_pairs,
+        two_qubit_error_threshold=two_qubit_error_threshold,
+        readout_error_threshold=readout_error_threshold,
+        optimization_level=optimization_level,
+        seed_transpiler=TRANSPILE_SEED,
+    )
+    isa_circuit = pass_manager.run(circuit)
+    elapsed = perf_counter() - start
+
+    requested = len(ab_indices)
+    kept = len(realized_ab)
+    dropped = [p for p in ab_indices if p not in realized_ab]
+    depth = isa_circuit.depth(
+        lambda inst: inst.operation.name not in ("rz", "barrier", "measure")
+    )
+    logger.info(
+        "Error-aware LUCJ layout (%s): requested %s alpha-beta pairs, hardware kept %s%s. "
+        "Thresholds: 2q_err>=%.3g dropped, readout_err>=%.3g dropped. "
+        "Completed in %.2fs. Circuit depth = %s. Instruction counts = %s",
+        connectivity,
+        requested,
+        kept,
+        f" (dropped {dropped})" if dropped else "",
+        two_qubit_error_threshold,
+        readout_error_threshold,
+        elapsed,
+        depth,
+        dict(isa_circuit.count_ops()),
+    )
+    create_table_artifact(
+        table=[
+            {
+                "requested_ab_pairs": requested,
+                "realized_ab_pairs": kept,
+                "dropped_ab_pairs": str(dropped),
+                "connectivity": connectivity,
+                "two_qubit_error_threshold": two_qubit_error_threshold,
+                "readout_error_threshold": readout_error_threshold,
+                "isa_depth": depth,
+            }
+        ],
+        key="lucj-error-aware-layout",
+    )
+    return isa_circuit

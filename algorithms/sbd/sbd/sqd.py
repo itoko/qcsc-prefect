@@ -1,6 +1,7 @@
 # Workflow for observability demo on Miyabi
 
 import asyncio
+import dataclasses
 import itertools
 from datetime import datetime, timezone
 from time import perf_counter
@@ -28,12 +29,38 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
-from .transpile_custom import find_optimal_layout, transpile_circuit
+from .transpile_custom import (
+    find_optimal_layout,
+    transpile_circuit,
+    transpile_lucj_error_aware,
+)
 
 # Convert Addon function into Prefect Task
 recover_configurations = task(_recover_configurations)
 
 MODULE_RNG = np.random.default_rng(seed=1333)
+
+
+def _backend_from_runtime(runtime: QuantumRuntime):
+    """Reconstruct the real IBM BackendV2 (with calibration) from the runtime's credentials.
+
+    prefect_qiskit's QuantumRuntime exposes only a Target via get_target(), but ffsim's
+    generate_lucj_pass_manager needs a BackendV2 to read per-qubit/per-edge error rates for the
+    error-aware layout. The runtime already holds the IBM api_key + crn, so we build a
+    QiskitRuntimeService from those and fetch the backend by resource_name -- no new credential
+    path, same instance the sampler uses.
+    """
+    from qiskit_ibm_runtime import QiskitRuntimeService
+
+    creds = runtime.credentials
+    service = QiskitRuntimeService(
+        channel="ibm_quantum_platform",
+        token=creds.api_key.get_secret_value()
+        if hasattr(creds.api_key, "get_secret_value")
+        else str(creds.api_key),
+        instance=creds.crn,
+    )
+    return service.backend(runtime.resource_name)
 
 
 def _spin_halves_as_ints(
@@ -272,35 +299,67 @@ def walker_sqd(
             n_lucj_layers=circuit_params.n_lucj_layers,
             use_reset_mitigation=circuit_params.use_reset_mitigation,
         )
-        logger.info(
-            "Searching ISA layout for backend %s "
-            "(max_iterations=%s, swap_trials=%s, layout_trials=%s).",
-            runtime.resource_name,
-            circuit_params.sabre_max_iterations,
-            circuit_params.sabre_swap_trials,
-            circuit_params.sabre_layout_trials,
-        )
-        layout = find_optimal_layout(
-            test_circuit=vir_circuit,
-            target=target,
-            optimization_level=circuit_params.optimization_level,
-            max_iterations=circuit_params.sabre_max_iterations,
-            swap_trials=circuit_params.sabre_swap_trials,
-            layout_trials=circuit_params.sabre_layout_trials,
-        )
-        logger.info("Transpiling ISA circuit for backend %s.", runtime.resource_name)
-        transpile_start = perf_counter()
-        isa_circuit = transpile_circuit(
-            circuit=vir_circuit,
-            target=target,
-            layout=layout,
-            optimization_level=circuit_params.optimization_level,
-        )
-        logger.info(
-            "Completed ISA transpilation for %s in %.2fs.",
-            runtime.resource_name,
-            perf_counter() - transpile_start,
-        )
+        if circuit_params.use_error_aware_layout:
+            # LUCJ-aware, error-aware mapping (ffsim generate_lucj_pass_manager): requests the
+            # alpha-beta coupling pairs in priority order + drops high-2q/readout-error qubits.
+            # Replaces the noise-only Sabre search below.
+            logger.info(
+                "Using error-aware LUCJ layout for backend %s "
+                "(connectivity=%s, 2q_err_thr=%s, readout_err_thr=%s, ab_pairs=%s).",
+                runtime.resource_name,
+                circuit_params.layout_connectivity,
+                circuit_params.two_qubit_error_threshold,
+                circuit_params.readout_error_threshold,
+                len(ab_indices),
+            )
+            transpile_start = perf_counter()
+            isa_circuit = transpile_lucj_error_aware(
+                circuit=vir_circuit,
+                backend=_backend_from_runtime(runtime),
+                norb=elec_props.num_orbitals,
+                aa_indices=aa_indices,
+                ab_indices=ab_indices,
+                bb_indices=None,
+                connectivity=circuit_params.layout_connectivity,
+                two_qubit_error_threshold=circuit_params.two_qubit_error_threshold,
+                readout_error_threshold=circuit_params.readout_error_threshold,
+                optimization_level=circuit_params.optimization_level,
+            )
+            logger.info(
+                "Completed error-aware ISA transpilation for %s in %.2fs.",
+                runtime.resource_name,
+                perf_counter() - transpile_start,
+            )
+        else:
+            logger.info(
+                "Searching ISA layout for backend %s "
+                "(max_iterations=%s, swap_trials=%s, layout_trials=%s).",
+                runtime.resource_name,
+                circuit_params.sabre_max_iterations,
+                circuit_params.sabre_swap_trials,
+                circuit_params.sabre_layout_trials,
+            )
+            layout = find_optimal_layout(
+                test_circuit=vir_circuit,
+                target=target,
+                optimization_level=circuit_params.optimization_level,
+                max_iterations=circuit_params.sabre_max_iterations,
+                swap_trials=circuit_params.sabre_swap_trials,
+                layout_trials=circuit_params.sabre_layout_trials,
+            )
+            logger.info("Transpiling ISA circuit for backend %s.", runtime.resource_name)
+            transpile_start = perf_counter()
+            isa_circuit = transpile_circuit(
+                circuit=vir_circuit,
+                target=target,
+                layout=layout,
+                optimization_level=circuit_params.optimization_level,
+            )
+            logger.info(
+                "Completed ISA transpilation for %s in %.2fs.",
+                runtime.resource_name,
+                perf_counter() - transpile_start,
+            )
         # Shot batching: reach a large effective shot count by submitting K smaller sampler jobs
         # and mixing them, instead of one huge job (which times out / can exceed IBM's per-job
         # cap). n_shot_batches lives at the TOP LEVEL of the options dict (not inside params, which
@@ -663,7 +722,14 @@ def walker_sqd(
             if batch_energy is None or this_energy < batch_energy:
                 batch_energy = this_energy
                 batch_carryover = this_carryover
-                batch_sbd_result = sbd_result  # full SBDResult (RDMs) of the best batch, for orbital opt
+                # Attach the CI subspace (alpha/beta determinant lists) to the SBDResult so a
+                # self-consistent orbital optimization can re-diagonalize this fixed subspace in a
+                # rotated basis in-process. betadets defaults to alphadets for RHF/closed-shell.
+                batch_sbd_result = dataclasses.replace(
+                    sbd_result,
+                    alphadets=this_save_kwargs.get("alphadets"),
+                    betadets=this_save_kwargs.get("betadets", this_save_kwargs.get("alphadets")),
+                )
                 batch_net_dim = this_net_dim
                 batch_save_kwargs = this_save_kwargs
 

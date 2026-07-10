@@ -59,6 +59,23 @@ def _build_task_runner():
     )
 
 
+def _build_ab_indices(norb: int, stride: int) -> list[tuple[int, int]]:
+    """Alpha-beta LUCJ coupling pairs (p, p), ordered by priority (most important first).
+
+    On heavy-hex hardware the ab couplings are ancilla-mediated and can't all be realized, so
+    ffsim's generate_lucj_pass_manager drops pairs from the END of the list until the layout
+    fits. We therefore emit the stock stride-4 anchors FIRST (they always fit on heavy-hex),
+    then the densification pairs (the extra p's a smaller stride adds) AFTER. This way a denser
+    request degrades gracefully back toward the stock coupling instead of losing anchor pairs.
+    stride=4 reproduces the historical [(p, p) for p in range(0, norb, 4)] exactly.
+    """
+    stride = max(1, int(stride))
+    anchors = [(p, p) for p in range(0, norb, 4)]
+    seen = {p for p, _ in anchors}
+    extra = [(p, p) for p in range(0, norb, stride) if p not in seen]
+    return anchors + extra
+
+
 class OptimizerState(BaseModel):
     """Intermediate data for optimization."""
 
@@ -159,7 +176,15 @@ def riken_sqd_de(
     # We assume heavy-hex topology
     # Orbitals for different spins have connections between every 4th orbital.
     aa_indices = [(p, p + 1) for p in range(elec_props.num_orbitals - 1)]
-    ab_indices = [(p, p) for p in range(0, elec_props.num_orbitals, 4)]
+    ab_indices = _build_ab_indices(
+        elec_props.num_orbitals, parameters.circ_params.ab_stride
+    )
+    logger.info(
+        "LUCJ alpha-beta coupling: stride=%s -> %s pairs (stock stride-4 would give %s)",
+        parameters.circ_params.ab_stride,
+        len(ab_indices),
+        len(range(0, elec_props.num_orbitals, 4)),
+    )
 
     state = OptimizerState.from_parameters(
         num_walkers=parameters.de_params.num_walkers,

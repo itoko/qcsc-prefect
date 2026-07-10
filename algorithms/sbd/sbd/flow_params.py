@@ -58,6 +58,67 @@ class CircuitParameters(BaseModel):
         ge=1,
     )
 
+    # ── Alpha-beta coupling density + error-aware LUCJ layout ───────────────────────────
+    # The alpha and beta spin channels of the LUCJ ansatz are coupled by the ab interaction
+    # pairs (p, p). On heavy-hex hardware those couplings are ancilla-mediated, so the stock
+    # layout only couples every 4th orbital (stride 4) to keep SWAP/2q-gate depth low. That
+    # undercouples inter-spin correlation. ab_stride < 4 requests denser coupling (2 -> ~2x,
+    # 1 -> full per-orbital) at the cost of more ECR gates / depth; the error-aware pass
+    # manager below drops the least-important requested pairs if the hardware can't fit them.
+    ab_stride: int = Field(
+        default=4,
+        description=(
+            "Stride for alpha-beta LUCJ coupling pairs (p, p) for p in range(0, norb, stride). "
+            "4 = stock heavy-hex (couple every 4th orbital); 2 = ~2x denser coupling; "
+            "1 = couple every orbital. Denser coupling captures more inter-spin correlation "
+            "but adds ECR gates / circuit depth."
+        ),
+        title="Alpha-Beta Coupling Stride",
+        ge=1,
+    )
+
+    use_error_aware_layout: bool = Field(
+        default=False,
+        description=(
+            "Use ffsim.qiskit.generate_lucj_pass_manager instead of the custom Sabre layout. "
+            "The ffsim mapper is LUCJ-aware: it lays the ansatz onto the heavy-hex/square "
+            "topology honoring the aa/ab/bb interaction structure, requests the ab pairs in "
+            "priority order (dropping the lowest-priority ones the hardware can't fit), removes "
+            "high-2q-error edges and high-readout-error qubits, and runs VF2PostLayout for a "
+            "noise-aware isomorphic subgraph search. Replaces noise-only line mapping (SatMapper)."
+        ),
+        title="Error-Aware LUCJ Layout",
+    )
+
+    two_qubit_error_threshold: float = Field(
+        default=1.0,
+        description=(
+            "Passed to generate_lucj_pass_manager: coupling-graph edges with 2q gate error "
+            ">= this are removed before layout. 1.0 removes only fully-faulty edges; lower "
+            "(e.g. 0.02) forces the layout onto low-2q-error qubit pairs."
+        ),
+        title="Two-Qubit Error Threshold",
+        ge=0.0,
+        le=1.0,
+    )
+
+    readout_error_threshold: float = Field(
+        default=0.1,
+        description=(
+            "Passed to generate_lucj_pass_manager: qubits with readout error >= this are "
+            "removed before layout, so measurements avoid high-readout-error qubits."
+        ),
+        title="Readout Error Threshold",
+        ge=0.0,
+        le=1.0,
+    )
+
+    layout_connectivity: str = Field(
+        default="heavy-hex",
+        description="Backend topology for the error-aware LUCJ layout: 'heavy-hex' or 'square'.",
+        title="Layout Connectivity",
+    )
+
 
 class DEParameters(BaseModel):
     """Configuration for differential evoluation."""
