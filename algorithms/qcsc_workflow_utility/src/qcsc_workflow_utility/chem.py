@@ -61,6 +61,38 @@ class ElectronicProperties(BaseModel):
     t2_bb: NpStrict4DArrayF64 | None = None
 
 
+def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
+    """Drive a UHF calculation to the genuine (possibly spin-broken) solution.
+
+    For a closed-shell singlet, plain UHF started from the RHF density stays at the RHF solution
+    (the RHF determinant is a stationary point of the UHF equations) -- so ``mf.to_uhf().kernel()``
+    returns an *effectively restricted* reference (<S^2> = 0, identical energy). For strongly
+    correlated systems (e.g. Fe-S clusters) the true UHF is lower in energy and spin-broken; seeding
+    the LUCJ ansatz / UCCSD amplitudes from the unbroken solution is a restricted reference in
+    disguise and defeats the point of running UHF.
+
+    This runs UHF, then iteratively performs an internal STABILITY analysis: if the current solution
+    is unstable, it rebuilds the density from the lowest instability mode and re-converges (via
+    Newton), following the instability down to a stable (broken-symmetry when appropriate) minimum.
+    This is the standard PySCF recipe for reaching the true UHF solution.
+    """
+    mf.kernel()
+    for _ in range(max_follow):
+        # stability() returns the (internal) stable MOs; if they differ from the current MOs the
+        # solution was unstable and we follow them down.
+        new_mo = mf.stability()[0]
+        # new_mo is (mo_a, mo_b); detect whether it changed (instability found).
+        cur = mf.mo_coeff
+        changed = not (
+            np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1])
+        )
+        if not changed:
+            break  # stable -> genuine UHF minimum reached
+        dm = mf.make_rdm1(new_mo, mf.mo_occ)
+        mf = mf.newton().run(dm)
+    return mf
+
+
 def _build_property(
     mf: scf.RHF,
     norb: int,
@@ -252,7 +284,10 @@ def compute_molecular_integrals_from_geometry(
     mol.verbose = 4
 
     if unrestricted:
-        mf = scf.UHF(mol).run()
+        mf = scf.UHF(mol)
+        # Follow any spin instability to the true (broken-symmetry) UHF minimum (see
+        # _converge_broken_symmetry_uhf) so the reference is genuinely unrestricted for singlets.
+        mf = _converge_broken_symmetry_uhf(mf)
         norb = mf.mo_coeff[0].shape[1]
         return _build_property_uhf(mf, norb, spin_sq, buf)
 
@@ -303,7 +338,9 @@ def compute_molecular_integrals_from_fcidump(
         nuc = mf.mol.energy_nuc()
         mf = mf.to_uhf()
         mf.mol.energy_nuc = lambda *args: nuc  # preserved across the class conversion
-        mf.kernel()
+        # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
+        # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
+        mf = _converge_broken_symmetry_uhf(mf)
         return _build_property_uhf(mf, norb, spin_sq, buf)
 
     # Run HF calculation with Newton method.

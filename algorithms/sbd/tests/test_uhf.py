@@ -227,3 +227,28 @@ def test_subsample_open_shell_rng_default_falls_back():
     ci_a = _draw_open_shell(7, rng=None)
     assert int(ci_a[0]) == (1 << 4) - 1  # HF anchored at index 0
     assert len(set(ci_a.tolist())) == len(ci_a)
+
+
+def test_uhf_breaks_spin_symmetry_for_correlated_singlet():
+    """Regression: the UHF path must reach the genuine broken-symmetry solution for a
+    strongly-correlated closed-shell SINGLET, not stay at the RHF stationary point.
+
+    Bug (fixed): mf.to_uhf().kernel() / scf.UHF(mol).run() started from the symmetric RHF density
+    and, for a singlet, converged back to RHF (<S^2>=0, identical energy) -> the "UHF" reference
+    and its UCCSD amplitude seed were restricted in disguise. _converge_broken_symmetry_uhf follows
+    the spin instability to the true UHF minimum. Stretched H4 is the canonical test: RHF and the
+    broken-symmetry UHF differ by hundreds of mHa.
+    """
+    import numpy as np
+    from pyscf import gto, scf
+    import qcsc_workflow_utility.chem as chem
+
+    mol = gto.M(atom="H 0 0 0; H 0 0 2.0; H 0 0 4.0; H 0 0 6.0", basis="sto-3g", spin=0, verbose=0)
+    e_rhf = scf.RHF(mol).run(verbose=0).e_tot
+
+    mf = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
+    ss, _ = mf.spin_square()
+    assert ss > 0.5, f"UHF stayed restricted (<S^2>={ss:.3f}); spin symmetry not broken"
+    assert mf.e_tot < e_rhf - 1e-2, (
+        f"broken-symmetry UHF E={mf.e_tot:.6f} not below RHF E={e_rhf:.6f}"
+    )
