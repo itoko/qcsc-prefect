@@ -31,6 +31,7 @@ def initialize_ucj_parameters(
     randomization_factor: float,
     n_lucj_layers: int,
     bb_indices: list[tuple[int, int]] | None = None,
+    ucj_optimize: bool = True,
 ) -> NpStrict2DArrayF64:
     global MODULE_RNG
 
@@ -43,6 +44,7 @@ def initialize_ucj_parameters(
             num_walkers=num_walkers,
             randomization_factor=randomization_factor,
             n_lucj_layers=n_lucj_layers,
+            ucj_optimize=ucj_optimize,
         )
 
     def _t2_to_ucj_parameters(t2: NpStrict4DArrayF64) -> NpStrict1DArrayF64:
@@ -55,12 +57,15 @@ def initialize_ucj_parameters(
         # state's <H> (Trotter error) but for SQD that is beneficial — it spreads the wavefunction
         # over many more configurations, producing a far more diverse sample set to diagonalize
         # over (measured ~6x participation ratio vs naive truncation, which is near single-HF).
+        # ucj_optimize=False disables it (bare truncated DF) for the ansatz-quality study.
+        optimize_kwargs = (
+            {"optimize": True, "options": {"maxiter": 50}} if ucj_optimize else {}
+        )
         tmp_operator = ffsim.UCJOpSpinBalanced.from_t_amplitudes(
             t2=t2,
             n_reps=n_lucj_layers + 1,
             interaction_pairs=(aa_indices, ab_indices),
-            optimize=True,
-            options={"maxiter": 50},
+            **optimize_kwargs,
         )
         truncated_ucj_op = ffsim.UCJOpSpinBalanced(
             diag_coulomb_mats=tmp_operator.diag_coulomb_mats[:-1],
@@ -88,6 +93,7 @@ def _initialize_ucj_parameters_uhf(
     num_walkers: int,
     randomization_factor: float,
     n_lucj_layers: int,
+    ucj_optimize: bool = True,
 ) -> NpStrict2DArrayF64:
     """Spin-unbalanced (UHF) counterpart of :func:`initialize_ucj_parameters`.
 
@@ -101,10 +107,17 @@ def _initialize_ucj_parameters_uhf(
     def _t2_to_ucj_parameters(
         t2: tuple[NpStrict4DArrayF64, NpStrict4DArrayF64, NpStrict4DArrayF64],
     ) -> NpStrict1DArrayF64:
+        # Match the RHF path: optimize=True (compressed DF) spreads the state over many more
+        # configurations for a diverse SQD sample. This was previously MISSING on the UHF path,
+        # which left UHF subspaces near-HF and made UHF circuits shallower than RHF (audit P2).
+        optimize_kwargs = (
+            {"optimize": True, "options": {"maxiter": 50}} if ucj_optimize else {}
+        )
         tmp_operator = ffsim.UCJOpSpinUnbalanced.from_t_amplitudes(
             t2=t2,
             n_reps=n_lucj_layers + 1,
             interaction_pairs=interaction_pairs,
+            **optimize_kwargs,
         )
         truncated_ucj_op = ffsim.UCJOpSpinUnbalanced(
             diag_coulomb_mats=tmp_operator.diag_coulomb_mats[:-1],

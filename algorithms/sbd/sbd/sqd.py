@@ -29,11 +29,17 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
+from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
     transpile_circuit,
     transpile_lucj_error_aware,
 )
+
+# prefect_qiskit 0.2.0's sampler Options schema silently drops the `twirling` block (no field +
+# extra="ignore"), so --measure-twirling never reached the device. Patch the schema at import so the
+# twirling option survives validation in the sampler process (this module runs the sampler call).
+apply_twirling_patch()
 
 # Convert Addon function into Prefect Task
 recover_configurations = task(_recover_configurations)

@@ -2,6 +2,7 @@
 
 import io
 import os
+import warnings
 from typing import Annotated
 
 import numpy as np
@@ -77,6 +78,7 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
     This is the standard PySCF recipe for reaching the true UHF solution.
     """
     mf.kernel()
+    stable = False
     for _ in range(max_follow):
         # stability() returns the (internal) stable MOs; if they differ from the current MOs the
         # solution was unstable and we follow them down.
@@ -87,9 +89,26 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
             np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1])
         )
         if not changed:
+            stable = True
             break  # stable -> genuine UHF minimum reached
         dm = mf.make_rdm1(new_mo, mf.mo_occ)
         mf = mf.newton().run(dm)
+    # Robustness (audit P4): if the follow loop exhausted max_follow while still unstable, the
+    # returned reference is NOT a genuine minimum. Warn loudly and report the final <S^2> so a
+    # downstream seed built from a non-stable / spin-contaminated reference is visible, not silent.
+    if not stable:
+        try:
+            ss, _mult = mf.spin_square()
+        except Exception:
+            ss = float("nan")
+        warnings.warn(
+            f"UHF stability following did not converge to a stable solution after "
+            f"{max_follow} follows; returning the last iterate (<S^2>={ss:.4f}). The UHF "
+            f"reference may be non-stationary or spin-contaminated -- t2/occupancy seeds built "
+            f"from it should be treated with caution.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return mf
 
 
@@ -336,8 +355,32 @@ def compute_molecular_integrals_from_fcidump(
         # FCIDUMP integral overrides and mol.spin = MS2) into a UHF object and run it. UHF init
         # guess builds two spin densities from nelec=(na, nb); no manual dm0 needed.
         nuc = mf.mol.energy_nuc()
-        mf = mf.to_uhf()
-        mf.mol.energy_nuc = lambda *args: nuc  # preserved across the class conversion
+        # Audit P3: tools.fcidump.to_scf sets mol.symmetry=True with a *guessed* point group when
+        # the FCIDUMP carries ORBSYM (both the Fe2S2 and Fe4S4 dumps do: ORBSYM=1). The RHF branch
+        # defeats this with mf.symmetry=False (below); the UHF branch previously did NOT, so UHF ran
+        # its kernel + stability analysis under a possibly-wrong group -> symmetry-constrained /
+        # misconverged reference, and stability following couldn't break the relevant symmetry.
+        # Disable symmetry on the mol and REBUILD it before converting, so to_uhf() produces a plain
+        # (non-symmetry-adapted) UHF whose kernel()/stability() don't require a point group. Setting
+        # .symmetry=False on an already-symmetry-adapted object is insufficient (SymAdaptedUHF.build
+        # still raises "mol.symmetry not enabled"); the rebuild is what actually clears it.
+        # to_scf builds a SymAdaptedRHF, and mf.to_uhf() preserves that symmetry-adapted class --
+        # whose build() still demands mol.symmetry even after we clear the flag. So disable symmetry
+        # on the mol, rebuild it, and construct a PLAIN scf.UHF on it (not mf.to_uhf()); carry the
+        # FCIDUMP integral overrides (get_hcore/_eri) + nuclear energy across by hand.
+        base_mol = mf.mol
+        if getattr(base_mol, "symmetry", False):
+            base_mol.symmetry = False
+            base_mol.build(dump_input=False, parse_arg=False)
+        hcore = mf.get_hcore()
+        ovlp = mf.get_ovlp()
+        eri = mf._eri
+        mf = scf.UHF(base_mol)
+        mf.get_hcore = lambda *args, **kwargs: hcore
+        mf.get_ovlp = lambda *args, **kwargs: ovlp
+        mf._eri = eri
+        mf.mol.energy_nuc = lambda *args: nuc  # preserved across the conversion
+        mf.symmetry = False
         # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
         # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
         mf = _converge_broken_symmetry_uhf(mf)
