@@ -670,6 +670,14 @@ def resolve_orbitals_self_consistent(
         # the true energy (or give up and stop). This is what keeps the loop strictly variational.
         tr = trust_radius
         accepted = False
+        # SPEED (Part D, deferred): each optimize_orbitals call rebuilds fresh jax.jit closures
+        # (_make_jax_uhf_obj_and_grad) that bake in the RDMs+integrals. Across these <=6 line-search
+        # iterations the RDMs are FIXED (only trust_radius/box-bounds change), so the jitted
+        # objective/gradient are identical -- yet each call re-traces + re-JITs (~200 ms compile each,
+        # measured). The win at Fe4S4 scale (36 orb, many macros): build obj_jax/grad_jax ONCE here
+        # per macro and thread them into optimize_orbitals so the 6 trust-radius shrinks reuse the
+        # compiled functions. On the tiny validation systems OO converges in 1 macro and does nothing,
+        # so this is a scale-only optimization -- left as a note per "speed after pipeline verified".
         for _ls in range(6):
             Ua, Ub, e_oo, grad_norm = optimize_orbitals(
                 ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
