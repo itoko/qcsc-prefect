@@ -355,17 +355,32 @@ def compute_molecular_integrals_from_fcidump(
         # FCIDUMP integral overrides and mol.spin = MS2) into a UHF object and run it. UHF init
         # guess builds two spin densities from nelec=(na, nb); no manual dm0 needed.
         nuc = mf.mol.energy_nuc()
-        mf = mf.to_uhf()
-        mf.mol.energy_nuc = lambda *args: nuc  # preserved across the class conversion
         # Audit P3: tools.fcidump.to_scf sets mol.symmetry=True with a *guessed* point group when
         # the FCIDUMP carries ORBSYM (both the Fe2S2 and Fe4S4 dumps do: ORBSYM=1). The RHF branch
         # defeats this with mf.symmetry=False (below); the UHF branch previously did NOT, so UHF ran
         # its kernel + stability analysis under a possibly-wrong group -> symmetry-constrained /
         # misconverged reference, and stability following couldn't break the relevant symmetry.
-        # Reset it here too so UHF is unconstrained and matches the RHF treatment.
+        # Disable symmetry on the mol and REBUILD it before converting, so to_uhf() produces a plain
+        # (non-symmetry-adapted) UHF whose kernel()/stability() don't require a point group. Setting
+        # .symmetry=False on an already-symmetry-adapted object is insufficient (SymAdaptedUHF.build
+        # still raises "mol.symmetry not enabled"); the rebuild is what actually clears it.
+        # to_scf builds a SymAdaptedRHF, and mf.to_uhf() preserves that symmetry-adapted class --
+        # whose build() still demands mol.symmetry even after we clear the flag. So disable symmetry
+        # on the mol, rebuild it, and construct a PLAIN scf.UHF on it (not mf.to_uhf()); carry the
+        # FCIDUMP integral overrides (get_hcore/_eri) + nuclear energy across by hand.
+        base_mol = mf.mol
+        if getattr(base_mol, "symmetry", False):
+            base_mol.symmetry = False
+            base_mol.build(dump_input=False, parse_arg=False)
+        hcore = mf.get_hcore()
+        ovlp = mf.get_ovlp()
+        eri = mf._eri
+        mf = scf.UHF(base_mol)
+        mf.get_hcore = lambda *args, **kwargs: hcore
+        mf.get_ovlp = lambda *args, **kwargs: ovlp
+        mf._eri = eri
+        mf.mol.energy_nuc = lambda *args: nuc  # preserved across the conversion
         mf.symmetry = False
-        if getattr(mf, "mol", None) is not None:
-            mf.mol.symmetry = False
         # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
         # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
         mf = _converge_broken_symmetry_uhf(mf)
