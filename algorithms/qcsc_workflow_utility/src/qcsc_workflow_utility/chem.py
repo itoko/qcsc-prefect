@@ -76,7 +76,78 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
     is unstable, it rebuilds the density from the lowest instability mode and re-converges (via
     Newton), following the instability down to a stable (broken-symmetry when appropriate) minimum.
     This is the standard PySCF recipe for reaching the true UHF solution.
+
+    IMPORTANT (Fe-S cubanes): for [4Fe-4S] the internal stability analysis from a SYMMETRIC guess
+    stays in the spin-pure (RHF) basin (<S^2>=0, -326.547) -- it does NOT find the antiferromagnetic
+    broken-symmetry minimum, because breaking the spatial symmetry to localize the Fe spins requires
+    a spin-IMBALANCED initial density, not just following an internal instability. So we FIRST try an
+    antiferromagnetic guess (promote a few beta electrons across the HOMO-LUMO gap, per the Noodleman
+    BS recipe), stability-follow that, and keep whichever solution (default vs AF-guess) is LOWER.
+    For Fe4S4 the AF guess reaches -326.767 (<S^2>~7.6), 219 mHa below the spin-pure solution.
     """
+
+    def _follow_stability(m, n=max_follow):
+        stab = False
+        for _ in range(n):
+            new_mo = m.stability()[0]
+            cur = m.mo_coeff
+            if np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1]):
+                stab = True
+                break
+            m = m.newton().run(m.make_rdm1(new_mo, m.mo_occ))
+        return m, stab
+
+    def _af_guess_uhf(base, base_mol, base_hcore, base_ovlp, base_eri, base_nuc):
+        """A fresh plain scf.UHF (same integrals/mol) started from an AF spin-imbalanced density.
+        Returns the stability-followed result, or None if it fails. Tries a couple of promotion
+        widths. Built from a PLAIN scf.UHF on the mol (not base.__class__, which may be a
+        newton-wrapped SecondOrderUHF lacking a simple mol constructor)."""
+        try:
+            na, nb = base_mol.nelec
+        except Exception:
+            return None
+        n = base_mol.nao
+        best = None
+        for shift in (2, 1, 3):
+            if nb - shift < 0 or nb + shift > n:
+                continue
+            m = scf.UHF(base_mol)
+            # carry the FCIDUMP integral overrides if present
+            if base_hcore is not None:
+                m.get_hcore = lambda *a, **k: base_hcore
+            if base_ovlp is not None:
+                m.get_ovlp = lambda *a, **k: base_ovlp
+            if base_eri is not None:
+                m._eri = base_eri
+            if base_nuc is not None:
+                m.mol.energy_nuc = lambda *a: base_nuc
+            m.max_cycle = 400
+            m.conv_tol = 1e-9
+            mo = np.eye(n)
+            occ_a = list(range(na))
+            occ_b = list(range(nb - shift)) + list(range(nb, nb + shift))
+            dma = mo[:, occ_a] @ mo[:, occ_a].T
+            dmb = mo[:, occ_b] @ mo[:, occ_b].T
+            try:
+                m.kernel(dm0=(dma, dmb))
+                m, _ = _follow_stability(m)
+                if best is None or m.e_tot < best.e_tot:
+                    best = m
+            except Exception:
+                continue
+        return best
+
+    # Capture the mol + any FCIDUMP integral overrides from the ORIGINAL mf before newton-wrapping,
+    # so the AF-guess UHF can be rebuilt as a plain scf.UHF with the same Hamiltonian.
+    _base_mol = mf.mol
+    _base_hcore = mf.get_hcore() if callable(getattr(mf, "get_hcore", None)) else None
+    _base_ovlp = mf.get_ovlp() if callable(getattr(mf, "get_ovlp", None)) else None
+    _base_eri = getattr(mf, "_eri", None)
+    try:
+        _base_nuc = float(mf.mol.energy_nuc())
+    except Exception:
+        _base_nuc = None
+
     mf.kernel()
     stable = False
     for _ in range(max_follow):
@@ -93,6 +164,25 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
             break  # stable -> genuine UHF minimum reached
         dm = mf.make_rdm1(new_mo, mf.mo_occ)
         mf = mf.newton().run(dm)
+
+    # Also try the antiferromagnetic broken-symmetry guess and keep whichever solution is LOWER.
+    # For closed-shell/RHF-basin cases the AF guess just returns to the same energy (no harm); for
+    # Fe-S cubanes it finds the genuine BS minimum the stability-only path misses.
+    af = _af_guess_uhf(mf, _base_mol, _base_hcore, _base_ovlp, _base_eri, _base_nuc)
+    if af is not None and af.converged and af.e_tot < mf.e_tot - 1e-6:
+        try:
+            ss_af, _ = af.spin_square()
+        except Exception:
+            ss_af = float("nan")
+        warnings.warn(
+            f"Broken-symmetry UHF found via AF guess: E={af.e_tot:.6f} <S^2>={ss_af:.3f} is "
+            f"{(mf.e_tot - af.e_tot) * 1000:.1f} mHa below the stability-only solution "
+            f"({mf.e_tot:.6f}). Using the broken-symmetry reference.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return af
+
     # Robustness (audit P4): if the follow loop exhausted max_follow while still unstable, the
     # returned reference is NOT a genuine minimum. Warn loudly and report the final <S^2> so a
     # downstream seed built from a non-stable / spin-contaminated reference is visible, not silent.
