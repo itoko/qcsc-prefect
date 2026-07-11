@@ -119,6 +119,18 @@ class CircuitParameters(BaseModel):
         title="Layout Connectivity",
     )
 
+    ucj_optimize: bool = Field(
+        default=True,
+        description=(
+            "Build the LUCJ ansatz with ffsim's compressed double factorization (optimize=True): "
+            "re-optimize the kept DF terms to best approximate the full UCCSD generator. This "
+            "spreads the prepared state over many more configurations -> a far more diverse SQD "
+            "sample set (bare optimize=False collapses toward Hartree-Fock). Applies to BOTH RHF "
+            "and UHF (previously only RHF used it). Set False only to study the ansatz effect."
+        ),
+        title="UCJ Compressed-DF Optimize",
+    )
+
 
 class DEParameters(BaseModel):
     """Configuration for differential evoluation."""

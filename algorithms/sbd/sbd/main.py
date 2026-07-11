@@ -378,6 +378,7 @@ def differential_evolution_trial(
             num_walkers=parameters.de_params.num_walkers,
             randomization_factor=parameters.de_params.randomization_factor,
             n_lucj_layers=parameters.circ_params.n_lucj_layers,
+            ucj_optimize=parameters.circ_params.ucj_optimize,
         )
 
     _, solver_block_name = parse_block_ref(parameters.solver_block_ref)

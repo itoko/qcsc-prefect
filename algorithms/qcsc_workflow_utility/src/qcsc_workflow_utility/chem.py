@@ -2,6 +2,7 @@
 
 import io
 import os
+import warnings
 from typing import Annotated
 
 import numpy as np
@@ -77,6 +78,7 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
     This is the standard PySCF recipe for reaching the true UHF solution.
     """
     mf.kernel()
+    stable = False
     for _ in range(max_follow):
         # stability() returns the (internal) stable MOs; if they differ from the current MOs the
         # solution was unstable and we follow them down.
@@ -87,9 +89,26 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
             np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1])
         )
         if not changed:
+            stable = True
             break  # stable -> genuine UHF minimum reached
         dm = mf.make_rdm1(new_mo, mf.mo_occ)
         mf = mf.newton().run(dm)
+    # Robustness (audit P4): if the follow loop exhausted max_follow while still unstable, the
+    # returned reference is NOT a genuine minimum. Warn loudly and report the final <S^2> so a
+    # downstream seed built from a non-stable / spin-contaminated reference is visible, not silent.
+    if not stable:
+        try:
+            ss, _mult = mf.spin_square()
+        except Exception:
+            ss = float("nan")
+        warnings.warn(
+            f"UHF stability following did not converge to a stable solution after "
+            f"{max_follow} follows; returning the last iterate (<S^2>={ss:.4f}). The UHF "
+            f"reference may be non-stationary or spin-contaminated -- t2/occupancy seeds built "
+            f"from it should be treated with caution.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return mf
 
 
@@ -338,6 +357,15 @@ def compute_molecular_integrals_from_fcidump(
         nuc = mf.mol.energy_nuc()
         mf = mf.to_uhf()
         mf.mol.energy_nuc = lambda *args: nuc  # preserved across the class conversion
+        # Audit P3: tools.fcidump.to_scf sets mol.symmetry=True with a *guessed* point group when
+        # the FCIDUMP carries ORBSYM (both the Fe2S2 and Fe4S4 dumps do: ORBSYM=1). The RHF branch
+        # defeats this with mf.symmetry=False (below); the UHF branch previously did NOT, so UHF ran
+        # its kernel + stability analysis under a possibly-wrong group -> symmetry-constrained /
+        # misconverged reference, and stability following couldn't break the relevant symmetry.
+        # Reset it here too so UHF is unconstrained and matches the RHF treatment.
+        mf.symmetry = False
+        if getattr(mf, "mol", None) is not None:
+            mf.mol.symmetry = False
         # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
         # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
         mf = _converge_broken_symmetry_uhf(mf)
