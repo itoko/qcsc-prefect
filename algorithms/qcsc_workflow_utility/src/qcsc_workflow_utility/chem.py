@@ -62,7 +62,43 @@ class ElectronicProperties(BaseModel):
     t2_bb: NpStrict4DArrayF64 | None = None
 
 
-def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
+def _parse_af_groups() -> dict | None:
+    """Parse the FE4S4_AF_GROUPS env var into an atom-localized AF-guess spec, or None.
+
+    Format (JSON): {"fe1":[2,3,4,5,6], "fe2":[7,8,9,10,11], ..., "up":["fe1","fe3"],
+    "down":["fe2","fe4"]}. Fragments listed in "up"/"down" are alpha/beta spin-polarized; all other
+    fragments are treated as closed (doubly occupied). Enables the Noodleman broken-symmetry guess in
+    _converge_broken_symmetry_uhf for Fe-S cubanes (~33 mHa lower reference than energy-ordered).
+
+    Convenience: FE4S4_AF_GROUPS="fe4s4" expands to the standard [Fe4S4(SCH3)4]2- MO grouping
+    (l1=0-1, fe1=2-6, fe2=7-11, s=12-23, fe3=24-28, fe4=29-33, l2=34-35) with the Singlet-I pairing
+    (Fe1,Fe3 up / Fe2,Fe4 down), matching the reference that reaches -326.801 (<S^2>~7.6).
+    """
+    import json
+
+    raw = os.environ.get("FE4S4_AF_GROUPS", "").strip()
+    if not raw:
+        return None
+    if raw.lower() == "fe4s4":
+        return {
+            "l1": list(range(0, 2)),
+            "fe1": list(range(2, 7)),
+            "fe2": list(range(7, 12)),
+            "s": list(range(12, 24)),
+            "fe3": list(range(24, 29)),
+            "fe4": list(range(29, 34)),
+            "l2": list(range(34, 36)),
+            "up": ["fe1", "fe3"],
+            "down": ["fe2", "fe4"],
+        }
+    try:
+        return json.loads(raw)
+    except Exception:
+        warnings.warn(f"FE4S4_AF_GROUPS could not be parsed as JSON: {raw!r}; ignoring.")
+        return None
+
+
+def _converge_broken_symmetry_uhf(mf, max_follow: int = 5, af_groups: dict | None = None):
     """Drive a UHF calculation to the genuine (possibly spin-broken) solution.
 
     For a closed-shell singlet, plain UHF started from the RHF density stays at the RHF solution
@@ -96,6 +132,34 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
                 break
             m = m.newton().run(m.make_rdm1(new_mo, m.mo_occ))
         return m, stab
+
+    def _follow_stability_external(m, n=10):
+        """Follow BOTH internal and EXTERNAL instabilities and keep the LOWEST iterate seen.
+
+        The Noodleman AF sublattice minima (Singlet-I/II/III) are near-degenerate and separated by
+        external (spin-symmetry-breaking) instabilities that plain internal following (_follow_
+        stability) does not cross -- it declares "stable" at the first internal minimum (~-326.769
+        for Fe4S4) and never reaches the lower external basin (~-326.801). Mirrors the collaborator
+        recipe: m.stability(return_status=True, external=True), rebuild, repeat, track the minimum."""
+        best = m
+        for _ in range(n):
+            res = m.stability(return_status=True, external=True)
+            mo = res[0]
+            stable_i, stable_e = res[-2], res[-1]
+            try:
+                # Pass the (external-)instability MO coefficients DIRECTLY to the Newton solver as
+                # the initial guess (not a density rebuilt from them): newton().run(mo_coeff) follows
+                # the external spin-symmetry-breaking mode into the lower AF basin, whereas
+                # run(make_rdm1(mo)) stalls at the higher internal minimum. This is the collaborator
+                # recipe and is what reaches -326.801 (vs -326.771 with the density rebuild).
+                m = m.newton().run(mo if isinstance(mo, tuple) else m.mo_coeff)
+            except Exception:
+                break
+            if m.e_tot < best.e_tot:
+                best = m
+            if stable_i and stable_e:
+                break
+        return best, True
 
     def _af_guess_uhf(base, base_mol, base_hcore, base_ovlp, base_eri, base_nuc):
         """A fresh plain scf.UHF (same integrals/mol) started from an AF spin-imbalanced density.
@@ -135,6 +199,50 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5):
                     best = m
             except Exception:
                 continue
+
+        # Atom-localized (Noodleman) AF guess: when an orbital->fragment map is supplied, seed the
+        # density so specific magnetic centers get spin-UP and the counter-set spin-DOWN (the true
+        # antiferromagnetic sublattices), instead of a chemistry-blind energy-ordered promotion. For
+        # Fe-S cubanes this lands in a ~33 mHa LOWER broken-symmetry basin than the energy-ordered
+        # guess (Fe4S4: -326.801 vs -326.768) -- the reference orbitals span the Fe-3d correlation
+        # far better, which is what SQD actually recovers on. `af_groups` maps fragment name ->
+        # list[orbital idx]; keys "up"/"down" list which fragments are alpha/beta-polarized, closed
+        # fragments (doubly occupied) are everything else. We stability-follow (external) and keep
+        # the lowest across all guesses.
+        if af_groups:
+            up = set(af_groups.get("up", []))
+            down = set(af_groups.get("down", []))
+            frags = {k: v for k, v in af_groups.items() if k not in ("up", "down")}
+            dm0 = np.zeros((2, n, n))
+            for name, orbs in frags.items():
+                for x in orbs:
+                    if name in up:
+                        dm0[0, x, x] = 1.0
+                    elif name in down:
+                        dm0[1, x, x] = 1.0
+                    else:  # closed fragment: doubly occupied
+                        dm0[:, x, x] = 1.0
+            m = scf.UHF(base_mol)
+            if base_hcore is not None:
+                m.get_hcore = lambda *a, **k: base_hcore
+            if base_ovlp is not None:
+                m.get_ovlp = lambda *a, **k: base_ovlp
+            if base_eri is not None:
+                m._eri = base_eri
+            if base_nuc is not None:
+                m.mol.energy_nuc = lambda *a: base_nuc
+            m.max_cycle = 400
+            m.conv_tol = 1e-9
+            try:
+                m.kernel(dm0=(dm0[0], dm0[1]))
+                # Follow external instabilities (10 rounds): the AF sublattice minima are
+                # near-degenerate (Singlet-I/II/III) and only EXTERNAL following reaches the lowest
+                # basin (~-326.801 for Fe4S4); internal-only following stalls at ~-326.769.
+                m, _ = _follow_stability_external(m, n=10)
+                if best is None or m.e_tot < best.e_tot:
+                    best = m
+            except Exception:
+                pass
         return best
 
     # Capture the mol + any FCIDUMP integral overrides from the ORIGINAL mf before newton-wrapping,
@@ -473,7 +581,10 @@ def compute_molecular_integrals_from_fcidump(
         mf.symmetry = False
         # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
         # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
-        mf = _converge_broken_symmetry_uhf(mf)
+        # For Fe-S cubanes, an atom-localized (Noodleman) AF guess -- supplied via FE4S4_AF_GROUPS --
+        # reaches a ~33 mHa lower BS basin than the energy-ordered guess (better Fe-3d orbitals for
+        # SQD to recover on). See _parse_af_groups; unset -> plain energy-ordered AF guess (default).
+        mf = _converge_broken_symmetry_uhf(mf, af_groups=_parse_af_groups())
         return _build_property_uhf(mf, norb, spin_sq, buf)
 
     # Run HF calculation with Newton method.
