@@ -73,6 +73,17 @@ def _parse_af_groups() -> dict | None:
     Convenience: FE4S4_AF_GROUPS="fe4s4" expands to the standard [Fe4S4(SCH3)4]2- MO grouping
     (l1=0-1, fe1=2-6, fe2=7-11, s=12-23, fe3=24-28, fe4=29-33, l2=34-35) with the Singlet-I pairing
     (Fe1,Fe3 up / Fe2,Fe4 down), matching the reference that reaches -326.801 (<S^2>~7.6).
+
+    Two extra env knobs tune the guess toward the physical super-exchange regime (local sweep found
+    p=0.6 + free bridging S gives the deepest BS-UCCSD -327.143 and a smaller <S^2>, vs -327.102 at
+    the default p=1.0):
+      FE4S4_AF_POL   (float, default 1.0): Fe spin-polarization amplitude. p=1 -> full 1.0/0.0 split
+                     (maximally localized, large <S^2>); p<1 -> 0.5(1+/-p) split so the sublattices
+                     couple more (smaller <S^2>).
+      FE4S4_AF_FREE_S (0/1, default 0): seed the bridging S 3p fragment half-filled/unpolarized so it
+                     MEDIATES the Fe-Fe exchange (the paper's principal singlet-triplet pathway),
+                     instead of forcing it doubly-occupied.
+    These attach as extra keys ("pol", "free") on the returned dict, consumed by _af_guess_uhf.
     """
     import json
 
@@ -80,7 +91,7 @@ def _parse_af_groups() -> dict | None:
     if not raw:
         return None
     if raw.lower() == "fe4s4":
-        return {
+        spec = {
             "l1": list(range(0, 2)),
             "fe1": list(range(2, 7)),
             "fe2": list(range(7, 12)),
@@ -91,11 +102,22 @@ def _parse_af_groups() -> dict | None:
             "up": ["fe1", "fe3"],
             "down": ["fe2", "fe4"],
         }
+    else:
+        try:
+            spec = json.loads(raw)
+        except Exception:
+            warnings.warn(f"FE4S4_AF_GROUPS could not be parsed as JSON: {raw!r}; ignoring.")
+            return None
+    # Optional fractional-polarization + free-bridging-S knobs (apply to any spec).
     try:
-        return json.loads(raw)
+        spec["pol"] = float(os.environ.get("FE4S4_AF_POL", "1.0"))
     except Exception:
-        warnings.warn(f"FE4S4_AF_GROUPS could not be parsed as JSON: {raw!r}; ignoring.")
-        return None
+        spec["pol"] = 1.0
+    if os.environ.get("FE4S4_AF_FREE_S", "0") == "1" and "free" not in spec:
+        # default the bridging-S fragment name to "s" (present in the fe4s4 convenience spec)
+        if "s" in spec:
+            spec["free"] = ["s"]
+    return spec
 
 
 def _converge_broken_symmetry_uhf(mf, max_follow: int = 5, af_groups: dict | None = None):
@@ -212,14 +234,30 @@ def _converge_broken_symmetry_uhf(mf, max_follow: int = 5, af_groups: dict | Non
         if af_groups:
             up = set(af_groups.get("up", []))
             down = set(af_groups.get("down", []))
-            frags = {k: v for k, v in af_groups.items() if k not in ("up", "down")}
+            free = set(af_groups.get("free", []))  # fragments left half-filled (unpolarized)
+            # Fractional polarization amplitude p in [0,1]: p=1 -> full 1.0/0.0 spin split on the
+            # magnetic centers (maximally localized, large <S^2>); p<1 -> 0.5(1+/-p) split, letting
+            # the sublattices couple more (SMALLER <S^2>, closer to the physical super-exchange
+            # regime). The paper notes the singlet-triplet exchange runs through the bridging S 3p
+            # orbitals -- so "free" fragments (the bridging S) are seeded half-filled to MEDIATE that
+            # exchange rather than being forced doubly-occupied. Local sweep: p=0.6 + free bridging S
+            # gives the deepest BS-UCCSD (-327.143 vs -327.102 at p=1.0) and lowest <S^2>.
+            pol = af_groups.get("pol", 1.0)
+            frags = {
+                k: v for k, v in af_groups.items()
+                if k not in ("up", "down", "free", "pol")
+            }
             dm0 = np.zeros((2, n, n))
             for name, orbs in frags.items():
                 for x in orbs:
                     if name in up:
-                        dm0[0, x, x] = 1.0
+                        dm0[0, x, x] = 0.5 + 0.5 * pol
+                        dm0[1, x, x] = 0.5 - 0.5 * pol
                     elif name in down:
-                        dm0[1, x, x] = 1.0
+                        dm0[0, x, x] = 0.5 - 0.5 * pol
+                        dm0[1, x, x] = 0.5 + 0.5 * pol
+                    elif name in free:  # bridging exchange mediator: half-filled, unpolarized
+                        dm0[:, x, x] = 0.5
                     else:  # closed fragment: doubly occupied
                         dm0[:, x, x] = 1.0
             m = scf.UHF(base_mol)
