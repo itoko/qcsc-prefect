@@ -99,8 +99,11 @@ def _parse_af_groups() -> dict | None:
             "fe3": list(range(24, 29)),
             "fe4": list(range(29, 34)),
             "l2": list(range(34, 36)),
-            "up": ["fe1", "fe3"],
-            "down": ["fe2", "fe4"],
+            # Pairing from the collaborator who built the FCIDUMP (verified 2026-07-13): up={fe1,fe2}
+            # down={fe3,fe4} reaches the deepest BS basin (-326.801) at full polarization directly,
+            # more robustly than the earlier {fe1,fe3}/{fe2,fe4} guess (which needed pol=0.6+free-S).
+            "up": ["fe1", "fe2"],
+            "down": ["fe3", "fe4"],
         }
     else:
         try:
