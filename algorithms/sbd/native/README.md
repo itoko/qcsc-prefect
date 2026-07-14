@@ -127,3 +127,85 @@ CCFLAGS="-std=c++17 -mp -cuda -fast -gpu=mem:unified -DSBD_THRUST" \
 SYSLIB="-lblas -llapack" \
 ./build_sbd_gpu.sh
 ```
+
+## Building the Multi-GPU (NCCL) Executable on ROQUO (GB200)
+
+`build_sbd_gpu.sh` produces a **single-GPU** binary (`-cuda -gpu=mem:unified -DSBD_THRUST`, no NCCL,
+no multi-rank path). To split the Davidson diagonalization across multiple GPUs (so subspace
+dimensions that a single GPU's HBM cannot hold, e.g. `sqd_dim = 1e9`, become tractable), build the
+**NCCL multi-GPU** binaries with `build_sbd_mpi.sh` (RHF) and `build_sbd_mpi_uhf.sh` (UHF). These
+target a fork that adds the multi-rank / non-CUDA-aware-MPI support the upstream tree lacks.
+
+### 1. Clone the fork (not vendored in this repo)
+
+The multi-GPU source lives in `native/sbd_mpi/` (gitignored — do not commit the ~large tree). Clone
+Ryusei Wakizaka's fork, `non-cuda-aware-mpi` branch, then apply the NCCL warm-up fix:
+
+```bash
+cd algorithms/sbd/native
+git clone --branch non-cuda-aware-mpi https://github.com/rwakizaka/sbd.git sbd_mpi
+# NCCL warm-up fix: in include/sbd/chemistry/tpb/sbdiag.h the warm-up all-reduce allocates a
+# full-width device_vector; on ranks holding a different-width W slice this deadlocks when ndets is
+# not divisible by bdet_comm_size. Shrink the warm-up buffer to length 1 (4 sites):
+#   thrust::device_vector<double> A(W.size(), 0.0)   ->   A(1, 0.0)
+```
+
+The fork's `apps/.../main.cc` writes the Prefect result files (`occ_a/occ_b.txt`,
+`davidson_energy.txt`, `carryover.bin` / `carryover_b.bin`) only under `#ifdef SBD_PREFECT` — the
+build scripts pass `-DSBD_PREFECT` so `SBDSolverJob` can read them back. (The fork's carryover.bin
+block references an undeclared `cobits`; rewrite it to use the fork's own `co_adet`/`co_bdet`
+carryover vectors before building — see `build_sbd_mpi*.sh` header.)
+
+### 2. Build (on a GB200 compute/login node with the modules)
+
+```bash
+sbatch build_sbd_mpi.sh        # -> native/diag-gpu-mpi       (RHF / restricted)
+sbatch build_sbd_mpi_uhf.sh    # -> native/diag-gpu_uhf-mpi   (UHF / open-shell, adds -D_UHF)
+```
+
+Both use the CMake `nvhpc-thrust` preset with NCCL + cuBLAS + rank-distribution:
+
+```bash
+module load cuda/13.2 nvhpc/26.5
+cmake --preset nvhpc-thrust \
+  -DSBD_USE_NCCL=ON -DSBD_USE_CUBLAS=ON \
+  -DSBD_USE_RANK_DISTRIBUTION=ON -DSBD_USE_BLOCK_RANK_DISTRIBUTION=ON \
+  -DCMAKE_CXX_FLAGS="-DSBD_PREFECT -DSBD_NON_CUDA_AWARE_MPI -I<nccl_include>" \
+  -DCMAKE_EXE_LINKER_FLAGS="-L<nccl>/lib -lnccl -L<cublas> -lcublas -cudalib=cublas"
+cmake --build build/nvhpc-thrust --target tpb_diag        # add -D_UHF to CXX_FLAGS for the UHF binary
+```
+
+Verify the link: `ldd native/diag-gpu-mpi | grep -iE 'nccl|mpi|cublas'` should show
+`libnccl.so.2`, `libmpi.so.40` (HPC-X OpenMPI 5), and `libcublas`.
+
+### 3. Run it — **use `mpirun`, not `srun`**
+
+**Critical:** ROQUO's `srun` cannot bootstrap the HPC-X OpenMPI 5 that these binaries link — under
+every available `--mpi` plugin (`none`, `pmi2`, `cray_shasta`) each rank initializes as its own
+`MPI_COMM_WORLD` of size 1, and the solver aborts with
+`std::invalid_argument: MPI Size of twister is not a square of a integer`. Only `mpirun -np N`
+(from the loaded `hpcx` module) gives a real N-rank world. This is what the tutorial's
+"Open MPI fails with PMI / PMIx errors under `srun`" note means — set `launcher="mpirun"`.
+
+For a 4-GPU single-node run, request a full node and split the beta-determinant communicator:
+
+```bash
+#SBATCH --gres=gpu:4 --ntasks-per-node=4
+module load cuda/13.2 nvhpc/26.5            # puts hpcx mpirun on PATH
+mpirun -np 4 ./diag-gpu_uhf-mpi \
+  --task_comm_size 1 --adet_comm_size 1 --bdet_comm_size 4 \
+  --block 20 --iteration 5 --tolerance 0.01 ... \
+  --adetfile AlphaDets.bin --bdetfile BetaDets.bin --carryoverfile carryover.txt
+```
+
+- The rank product `task_comm_size × adet_comm_size × bdet_comm_size × h_comm_size` must equal the
+  MPI world size (`-np N`). For 4 GPUs on one node: `bdet_comm_size=4`, the rest `1`
+  (`h_comm_size` is derived as `world / (task·adet·bdet)`).
+- GPU binding is automatic: `main.cc` does `cudaSetDevice(mpi_rank % cudaGetDeviceCount())`, so with
+  `--gres=gpu:4` rank *i* lands on GPU *i*. Do **not** pass srun's `--gpu-bind`.
+- `-DSBD_NON_CUDA_AWARE_MPI` (CPU-staged MPI) is compiled in so the binary is **multi-node-ready**,
+  but only 4-GPU single-node has been validated to date; a genuine 2+ node run is untested.
+
+The sweep launcher `sweep/run_fe4s4_mgpu.sh` wires all of this via env
+(`FE4S4_LAUNCHER=mpirun`, `FE4S4_MPI_OPTIONS=-np,4`, `FE4S4_BDET_COMM_SIZE=4`,
+`FE4S4_DIAG_BIN=diag-gpu-mpi`, `FE4S4_DIAG_BIN_UHF=diag-gpu_uhf-mpi`).

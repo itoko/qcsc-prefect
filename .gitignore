@@ -218,6 +218,11 @@ __marimo__/
 algorithms/sbd/native/diag
 algorithms/sbd/native/*.o
 algorithms/sbd/native/sbd/
+algorithms/sbd/native/sbd_mpi/
+algorithms/sbd/native/diag-gpu*
+algorithms/sbd/native/diag_uhf
+algorithms/sbd/native/*.out
+algorithms/sbd/native/*.err
 .DS_Store
 .vscode/sftp.json
 
