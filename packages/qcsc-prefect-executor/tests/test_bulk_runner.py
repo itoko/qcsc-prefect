@@ -50,6 +50,8 @@ def _spec(
     priority: int = 0,
     command_args: dict[str, Any] | None = None,
     expected_outputs: list[Path] | None = None,
+    execution_profile_block: str | None = None,
+    hpc_profile_block: str | None = None,
 ) -> BulkJobSpec:
     return BulkJobSpec(
         job_key=job_key,
@@ -59,6 +61,8 @@ def _spec(
         priority=priority,
         command_args=command_args or {},
         expected_outputs=expected_outputs or [],
+        execution_profile_block=execution_profile_block,
+        hpc_profile_block=hpc_profile_block,
     )
 
 
@@ -86,6 +90,8 @@ def _install_fake_submit_and_monitor(
     submit_failures: dict[str, list[Exception]] | None = None,
     active_counts_after_submit: list[int] | None = None,
     assert_deferred_on_retry: set[str] | None = None,
+    submit_block_calls: list[tuple[str, str, str]] | None = None,
+    monitor_block_calls: list[tuple[str, list[str]]] | None = None,
 ) -> None:
     scheduler_to_job: dict[str, str] = {}
     submit_failures = submit_failures or {}
@@ -117,6 +123,8 @@ def _install_fake_submit_and_monitor(
         scheduler_job_id = f"sched-{job_key}"
         scheduler_to_job[scheduler_job_id] = job_key
         submitted.append(job_key)
+        if submit_block_calls is not None:
+            submit_block_calls.append((job_key, execution_profile_block, hpc_profile_block))
         if registry is not None:
             registry.mark_submitted(job_key, scheduler_job_id)
             if active_counts_after_submit is not None:
@@ -136,6 +144,8 @@ def _install_fake_submit_and_monitor(
     ) -> dict[str, BulkJobStatus]:
         if monitor_calls is not None:
             monitor_calls.append(list(scheduler_job_ids))
+        if monitor_block_calls is not None:
+            monitor_block_calls.append((hpc_profile_block, list(scheduler_job_ids)))
 
         statuses: dict[str, BulkJobStatus] = {}
         for scheduler_job_id in scheduler_job_ids:
@@ -373,6 +383,41 @@ def test_run_jobs_from_blocks_bulk_respects_max_submit_per_refill(tmp_path: Path
     assert result.succeeded == 3
 
 
+def test_run_jobs_from_blocks_bulk_uses_per_job_blocks_for_single_submit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    registry_path = tmp_path / "bulk.sqlite"
+    submitted: list[str] = []
+    submit_block_calls: list[tuple[str, str, str]] = []
+    _install_fake_submit_and_monitor(
+        monkeypatch,
+        submitted=submitted,
+        submit_block_calls=submit_block_calls,
+    )
+
+    result = _run_bulk(
+        tmp_path=tmp_path,
+        jobs=[
+            _spec(
+                tmp_path,
+                "job-0",
+                execution_profile_block="exec-small",
+                hpc_profile_block="hpc-small",
+            ),
+            _spec(tmp_path, "job-1"),
+        ],
+        queue_probe=_RegistryCapacityProbe(registry_path, max_active_jobs=2),
+    )
+
+    assert submitted == ["job-0", "job-1"]
+    assert submit_block_calls == [
+        ("job-0", "exec-small", "hpc-small"),
+        ("job-1", "exec", "hpc"),
+    ]
+    assert result.succeeded == 2
+
+
 def test_queue_full_marks_submit_deferred_and_retries_later(tmp_path: Path, monkeypatch):
     registry_path = tmp_path / "bulk.sqlite"
     submitted: list[str] = []
@@ -509,6 +554,76 @@ def test_active_jobs_are_passed_to_monitor_many_in_batches(tmp_path: Path, monke
     assert submitted == []
     assert monitor_calls == [["sched-job-1", "sched-job-2"]]
     assert result.succeeded == 2
+
+
+def test_run_jobs_from_blocks_bulk_groups_monitoring_by_effective_hpc_block(
+    tmp_path: Path,
+    monkeypatch,
+):
+    registry_path = tmp_path / "bulk.sqlite"
+    registry = BulkJobRegistry(registry_path)
+    jobs = [
+        _spec(tmp_path, "job-0", hpc_profile_block="hpc-a"),
+        _spec(tmp_path, "job-1", hpc_profile_block="hpc-b"),
+        _spec(tmp_path, "job-2"),
+    ]
+    registry.upsert_jobs(jobs)
+    registry.mark_submitted("job-0", "sched-job-0")
+    registry.mark_submitted("job-1", "sched-job-1")
+    registry.mark_submitted("job-2", "sched-job-2")
+    submitted: list[str] = []
+    monitor_block_calls: list[tuple[str, list[str]]] = []
+    _install_fake_submit_and_monitor(
+        monkeypatch,
+        submitted=submitted,
+        monitor_block_calls=monitor_block_calls,
+    )
+
+    result = _run_bulk(
+        tmp_path=tmp_path,
+        jobs=jobs,
+        queue_probe=_RegistryCapacityProbe(registry_path, max_active_jobs=3),
+    )
+
+    assert submitted == []
+    assert dict(monitor_block_calls) == {
+        "hpc-a": ["sched-job-0"],
+        "hpc-b": ["sched-job-1"],
+        "hpc": ["sched-job-2"],
+    }
+    assert result.succeeded == 3
+
+
+def test_native_bulk_rejects_per_job_block_overrides(tmp_path: Path):
+    registry_path = tmp_path / "bulk.sqlite"
+
+    try:
+        asyncio.run(
+            mod.run_jobs_from_blocks_bulk(
+                jobs=[
+                    _spec(
+                        tmp_path,
+                        "job-0",
+                        stage_id="stage-a",
+                        execution_profile_block="exec-small",
+                    )
+                ],
+                command_block="cmd",
+                execution_profile_block="exec",
+                hpc_profile_block="hpc",
+                registry_path=registry_path,
+                queue_probe=_FixedCapacityProbe(10),
+                submit_mode="native_bulk",
+                poll_interval_seconds=0,
+                refill_interval_seconds=0,
+            )
+        )
+    except ValueError as exc:
+        assert "native_bulk" in str(exc)
+        assert "per-job" in str(exc)
+        assert "job-0" in str(exc)
+    else:
+        raise AssertionError("native bulk should reject per-job block overrides")
 
 
 def test_native_bulk_jobs_are_monitored_by_scheduler_subjob_id(tmp_path: Path, monkeypatch):

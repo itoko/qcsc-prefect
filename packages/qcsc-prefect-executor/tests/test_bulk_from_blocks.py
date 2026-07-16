@@ -175,6 +175,8 @@ def test_submit_job_from_blocks_records_submitted_with_scheduler_job_id(
     assert record.status == BulkJobStatus.SUBMITTED
     assert record.scheduler_job_id == "12345"
     assert record.command_args == {"input": "a.dat"}
+    assert record.execution_profile_block == "exec"
+    assert record.hpc_profile_block == "hpc"
 
 
 def test_submit_job_from_blocks_does_not_wait_for_completion(tmp_path: Path, monkeypatch):

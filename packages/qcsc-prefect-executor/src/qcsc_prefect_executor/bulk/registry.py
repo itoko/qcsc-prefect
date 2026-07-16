@@ -96,6 +96,8 @@ class BulkJobRegistry:
                     monitor_attempts INTEGER NOT NULL DEFAULT 0,
                     command_args_json TEXT,
                     expected_outputs_json TEXT,
+                    execution_profile_block TEXT,
+                    hpc_profile_block TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     submitted_at TEXT,
@@ -152,6 +154,8 @@ class BulkJobRegistry:
             "bulk_parent_job_id": "bulk_parent_job_id TEXT",
             "bulk_index": "bulk_index INTEGER",
             "scheduler_subjob_id": "scheduler_subjob_id TEXT",
+            "execution_profile_block": "execution_profile_block TEXT",
+            "hpc_profile_block": "hpc_profile_block TEXT",
         }
         for column_name, column_def in column_defs.items():
             if column_name not in existing_columns:
@@ -196,6 +200,8 @@ class BulkJobRegistry:
                             monitor_attempts,
                             command_args_json,
                             expected_outputs_json,
+                            execution_profile_block,
+                            hpc_profile_block,
                             created_at,
                             updated_at,
                             submitted_at,
@@ -205,7 +211,10 @@ class BulkJobRegistry:
                             priority,
                             max_submit_attempts
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?)
+                        VALUES (
+                            ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?, ?, ?, ?, ?,
+                            NULL, NULL, NULL, ?, ?
+                        )
                         """,
                         (
                             job.job_key,
@@ -216,6 +225,8 @@ class BulkJobRegistry:
                             str(job.work_dir),
                             command_args_json,
                             expected_outputs_json,
+                            job.execution_profile_block,
+                            job.hpc_profile_block,
                             now,
                             now,
                             now if status == BulkJobStatus.SUCCEEDED else None,
@@ -237,6 +248,16 @@ class BulkJobRegistry:
                             work_dir = ?,
                             command_args_json = ?,
                             expected_outputs_json = ?,
+                            execution_profile_block = CASE
+                                WHEN scheduler_job_id IS NULL AND scheduler_subjob_id IS NULL
+                                THEN ?
+                                ELSE execution_profile_block
+                            END,
+                            hpc_profile_block = CASE
+                                WHEN scheduler_job_id IS NULL AND scheduler_subjob_id IS NULL
+                                THEN ?
+                                ELSE hpc_profile_block
+                            END,
                             updated_at = ?,
                             finished_at = COALESCE(finished_at, ?),
                             last_error = NULL,
@@ -252,6 +273,8 @@ class BulkJobRegistry:
                             str(job.work_dir),
                             command_args_json,
                             expected_outputs_json,
+                            job.execution_profile_block,
+                            job.hpc_profile_block,
                             now,
                             now,
                             job.priority,
@@ -270,6 +293,16 @@ class BulkJobRegistry:
                             work_dir = ?,
                             command_args_json = ?,
                             expected_outputs_json = ?,
+                            execution_profile_block = CASE
+                                WHEN scheduler_job_id IS NULL AND scheduler_subjob_id IS NULL
+                                THEN ?
+                                ELSE execution_profile_block
+                            END,
+                            hpc_profile_block = CASE
+                                WHEN scheduler_job_id IS NULL AND scheduler_subjob_id IS NULL
+                                THEN ?
+                                ELSE hpc_profile_block
+                            END,
                             updated_at = ?,
                             priority = ?,
                             max_submit_attempts = ?
@@ -282,6 +315,8 @@ class BulkJobRegistry:
                             str(job.work_dir),
                             command_args_json,
                             expected_outputs_json,
+                            job.execution_profile_block,
+                            job.hpc_profile_block,
                             now,
                             job.priority,
                             job.max_submit_attempts,
@@ -780,4 +815,6 @@ def _record_from_row(row: sqlite3.Row) -> BulkJobRecord:
         bulk_parent_job_id=row["bulk_parent_job_id"],
         bulk_index=None if row["bulk_index"] is None else int(row["bulk_index"]),
         scheduler_subjob_id=row["scheduler_subjob_id"],
+        execution_profile_block=row["execution_profile_block"],
+        hpc_profile_block=row["hpc_profile_block"],
     )

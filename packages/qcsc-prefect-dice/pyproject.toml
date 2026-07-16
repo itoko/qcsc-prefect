@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qcsc-prefect-dice"
-version = "0.2.3"
+version = "0.2.5"
 description = "DICE SHCI solver integration for qcsc-prefect"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,9 +22,9 @@ dependencies = [
     "pydantic>=2",
     "pyscf",
     "qiskit-addon-sqd==0.11.0",
-    "qcsc-prefect-blocks==0.2.3",
-    "qcsc-prefect-core==0.2.3",
-    "qcsc-prefect-executor==0.2.3",
+    "qcsc-prefect-blocks==0.2.5",
+    "qcsc-prefect-core==0.2.5",
+    "qcsc-prefect-executor==0.2.5",
 ]
 
 [project.urls]

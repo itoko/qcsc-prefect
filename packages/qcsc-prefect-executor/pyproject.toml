@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qcsc-prefect-executor"
-version = "0.2.3"
+version = "0.2.5"
 description = "Prefect executor integrations for HPC schedulers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,9 +17,9 @@ maintainers = [
 ]
 dependencies = [
     "prefect>=2.19",
-    "qcsc-prefect-adapters==0.2.3",
-    "qcsc-prefect-blocks==0.2.3",
-    "qcsc-prefect-core==0.2.3",
+    "qcsc-prefect-adapters==0.2.5",
+    "qcsc-prefect-blocks==0.2.5",
+    "qcsc-prefect-core==0.2.5",
 ]
 
 [project.urls]

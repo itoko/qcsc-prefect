@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qcsc-prefect-blocks"
-version = "0.2.3"
+version = "0.2.5"
 description = "Prefect block definitions for HPC + Miyabi execution"
 readme = "README.md"
 requires-python = ">=3.10"

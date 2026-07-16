@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qcsc-prefect-adapters"
-version = "0.2.3"
+version = "0.2.5"
 description = "HPC adapters (Miyabi, Fugaku, Slurm) for QCSC Prefect workflows"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ maintainers = [
 ]
 dependencies = [
     "Jinja2>=3.1",
-    "qcsc-prefect-core==0.2.3",
+    "qcsc-prefect-core==0.2.5",
 ]
 
 [project.urls]

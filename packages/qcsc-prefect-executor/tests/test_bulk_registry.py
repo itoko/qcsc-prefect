@@ -22,6 +22,8 @@ def _spec(
     stage_id: str | None = None,
     priority: int = 0,
     max_submit_attempts: int = 5,
+    execution_profile_block: str | None = None,
+    hpc_profile_block: str | None = None,
 ) -> BulkJobSpec:
     return BulkJobSpec(
         job_key=job_key,
@@ -33,6 +35,8 @@ def _spec(
         expected_outputs=expected_outputs or [],
         priority=priority,
         max_submit_attempts=max_submit_attempts,
+        execution_profile_block=execution_profile_block,
+        hpc_profile_block=hpc_profile_block,
     )
 
 
@@ -144,6 +148,8 @@ def test_registry_migrates_old_schema_with_native_bulk_columns(tmp_path: Path):
         "bulk_parent_job_id",
         "bulk_index",
         "scheduler_subjob_id",
+        "execution_profile_block",
+        "hpc_profile_block",
     } <= columns
     assert {
         "idx_bulk_jobs_status",
@@ -161,6 +167,8 @@ def test_registry_migrates_old_schema_with_native_bulk_columns(tmp_path: Path):
     assert record.bulk_parent_job_id is None
     assert record.bulk_index is None
     assert record.scheduler_subjob_id is None
+    assert record.execution_profile_block is None
+    assert record.hpc_profile_block is None
     assert record.effective_scheduler_job_id == "43607196"
 
 
@@ -212,6 +220,69 @@ def test_stage_and_native_bulk_fields_round_trip(tmp_path: Path):
     assert submitted.bulk_index == 7
     assert submitted.scheduler_subjob_id == "12345[7]"
     assert submitted.effective_scheduler_job_id == "12345[7]"
+
+
+def test_per_job_block_fields_round_trip_and_update_while_pending(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry.upsert_jobs(
+        [
+            _spec(
+                tmp_path,
+                "job-1",
+                execution_profile_block="exec-small",
+                hpc_profile_block="hpc-a",
+            )
+        ]
+    )
+
+    pending = _only_job(registry)
+    assert pending.execution_profile_block == "exec-small"
+    assert pending.hpc_profile_block == "hpc-a"
+
+    registry.upsert_jobs(
+        [
+            _spec(
+                tmp_path,
+                "job-1",
+                execution_profile_block="exec-large",
+                hpc_profile_block="hpc-b",
+            )
+        ]
+    )
+
+    updated = _only_job(registry)
+    assert updated.execution_profile_block == "exec-large"
+    assert updated.hpc_profile_block == "hpc-b"
+
+
+def test_per_job_block_fields_are_preserved_after_scheduler_submit(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry.upsert_jobs(
+        [
+            _spec(
+                tmp_path,
+                "job-1",
+                execution_profile_block="exec-original",
+                hpc_profile_block="hpc-original",
+            )
+        ]
+    )
+    registry.mark_submitted("job-1", "43607196")
+
+    registry.upsert_jobs(
+        [
+            _spec(
+                tmp_path,
+                "job-1",
+                execution_profile_block="exec-new",
+                hpc_profile_block="hpc-new",
+            )
+        ]
+    )
+
+    submitted = _only_job(registry)
+    assert submitted.execution_profile_block == "exec-original"
+    assert submitted.hpc_profile_block == "hpc-original"
 
 
 def test_upsert_jobs_is_idempotent(tmp_path: Path):

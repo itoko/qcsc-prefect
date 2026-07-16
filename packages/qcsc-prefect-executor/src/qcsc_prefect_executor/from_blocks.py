@@ -36,6 +36,8 @@ from qcsc_prefect_executor.bulk.models import (
     BulkJobStatus,
     BulkRunResult,
     SubmittedJob,
+    effective_execution_profile_block,
+    effective_hpc_profile_block,
 )
 from qcsc_prefect_executor.bulk.native_manifest import create_native_bulk_group_manifests
 from qcsc_prefect_executor.bulk.registry import BulkJobRegistry
@@ -291,10 +293,10 @@ def _resolve_named_argument(
     alias: str | None,
     label: str,
 ) -> str:
-    value = preferred or alias
-    if value is None:
+    value = preferred if preferred is not None else alias
+    if value is None or not str(value).strip():
         raise ValueError(f"{label} is required.")
-    return value
+    return str(value)
 
 
 def _ensure_registry_can_submit(*, registry: BulkJobRegistry, job_key: str) -> None:
@@ -452,6 +454,32 @@ def _validate_native_bulk_candidates(jobs: list[BulkJobRecord]) -> None:
         raise ValueError(
             "submit_mode='native_bulk' requires stage_id for every selected job: "
             + ", ".join(missing_stage)
+        )
+
+    overridden_blocks = [
+        job.job_key
+        for job in jobs
+        if job.execution_profile_block is not None or job.hpc_profile_block is not None
+    ]
+    if overridden_blocks:
+        raise ValueError(
+            "submit_mode='native_bulk' does not support per-job execution_profile_block "
+            "or hpc_profile_block overrides: "
+            + ", ".join(overridden_blocks)
+        )
+
+
+def _validate_native_bulk_specs(jobs: list[BulkJobSpec]) -> None:
+    overridden_blocks = [
+        job.job_key
+        for job in jobs
+        if job.execution_profile_block is not None or job.hpc_profile_block is not None
+    ]
+    if overridden_blocks:
+        raise ValueError(
+            "submit_mode='native_bulk' does not support per-job execution_profile_block "
+            "or hpc_profile_block overrides: "
+            + ", ".join(overridden_blocks)
         )
 
 
@@ -877,6 +905,8 @@ async def submit_job_from_blocks(
                         job_key=job_key,
                         work_dir=Path(work_dir),
                         command_args=dict(command_args or {}),
+                        execution_profile_block=resolved_execution_profile_block,
+                        hpc_profile_block=resolved_hpc_profile_block,
                     )
                 ]
             )
@@ -1380,13 +1410,15 @@ async def run_jobs_from_blocks_bulk(
     Fugaku submissions only.
     """
 
+    if submit_mode not in {"single", "native_bulk"}:
+        raise ValueError("submit_mode must be 'single' or 'native_bulk'.")
+    if submit_mode == "native_bulk":
+        _validate_native_bulk_specs(jobs)
+
     registry = BulkJobRegistry(registry_path)
     registry.upsert_jobs(jobs)
     registry.refresh_completed_jobs_from_outputs()
     total_jobs = len({job.job_key for job in jobs})
-
-    if submit_mode not in {"single", "native_bulk"}:
-        raise ValueError("submit_mode must be 'single' or 'native_bulk'.")
 
     if registry.all_terminal() or (stop_on_first_failure and _has_failed_jobs(registry)):
         return _build_bulk_run_result(registry=registry, total_jobs=total_jobs)
@@ -1423,11 +1455,18 @@ async def run_jobs_from_blocks_bulk(
             job for job in registry.get_monitorable_jobs() if job.effective_scheduler_job_id
         ]
         if monitorable_jobs:
-            await monitor_jobs_many(
-                hpc_profile_block=hpc_profile_block,
-                scheduler_job_ids=[str(job.effective_scheduler_job_id) for job in monitorable_jobs],
-                registry=registry,
-            )
+            grouped_scheduler_ids: dict[str, list[str]] = {}
+            for job in monitorable_jobs:
+                effective_hpc_block = effective_hpc_profile_block(job, hpc_profile_block)
+                grouped_scheduler_ids.setdefault(effective_hpc_block, []).append(
+                    str(job.effective_scheduler_job_id)
+                )
+            for effective_hpc_block, scheduler_job_ids in grouped_scheduler_ids.items():
+                await monitor_jobs_many(
+                    hpc_profile_block=effective_hpc_block,
+                    scheduler_job_ids=scheduler_job_ids,
+                    registry=registry,
+                )
 
         registry.refresh_completed_jobs_from_outputs()
 
@@ -1467,8 +1506,14 @@ async def run_jobs_from_blocks_bulk(
                         try:
                             await submit_job_from_blocks(
                                 command_block=command_block,
-                                execution_profile_block=execution_profile_block,
-                                hpc_profile_block=hpc_profile_block,
+                                execution_profile_block=effective_execution_profile_block(
+                                    job,
+                                    execution_profile_block,
+                                ),
+                                hpc_profile_block=effective_hpc_profile_block(
+                                    job,
+                                    hpc_profile_block,
+                                ),
                                 work_dir=job.work_dir,
                                 job_key=job.job_key,
                                 command_args=job.command_args,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from qcsc_prefect_executor.bulk.models import (
     BulkJobStatus,
     BulkTickResult,
     SubmittedJob,
+    effective_execution_profile_block,
+    effective_hpc_profile_block,
 )
 from qcsc_prefect_executor.bulk.registry import BulkJobRegistry
 
@@ -109,6 +112,8 @@ class GlobalFugakuBulkRunner:
 
     The runner uses the existing single-submit path. Native PJM bulk submission
     remains an explicit experimental mode elsewhere and is not used here.
+    Within one tick, selected pending jobs are submitted concurrently up to
+    ``submit_workers`` without increasing the queue-aware batch size.
     """
 
     command_block: str
@@ -122,9 +127,13 @@ class GlobalFugakuBulkRunner:
     max_submit_per_refill: int = 100
     target_active_jobs: int | None = None
     no_check_directory: bool = False
+    submit_workers: int = 8
 
     def __post_init__(self) -> None:
         self.registry_path = Path(self.registry_path).expanduser()
+        self.submit_workers = int(self.submit_workers)
+        if self.submit_workers < 1:
+            raise ValueError("submit_workers must be positive.")
         self.registry = BulkJobRegistry(self.registry_path)
 
     def register_jobs(self, jobs: list[BulkJobSpec]) -> None:
@@ -176,14 +185,23 @@ class GlobalFugakuBulkRunner:
         if not monitorable_jobs:
             return {}
 
-        scheduler_job_ids = [
-            str(job.effective_scheduler_job_id) for job in monitorable_jobs
-        ]
-        return await monitor_jobs_many(
-            hpc_profile_block=self.hpc_profile_block,
-            scheduler_job_ids=scheduler_job_ids,
-            registry=self.registry,
-        )
+        grouped_scheduler_ids: dict[str, list[str]] = {}
+        for job in monitorable_jobs:
+            hpc_profile_block = effective_hpc_profile_block(job, self.hpc_profile_block)
+            grouped_scheduler_ids.setdefault(hpc_profile_block, []).append(
+                str(job.effective_scheduler_job_id)
+            )
+
+        results: dict[str, BulkJobStatus] = {}
+        for hpc_profile_block, scheduler_job_ids in grouped_scheduler_ids.items():
+            results.update(
+                await monitor_jobs_many(
+                    hpc_profile_block=hpc_profile_block,
+                    scheduler_job_ids=scheduler_job_ids,
+                    registry=self.registry,
+                )
+            )
+        return results
 
     async def _submit_once(self) -> list[SubmittedJob]:
         submit_limit = _submit_limit_for_cycle(
@@ -196,35 +214,56 @@ class GlobalFugakuBulkRunner:
         if not candidates:
             return []
 
+        semaphore = asyncio.Semaphore(self.submit_workers)
+
+        async def _attempt(
+            job: BulkJobRecord,
+        ) -> tuple[str, BulkJobRecord, SubmittedJob | str]:
+            async with semaphore:
+                try:
+                    submitted_job = await submit_job_from_blocks(
+                        command_block=self.command_block,
+                        execution_profile_block=effective_execution_profile_block(
+                            job,
+                            self.execution_profile_block,
+                        ),
+                        hpc_profile_block=effective_hpc_profile_block(
+                            job,
+                            self.hpc_profile_block,
+                        ),
+                        work_dir=job.work_dir,
+                        job_key=job.job_key,
+                        command_args=job.command_args,
+                        registry=self.registry,
+                        fugaku_no_check_directory=self.no_check_directory,
+                    )
+                except (QueueFullError, TemporarySubmitError) as exc:
+                    return ("deferred", job, str(exc))
+                except Exception as exc:
+                    return ("failed", job, _exception_text(exc))
+
+                return ("submitted", job, submitted_job)
+
+        outcomes = await asyncio.gather(*(_attempt(job) for job in candidates))
+
         submitted: list[SubmittedJob] = []
-        for job in candidates:
-            try:
-                submitted_job = await submit_job_from_blocks(
-                    command_block=self.command_block,
-                    execution_profile_block=self.execution_profile_block,
-                    hpc_profile_block=self.hpc_profile_block,
-                    work_dir=job.work_dir,
-                    job_key=job.job_key,
-                    command_args=job.command_args,
-                    registry=self.registry,
-                    fugaku_no_check_directory=self.no_check_directory,
-                )
-            except (QueueFullError, TemporarySubmitError) as exc:
+        for kind, job, payload in outcomes:
+            if kind == "submitted":
+                submitted.append(payload)
+                continue
+            if kind == "deferred":
                 _mark_deferred_if_needed(
                     registry=self.registry,
                     job_key=job.job_key,
-                    error=str(exc),
-                )
-                break
-            except Exception as exc:
-                _mark_failed_if_needed(
-                    registry=self.registry,
-                    job_key=job.job_key,
-                    error=_exception_text(exc),
+                    error=str(payload),
                 )
                 continue
 
-            submitted.append(submitted_job)
+            _mark_failed_if_needed(
+                registry=self.registry,
+                job_key=job.job_key,
+                error=str(payload),
+            )
 
         return submitted
 

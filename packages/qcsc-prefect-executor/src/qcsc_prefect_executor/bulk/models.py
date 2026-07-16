@@ -77,10 +77,20 @@ class BulkJobSpec:
     priority: int = 0
     expected_outputs: list[Path] = field(default_factory=list)
     max_submit_attempts: int = 5
+    execution_profile_block: str | None = None
+    hpc_profile_block: str | None = None
 
     def __post_init__(self) -> None:
         if not self.job_key.strip():
             raise ValueError("BulkJobSpec.job_key must be non-empty.")
+        for field_name in ("execution_profile_block", "hpc_profile_block"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            normalized = str(value)
+            if not normalized.strip():
+                raise ValueError(f"BulkJobSpec.{field_name} must be non-empty when set.")
+            object.__setattr__(self, field_name, normalized)
         object.__setattr__(self, "work_dir", Path(self.work_dir))
         object.__setattr__(
             self,
@@ -124,6 +134,8 @@ class BulkJobRecord:
     bulk_parent_job_id: str | None = None
     bulk_index: int | None = None
     scheduler_subjob_id: str | None = None
+    execution_profile_block: str | None = None
+    hpc_profile_block: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -140,6 +152,28 @@ class BulkJobRecord:
     @property
     def effective_scheduler_job_id(self) -> str | None:
         return self.scheduler_subjob_id or self.scheduler_job_id
+
+
+def effective_execution_profile_block(
+    job: BulkJobSpec | BulkJobRecord,
+    default_block: str,
+) -> str:
+    """Return the per-job execution profile block or the runner/API default."""
+
+    return (
+        job.execution_profile_block
+        if job.execution_profile_block is not None
+        else default_block
+    )
+
+
+def effective_hpc_profile_block(
+    job: BulkJobSpec | BulkJobRecord,
+    default_block: str,
+) -> str:
+    """Return the per-job HPC profile block or the runner/API default."""
+
+    return job.hpc_profile_block if job.hpc_profile_block is not None else default_block
 
 
 @dataclass(frozen=True)
