@@ -545,6 +545,38 @@ def walker_sqd(
     # previous single-pass behavior exactly.
     avg_occ = elec_props.initial_occupancy
 
+    # ---- checkpoint / resume ----------------------------------------------------------------
+    # A long (many-step) recovery run can be killed (wall-clock, node fault, or a native-solver
+    # wedge) and lose everything, since the only inter-step state is the occupancy `avg_occ` that
+    # steers the next pass (+ best energy + carryover). Persist that state after every step so the
+    # run can restart mid-trajectory. Opt-in via FE4S4_CKPT_DIR; per-(trial,walker) file so
+    # multi-walker runs don't clobber each other. Absent env -> exact previous behavior.
+    _ckpt_dir = os.environ.get("FE4S4_CKPT_DIR", "").strip()
+    _ckpt_path = None
+    _resume_step = 0
+    _resume_best = None
+    if _ckpt_dir:
+        os.makedirs(_ckpt_dir, exist_ok=True)
+        _ckpt_path = os.path.join(_ckpt_dir, f"ckpt_t{trial_index:02d}_w{walker_index}.npz")
+        if os.path.exists(_ckpt_path):
+            try:
+                _ck = np.load(_ckpt_path, allow_pickle=False)
+                avg_occ = (_ck["occ_a"], _ck["occ_b"])
+                _resume_step = int(_ck["next_step"])
+                _resume_best = float(_ck["best_energy"])
+                _co = _ck["carryover"]
+                if _co.size:
+                    carryover = _co.astype(bool)
+                logger.info(
+                    "[ckpt] RESUME from %s: completed %d step(s), best_energy so far=%.6f",
+                    _ckpt_path, _resume_step, float(_ck["best_energy"]),
+                )
+            except Exception as _cexc:  # a corrupt ckpt must never block a fresh start
+                logger.info("[ckpt] ignoring unreadable checkpoint %s (%s)", _ckpt_path, _cexc)
+                _resume_step = 0
+                _resume_best = None
+    # -----------------------------------------------------------------------------------------
+
     # Per-walker random generator. recover_configurations and the subsample routines must draw
     # INDEPENDENT subspaces for each walker, otherwise differential evolution / multi-walker
     # averaging sees correlated draws and loses its diversity. A module-global Generator also races
@@ -558,6 +590,8 @@ def walker_sqd(
     walker_rng = np.random.default_rng(seed=walker_seed)
 
     best_energy: float | None = None
+    if _resume_best is not None:
+        best_energy = _resume_best  # resumed best floor; a worse new step won't overwrite it
     best_carryover: NpStrict2DArrayBool | None = None
     best_sbd_result: "SBDResult | None" = None  # SBDResult (RDMs) of the best pass, for orbital opt
     best_report_s3: str | None = None
@@ -586,6 +620,8 @@ def walker_sqd(
     )
 
     for recovery_step in range(n_recovery_steps):
+        if recovery_step < _resume_step:
+            continue  # already completed in a prior run (checkpoint resume)
         # [diag] occupancies feeding this recovery pass (per-spin); fractional values are what
         # configuration recovery needs to bias toward correlated configs.
         occ_a_arr, occ_b_arr = np.asarray(avg_occ[0]), np.asarray(avg_occ[1])
@@ -883,6 +919,31 @@ def walker_sqd(
         # this stacked/flat shape, matching what _stack_spin_carryover / the RHF branch produced.
         if step_carryover is not None:
             carryover = step_carryover
+
+        # Persist checkpoint AFTER updating avg_occ so a resume re-enters at the NEXT step with the
+        # occupancies this step produced. Atomic (tmp + replace) so a kill mid-write can't corrupt
+        # it. best_energy/best_carryover are the running best across all steps so far.
+        if _ckpt_path is not None:
+            try:
+                _co_save = (best_carryover if best_carryover is not None
+                            else np.empty((0, 0), dtype=bool))
+                # NB: np.savez appends ".npz" to a *string* path -> writing to a file HANDLE
+                # instead keeps the exact tmp name so os.replace() finds it (atomic rename).
+                _tmp = _ckpt_path + ".tmp"
+                with open(_tmp, "wb") as _fh:
+                    np.savez(
+                        _fh,
+                        occ_a=np.asarray(step_occ_a, dtype=np.float64),
+                        occ_b=np.asarray(step_occ_b, dtype=np.float64),
+                        next_step=np.int64(recovery_step + 1),
+                        best_energy=np.float64(best_energy if best_energy is not None else 0.0),
+                        carryover=np.asarray(_co_save, dtype=bool),
+                    )
+                os.replace(_tmp, _ckpt_path)
+                logger.info("[ckpt] wrote %s (next_step=%d, best=%.6f)",
+                            _ckpt_path, recovery_step + 1, float(best_energy or 0.0))
+            except Exception as _sexc:  # checkpointing must never break the calculation
+                logger.info("[ckpt] checkpoint save failed (non-fatal): %s", _sexc)
 
     logger.debug("Completed configuration recovery loop.")
 
