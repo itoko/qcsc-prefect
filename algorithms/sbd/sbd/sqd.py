@@ -224,6 +224,30 @@ def _comprehensive_summary(
                 walker_tag)
 
 
+def _compute_excitation_counts(ci_strings: np.ndarray, num_elec: int) -> dict[str, int]:
+    """Compute excitation-level counts from Hartree-Fock.
+
+    Returns dict with keys: HF, S, D, T, Q, high5 (≥5 excitations), max_exc, n_total, n_unique.
+    """
+    ci = np.asarray(ci_strings, dtype=np.int64).reshape(-1)
+    if ci.size == 0:
+        return {"HF": 0, "S": 0, "D": 0, "T": 0, "Q": 0, "high5": 0,
+                "max_exc": 0, "n_total": 0, "n_unique": 0}
+    hf = (1 << num_elec) - 1
+    exc = np.array([bin(int(x) ^ hf).count("1") // 2 for x in ci])
+    return {
+        "HF": int(np.sum(exc == 0)),
+        "S": int(np.sum(exc == 1)),
+        "D": int(np.sum(exc == 2)),
+        "T": int(np.sum(exc == 3)),
+        "Q": int(np.sum(exc == 4)),
+        "high5": int(np.sum(exc >= 5)),
+        "max_exc": int(exc.max()),
+        "n_total": int(ci.size),
+        "n_unique": len(set(ci.tolist())),
+    }
+
+
 def _excitation_summary(ci_strings: np.ndarray, num_elec: int) -> str:
     """Summarize a determinant list by excitation level from Hartree-Fock.
 
@@ -231,18 +255,11 @@ def _excitation_summary(ci_strings: np.ndarray, num_elec: int) -> str:
     dominated by high (>2) excitations cannot lower the energy below HF. This is the key diagnostic
     for why a large subspace can still collapse to the SCF energy. Returns a compact histogram.
     """
-    ci = np.asarray(ci_strings, dtype=np.int64).reshape(-1)
-    if ci.size == 0:
-        return "empty"
-    hf = (1 << num_elec) - 1  # lowest num_elec orbitals occupied
-    # excitation level = (number of differing occupied orbitals) / 2
-    exc = np.array([bin(int(x) ^ hf).count("1") // 2 for x in ci])
-    n_hf = int(np.sum(exc == 0))
-    n_sd = int(np.sum((exc >= 1) & (exc <= 2)))  # singles+doubles (couple to HF)
-    n_high = int(np.sum(exc >= 3))
+    counts = _compute_excitation_counts(ci_strings, num_elec)
     return (
-        f"n={ci.size} unique={len(set(ci.tolist()))} HF={n_hf} "
-        f"singles+doubles={n_sd} higher(>2)={n_high} max_exc={int(exc.max())}"
+        f"n={counts['n_total']} unique={counts['n_unique']} HF={counts['HF']} "
+        f"S={counts['S']} D={counts['D']} T={counts['T']} Q={counts['Q']} "
+        f"≥5={counts['high5']} max_exc={counts['max_exc']}"
     )
 
 
@@ -823,6 +840,14 @@ def walker_sqd(
             carryover_acquisition = len(cur_keys - prev_carryover_keys)
         prev_carryover_keys = cur_keys
 
+        # Compute excitation counts (S/D/T/Q/higher) from the best batch's determinant lists.
+        # For UHF: compute separately for alpha and beta. For RHF: alpha only (beta=alpha).
+        exc_a = _compute_excitation_counts(save_kwargs.get("alphadets", np.array([])), num_elec_a)
+        if "betadets" in save_kwargs and save_kwargs["betadets"] is not None:
+            exc_b = _compute_excitation_counts(save_kwargs["betadets"], num_elec_b)
+        else:
+            exc_b = exc_a  # RHF: beta = alpha
+
         recovery_trace.append(
             {
                 "step": int(recovery_step),
@@ -838,6 +863,9 @@ def walker_sqd(
                 "carryover_acquisition": int(carryover_acquisition),
                 "occ_a": step_occ_a.tolist(),
                 "occ_b": step_occ_b.tolist(),
+                # Excitation counts per spin (HF/S/D/T/Q/≥5) for per-step plotting.
+                "exc_a": exc_a,
+                "exc_b": exc_b,
             }
         )
         logger.info(
