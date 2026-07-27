@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import itertools
+import os
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
