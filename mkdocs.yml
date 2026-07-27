@@ -62,9 +62,11 @@ nav:
   - Tutorials:
       - Miyabi Workflow: tutorials/create_qcsc_workflow_for_miyabi.md
       - Fugaku Workflow: tutorials/create_qcsc_workflow_for_fugaku.md
+      - ROQUO (GB200 GPU) Workflow: tutorials/create_qcsc_workflow_for_roquo_gpu.md
       - Local Slurm Workflow: tutorials/create_qcsc_workflow_for_local_slurm.md
       - Closed Loop Workflow: tutorials/run_sbd_closed_loop_workflow.md
       - Closed Loop Workflow (Fugaku): tutorials/run_sbd_closed_loop_workflow_fugaku.md
+      - UHF/BS-UHF for Any Molecule (Fugaku + ROQUO): tutorials/run_uhf_bsuhf_any_molecule.md
   - How-to:
       - Native Qiskit on Prefect: howto/howto_use_native_qiskit_prefect.md
       - Prefect Qiskit Setup: howto/howto_setup_prefect_qiskit.md
@@ -83,3 +85,4 @@ nav:
       - PyPI Release Guide: release.md
       - QCSC Prefect API: reference/qcsc_prefect_api.md
       - Native Qiskit API: reference/native_qiskit_api.md
+      - HPC Resource Sizing: reference/hpc_resource_sizing.md

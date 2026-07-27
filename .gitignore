@@ -228,3 +228,6 @@ algorithms/sbd/native/*.err
 
 # Local analysis artifacts (not for commit)
 docs/analysis_2026-06-30/
+
+# Notebook-fetched example data (downloaded at run time, not vendored)
+examples/sbd_uhf_recover_any_molecule/data/
