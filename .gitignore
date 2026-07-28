@@ -229,5 +229,9 @@ algorithms/sbd/native/*.err
 # Local analysis artifacts (not for commit)
 docs/analysis_2026-06-30/
 
+# Draft reports for internal review (not for the public repo yet)
+docs/2026-07-22/
+docs/2026-07-26/
+
 # Notebook-fetched example data (downloaded at run time, not vendored)
 examples/sbd_uhf_recover_any_molecule/data/
