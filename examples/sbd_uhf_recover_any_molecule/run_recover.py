@@ -128,6 +128,20 @@ def build_create_blocks_cmd(args: argparse.Namespace, *, python: str, sbd_dir: P
             cmd += ["--fugaku-gfscache", args.fugaku_gfscache]
         if args.fugaku_mpi_options_for_pjm:
             cmd += ["--fugaku-mpi-options-for-pjm", *args.fugaku_mpi_options_for_pjm]
+    elif args.hpc_target == "miyabi":
+        if not args.group:
+            raise SystemExit("--group is required for --hpc-target miyabi (PBS group_list).")
+        if not args.queue:
+            raise SystemExit(
+                "--queue is required for --hpc-target miyabi (e.g. regular-g for Miyabi-G GPU "
+                "nodes, regular-c for Miyabi-C CPU nodes)."
+            )
+        cmd += ["--group", args.group, "--queue", args.queue]
+        # Miyabi-G is 1 GPU/node -- confirmed from a working reference PBS script (not in this
+        # repo) that `#PBS -l select=N:mpiprocs=M` alone gets the GPU, with no separate `ngpus=`
+        # resource request and `mpirun -n <total>` as the launcher (not mpiexec.hydra). This is
+        # NOT yet independently verified against this repo's own Miyabi adapter template --
+        # confirm the generated .pbs script's select= line looks right before trusting it blind.
     elif args.hpc_target == "slurm":
         if not args.slurm_account:
             raise SystemExit("--slurm-account is required for --hpc-target slurm.")
@@ -174,7 +188,7 @@ def main() -> None:
                        help="Enables checkpoint/resume (FE4S4_CKPT_DIR). Omit to disable.")
 
     hpc = p.add_argument_group("HPC target + sizing (see docs/reference/hpc_resource_sizing.md)")
-    hpc.add_argument("--hpc-target", choices=["fugaku", "slurm", "local"], required=True)
+    hpc.add_argument("--hpc-target", choices=["fugaku", "miyabi", "slurm", "local"], required=True)
     hpc.add_argument("--solver-mode", choices=["cpu", "gpu", "fugaku"], default=None,
                       help="Default: 'fugaku' for --hpc-target fugaku, else 'cpu'. Pass 'gpu' "
                            "for a GPU solver run (e.g. ROQUO).")
