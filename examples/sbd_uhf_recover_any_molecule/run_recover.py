@@ -110,6 +110,7 @@ def build_create_blocks_cmd(args: argparse.Namespace, *, python: str, sbd_dir: P
         "--carryover-ratio", str(args.carryover_ratio),
         "--carryover-type", str(args.carryover_type),
         "--solver-timeout-seconds", str(args.solver_timeout_seconds),
+        "--walltime", args.walltime,
         "--saved-samples", *pools,
         "--sbd-executable", args.sbd_executable,
     ]
@@ -227,6 +228,11 @@ def main() -> None:
     solver.add_argument("--carryover-ratio", type=float, default=0.5)
     solver.add_argument("--carryover-type", type=int, default=1)
     solver.add_argument("--solver-timeout-seconds", type=float, default=43_200)
+    solver.add_argument("--walltime", default="02:00:00",
+                         help="Per-solver-job wall-clock limit (PBS/Slurm HH:MM:SS), NOT the "
+                              "total run time -- one solve per recovery step gets its own job "
+                              "at this limit. create_blocks.py's own default (2h) is usually too "
+                              "short for a large sqd_dim; size it to your expected per-step time.")
     solver.add_argument("--solver-block-ref", default="sbd_solver_job/davidson-solver")
 
     misc = p.add_argument_group("misc")
