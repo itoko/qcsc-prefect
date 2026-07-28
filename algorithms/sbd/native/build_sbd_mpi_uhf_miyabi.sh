@@ -157,13 +157,25 @@ rm -rf build/nvhpc-thrust
 NCCL_INC=$(dirname "$(find "$NV" -name nccl.h 2>/dev/null | head -1)")
 CUBLAS_LIB=$(dirname "$(find "$NV" -name libcublas.so 2>/dev/null | head -1)")
 echo "CUBLAS_LIB=$CUBLAS_LIB"
+
+# RPATH, not just -L at link time: on Miyabi-G, `module load`'s LD_LIBRARY_PATH does NOT
+# propagate to remote ranks under mpirun/PBS multi-node (confirmed on real hardware -- rank 0
+# finds libnccl.so.2 fine via the launching shell's env, rank 1 on the second node does not).
+# Embedding the actual runtime lib dirs as RPATH makes every rank self-sufficient regardless of
+# what environment mpirun did or didn't forward -- the same technique this repo's DICE Miyabi
+# build already uses (RUNPATH=$ORIGIN) for its own bundled-library problem.
+MPI_LIB_DIR=$(dirname "$(find "$NV" -name libmpi.so.40 2>/dev/null | head -1)")
+CUDA_LIB_DIR=$(dirname "$(find "$NV" -name libcudart.so 2>/dev/null | head -1)")
+RPATH_DIRS="${NCCL_ROOT}/lib:${CUBLAS_LIB}:${MPI_LIB_DIR}:${CUDA_LIB_DIR}:${NV}/compilers/lib"
+echo "RPATH_DIRS=$RPATH_DIRS"
+
 cmake --preset nvhpc-thrust \
   -DSBD_USE_NCCL=ON \
   -DSBD_USE_CUBLAS=ON \
   -DSBD_USE_RANK_DISTRIBUTION=ON \
   -DSBD_USE_BLOCK_RANK_DISTRIBUTION=ON \
   -DCMAKE_CXX_FLAGS="-D_UHF -DSBD_PREFECT -DSBD_NON_CUDA_AWARE_MPI -I${NCCL_INC}" \
-  -DCMAKE_EXE_LINKER_FLAGS="-L${NCCL_ROOT}/lib -lnccl -L${CUBLAS_LIB} -lcublas -cudalib=cublas" \
+  -DCMAKE_EXE_LINKER_FLAGS="-L${NCCL_ROOT}/lib -lnccl -L${CUBLAS_LIB} -lcublas -cudalib=cublas -Wl,-rpath,${RPATH_DIRS}" \
   2>&1 | tail -25
 echo "=== build tpb_diag ==="
 cmake --build build/nvhpc-thrust --target tpb_diag -j 8 2>&1 | tail -25
