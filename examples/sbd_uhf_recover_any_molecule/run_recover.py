@@ -119,6 +119,8 @@ def build_create_blocks_cmd(args: argparse.Namespace, *, python: str, sbd_dir: P
         cmd += ["--launcher", args.launcher]
     if args.mpi_options:
         cmd += ["--mpi-options", *args.mpi_options]
+    if args.modules:
+        cmd += ["--modules", *args.modules]
 
     if args.hpc_target == "fugaku":
         if not args.group:
@@ -203,6 +205,11 @@ def main() -> None:
     hpc.add_argument("--task-comm-size", type=int, default=1)
     hpc.add_argument("--launcher", default=None, help="e.g. mpiexec (Fugaku), srun/mpirun (ROQUO).")
     hpc.add_argument("--mpi-options", nargs="*", default=None)
+    hpc.add_argument("--modules", nargs="*", default=None,
+                      help="Modules to 'module load' inside the generated batch script -- PBS "
+                           "targets (Fugaku, Miyabi) do not inherit the submitting shell's "
+                           "loaded modules, so anything the solver binary needs on PATH/"
+                           "LD_LIBRARY_PATH (e.g. nvidia/25.9 on Miyabi-G) must be listed here.")
     hpc.add_argument("--queue", default=None, help="Fugaku rscgrp.")
     hpc.add_argument("--group", default=None, help="Fugaku group.")
     hpc.add_argument("--fugaku-gfscache", default=None)
