@@ -14,12 +14,16 @@ class _LoggerStub:
     def __init__(self) -> None:
         self.info_lines: list[str] = []
         self.error_lines: list[str] = []
+        self.warning_lines: list[str] = []
 
     def info(self, message: str) -> None:
         self.info_lines.append(message)
 
     def error(self, message: str) -> None:
         self.error_lines.append(message)
+
+    def warning(self, message: str, *args: Any) -> None:
+        self.warning_lines.append(message % args if args else message)
 
 
 class _RuntimeStub:
@@ -39,6 +43,7 @@ class _RuntimeStub:
         *,
         watch_poll_interval: float = 10.0,
         timeout_seconds: float | None = None,
+        stdout_fallback_path: Path | None = None,
     ) -> dict[str, Any]:
         self._calls.append(
             (
@@ -47,6 +52,7 @@ class _RuntimeStub:
                 {
                     "watch_poll_interval": watch_poll_interval,
                     "timeout_seconds": timeout_seconds,
+                    "stdout_fallback_path": stdout_fallback_path,
                 },
             )
         )
@@ -115,7 +121,56 @@ def test_run_miyabi_job_local_mock(tmp_path: Path, monkeypatch):
     assert runtime_calls[1] == (
         "wait_final_status",
         ("12345.miyabi",),
-        {"watch_poll_interval": 0.01, "timeout_seconds": 5},
+        {
+            "watch_poll_interval": 0.01,
+            "timeout_seconds": 5,
+            "stdout_fallback_path": tmp_path / "output.out",
+        },
     )
     assert len(artifact_calls) == 1
     assert artifact_calls[0]["key"] == "pytest-metrics"
+    assert logger.warning_lines == []
+
+
+def test_run_miyabi_job_local_mock_logs_fallback_warning(tmp_path: Path, monkeypatch):
+    """When qstat -fH never confirms completion and the stdout-stability fallback fires,
+    run_miyabi_job must surface that (via a warning log), not swallow it silently."""
+    stdout_path = tmp_path / "output.out"
+    stdout_path.write_text("hello from stdout")
+
+    final_status = {
+        "job_state": "F",
+        "Exit_status": "0",
+        "Output_Path": str(stdout_path),
+        "_fallback": "qstat -fH never reported job_id=12345.miyabi as finished",
+    }
+    runtime_calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    logger = _LoggerStub()
+
+    def runtime_factory() -> _RuntimeStub:
+        return _RuntimeStub(final_status=final_status, calls=runtime_calls)
+
+    async def fake_create_table_artifact(*, table: list[list[Any]], key: str) -> None:
+        pass
+
+    monkeypatch.setattr(run_mod, "MiyabiPBSRuntime", runtime_factory)
+    monkeypatch.setattr(run_mod, "get_run_logger", lambda: logger)
+    monkeypatch.setattr(run_mod, "create_table_artifact", fake_create_table_artifact)
+
+    profile = ExecutionProfile(command_key="hello", num_nodes=1, launcher="single")
+    req = MiyabiJobRequest(queue_name="normal", project="z99999", executable="/bin/echo")
+
+    result = asyncio.run(
+        run_mod.run_miyabi_job(
+            work_dir=tmp_path,
+            script_filename="job.pbs",
+            exec_profile=profile,
+            req=req,
+            watch_poll_interval=0.01,
+            timeout_seconds=5,
+        )
+    )
+
+    assert result.exit_status == 0
+    assert len(logger.warning_lines) == 1
+    assert "12345.miyabi" in logger.warning_lines[0]

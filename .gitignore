@@ -219,10 +219,45 @@ algorithms/sbd/native/diag
 algorithms/sbd/native/*.o
 algorithms/sbd/native/sbd/
 algorithms/sbd/native/sbd_mpi/
+algorithms/sbd/native/sbd_bisect/
+algorithms/sbd/native/oldmodule/
+algorithms/sbd/native/containers/
 algorithms/sbd/native/diag-gpu*
 algorithms/sbd/native/diag_uhf
 algorithms/sbd/native/*.out
 algorithms/sbd/native/*.err
+algorithms/sbd/native/*.bak*
+algorithms/sbd/native/wedge_backtrace_*.txt
+# One-off investigation build-script variants + probes from the 2026-08 ROQUO container/OMP
+# investigation -- the two production-relevant recipes (build_sbd_mpi_uhf_hpcx250.sh,
+# build_sbd_mpi_uhf_container.sh) are tracked; everything else here was throwaway isolation
+# testing (see docs/2026-08-13 for the writeup) and doesn't need to live in the repo.
+algorithms/sbd/native/build_sbd_mpi_uhf_hpcx250_control.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_hpcx250_freshtest.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_hpcx250_genexcfix.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_hpcx250_pristine.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_nvhpcmpi*.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_pr79.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_rdmfix.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_safeallreduce.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_sw1.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_atomicfix.sh
+algorithms/sbd/native/build_sbd_mpi_uhf_ompfix.sh
+algorithms/sbd/native/build_sbd_mpi_atomicfix.sh
+algorithms/sbd/native/build_sbd_mpi.sh
+algorithms/sbd/native/build_sbd_mpi_uhf.sh
+algorithms/sbd/native/build_oldmodule_test.sh
+algorithms/sbd/native/build_rhf.*
+algorithms/sbd/native/build_uhf.*
+algorithms/sbd/native/_build_both.sh
+algorithms/sbd/native/check_*.sh
+algorithms/sbd/native/dump_module.sh
+algorithms/sbd/native/pmix_*.sh
+algorithms/sbd/native/pull_nvhpc_container.sh
+algorithms/sbd/native/sbd-mpi-*.out
+algorithms/sbd/native/sbd-mpi-*.err
+algorithms/sbd/native/sbd_*.out
+algorithms/sbd/native/sbd_*.err
 .DS_Store
 .vscode/sftp.json
 
@@ -232,6 +267,16 @@ docs/analysis_2026-06-30/
 # Draft reports for internal review (not for the public repo yet)
 docs/2026-07-22/
 docs/2026-07-26/
+
+# Future-work brainstorm for the manuscript, not for publication/commit
+docs/2026-08-04/README.md
+# Paper drafts / internal notes / support-response drafts, not for the public repo yet
+docs/2026-08-04/
+
+# Personal scratch: job-tracking notes and diagram-tool working files
+/ACTIVE_JOBS.md
+/QCSC-prefect-workflow.drawio
+/QCSCprefectUHFcloseloop.drawio
 
 # Notebook-fetched example data (downloaded at run time, not vendored)
 examples/sbd_uhf_recover_any_molecule/data/
