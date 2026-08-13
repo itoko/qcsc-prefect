@@ -3,10 +3,12 @@
 import asyncio
 import dataclasses
 import itertools
+import json
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
+import os
 import numpy as np
 from prefect import get_run_logger, task
 from prefect.variables import Variable
@@ -224,6 +226,30 @@ def _comprehensive_summary(
                 walker_tag)
 
 
+def _compute_excitation_counts(ci_strings: np.ndarray, num_elec: int) -> dict[str, int]:
+    """Compute excitation-level counts from Hartree-Fock.
+
+    Returns dict with keys: HF, S, D, T, Q, high5 (>=5 excitations), max_exc, n_total, n_unique.
+    """
+    ci = np.asarray(ci_strings, dtype=np.int64).reshape(-1)
+    if ci.size == 0:
+        return {"HF": 0, "S": 0, "D": 0, "T": 0, "Q": 0, "high5": 0,
+                "max_exc": 0, "n_total": 0, "n_unique": 0}
+    hf = (1 << num_elec) - 1
+    exc = np.array([bin(int(x) ^ hf).count("1") // 2 for x in ci])
+    return {
+        "HF": int(np.sum(exc == 0)),
+        "S": int(np.sum(exc == 1)),
+        "D": int(np.sum(exc == 2)),
+        "T": int(np.sum(exc == 3)),
+        "Q": int(np.sum(exc == 4)),
+        "high5": int(np.sum(exc >= 5)),
+        "max_exc": int(exc.max()),
+        "n_total": int(ci.size),
+        "n_unique": len(set(ci.tolist())),
+    }
+
+
 def _excitation_summary(ci_strings: np.ndarray, num_elec: int) -> str:
     """Summarize a determinant list by excitation level from Hartree-Fock.
 
@@ -231,18 +257,15 @@ def _excitation_summary(ci_strings: np.ndarray, num_elec: int) -> str:
     dominated by high (>2) excitations cannot lower the energy below HF. This is the key diagnostic
     for why a large subspace can still collapse to the SCF energy. Returns a compact histogram.
     """
-    ci = np.asarray(ci_strings, dtype=np.int64).reshape(-1)
-    if ci.size == 0:
+    counts = _compute_excitation_counts(ci_strings, num_elec)
+    if counts["n_total"] == 0:
         return "empty"
-    hf = (1 << num_elec) - 1  # lowest num_elec orbitals occupied
-    # excitation level = (number of differing occupied orbitals) / 2
-    exc = np.array([bin(int(x) ^ hf).count("1") // 2 for x in ci])
-    n_hf = int(np.sum(exc == 0))
-    n_sd = int(np.sum((exc >= 1) & (exc <= 2)))  # singles+doubles (couple to HF)
-    n_high = int(np.sum(exc >= 3))
+    n_sd = counts["S"] + counts["D"]              # singles+doubles (the terms that couple to HF)
+    n_high = counts["n_total"] - counts["HF"] - n_sd  # >2 (triples and above)
     return (
-        f"n={ci.size} unique={len(set(ci.tolist()))} HF={n_hf} "
-        f"singles+doubles={n_sd} higher(>2)={n_high} max_exc={int(exc.max())}"
+        f"n={counts['n_total']} unique={counts['n_unique']} HF={counts['HF']} "
+        f"S={counts['S']} D={counts['D']} T={counts['T']} singles+doubles={n_sd} "
+        f"higher(>2)={n_high} max_exc={counts['max_exc']}"
     )
 
 
@@ -266,9 +289,21 @@ def walker_sqd(
     n_batches: int = 1,
     seed_cisd: int = 0,
     seed_budget_frac: float = 1.0,
+    hci_boost: int = 0,
+    hci_boost_max: int = 20000,
+    hci_boost_ncore: int = 200,
+    recomb_boost: bool = False,
+    recomb_max_parents: int = 250,
 ) -> tuple[tuple[float, NpStrict2DArrayBool, "SBDResult | None"], dict[str, Any]]:
     logger = get_run_logger()
     davidson_solver = SBDSolverJob.load(solver_block_name)
+
+    # Opt-in same-spin recombination candidate booster (see _recombine_same_spin_candidates).
+    # Env-var override lets existing env-var-driven launcher scripts opt in without new CLI/flow
+    # parameter plumbing, matching the FE4S4_CKPT_DIR / FE4S4_AF_GROUPS convention.
+    recomb_boost = recomb_boost or os.environ.get("FE4S4_RECOMB_BOOST", "0") == "1"
+    recomb_max_parents = int(os.environ.get("FE4S4_RECOMB_MAX_PARENTS", str(recomb_max_parents)))
+    seed_budget_frac = float(os.environ.get("FE4S4_SEED_BUDGET_FRAC", str(seed_budget_frac)))
 
     telemetry = {
         "trial_index": trial_index,
@@ -528,6 +563,38 @@ def walker_sqd(
     # previous single-pass behavior exactly.
     avg_occ = elec_props.initial_occupancy
 
+    # ---- checkpoint / resume ----------------------------------------------------------------
+    # A long (many-step) recovery run can be killed (wall-clock, node fault, or a native-solver
+    # wedge) and lose everything, since the only inter-step state is the occupancy `avg_occ` that
+    # steers the next pass (+ best energy + carryover). Persist that state after every step so the
+    # run can restart mid-trajectory. Opt-in via FE4S4_CKPT_DIR; per-(trial,walker) file so
+    # multi-walker runs don't clobber each other. Absent env -> exact previous behavior.
+    _ckpt_dir = os.environ.get("FE4S4_CKPT_DIR", "").strip()
+    _ckpt_path = None
+    _resume_step = 0
+    _resume_best = None
+    if _ckpt_dir:
+        os.makedirs(_ckpt_dir, exist_ok=True)
+        _ckpt_path = os.path.join(_ckpt_dir, f"ckpt_t{trial_index:02d}_w{walker_index}.npz")
+        if os.path.exists(_ckpt_path):
+            try:
+                _ck = np.load(_ckpt_path, allow_pickle=False)
+                avg_occ = (_ck["occ_a"], _ck["occ_b"])
+                _resume_step = int(_ck["next_step"])
+                _resume_best = float(_ck["best_energy"])
+                _co = _ck["carryover"]
+                if _co.size:
+                    carryover = _co.astype(bool)
+                logger.info(
+                    "[ckpt] RESUME from %s: completed %d step(s), best_energy so far=%.6f",
+                    _ckpt_path, _resume_step, float(_ck["best_energy"]),
+                )
+            except Exception as _cexc:  # a corrupt ckpt must never block a fresh start
+                logger.info("[ckpt] ignoring unreadable checkpoint %s (%s)", _ckpt_path, _cexc)
+                _resume_step = 0
+                _resume_best = None
+    # -----------------------------------------------------------------------------------------
+
     # Per-walker random generator. recover_configurations and the subsample routines must draw
     # INDEPENDENT subspaces for each walker, otherwise differential evolution / multi-walker
     # averaging sees correlated draws and loses its diversity. A module-global Generator also races
@@ -541,6 +608,8 @@ def walker_sqd(
     walker_rng = np.random.default_rng(seed=walker_seed)
 
     best_energy: float | None = None
+    if _resume_best is not None:
+        best_energy = _resume_best  # resumed best floor; a worse new step won't overwrite it
     best_carryover: NpStrict2DArrayBool | None = None
     best_sbd_result: "SBDResult | None" = None  # SBDResult (RDMs) of the best pass, for orbital opt
     best_report_s3: str | None = None
@@ -569,6 +638,8 @@ def walker_sqd(
     )
 
     for recovery_step in range(n_recovery_steps):
+        if recovery_step < _resume_step:
+            continue  # already completed in a prior run (checkpoint resume)
         # [diag] occupancies feeding this recovery pass (per-spin); fractional values are what
         # configuration recovery needs to bias toward correlated configs.
         occ_a_arr, occ_b_arr = np.asarray(avg_occ[0]), np.asarray(avg_occ[1])
@@ -659,6 +730,8 @@ def walker_sqd(
                     rng=walker_rng,
                     seed_cisd=seed_cisd,
                     seed_budget_frac=seed_budget_frac,
+                    recomb_boost=recomb_boost,
+                    recomb_max_parents=recomb_max_parents,
                 )
                 if batch == 0:
                     # [diag] excitation profile of batch 0 (make-or-break: a subspace dominated by
@@ -697,6 +770,8 @@ def walker_sqd(
                     rng=walker_rng,
                     seed_cisd=seed_cisd,
                     seed_budget_frac=seed_budget_frac,
+                    recomb_boost=recomb_boost,
+                    recomb_max_parents=recomb_max_parents,
                 )
                 if batch == 0:
                     logger.info("[diag] recovery %d/%d dets: %s", recovery_step + 1,
@@ -713,6 +788,72 @@ def walker_sqd(
                 this_carryover = sbd_result.carryover_bitstrings
                 this_net_dim = int(len(ci_strings) ** 2)
                 this_save_kwargs = dict(alphadets=ci_strings)
+
+            # --- HCI importance booster (OPT-IN, hci_boost>0; default OFF => this block is skipped) ---
+            # After the solve, take the high-weight core (carryover ~ large-|c| dets), generate its
+            # single+double connected children (=> triples/quads by IMPORTANCE, not sampling frequency),
+            # augment the subspace and re-solve ONCE, keeping the lower energy. Addresses the recovery
+            # limitation (frequency/occupancy selection can't surface strongly-coupled high-rank dets).
+            if hci_boost > 0:
+                try:
+                    core_a = _spin_halves_as_ints(this_carryover, norb)[1] if this_carryover.size else np.empty(0, dtype=np.longlong)
+                    if elec_props.unrestricted:
+                        cur_a = np.asarray(this_save_kwargs["alphadets"], dtype=np.longlong)
+                        cur_b = np.asarray(this_save_kwargs["betadets"], dtype=np.longlong)
+                        core_b = _spin_halves_as_ints(this_carryover, norb)[0] if this_carryover.size else np.empty(0, dtype=np.longlong)
+                        # aug may exceed the base subspace by up to OVERSHOOT (re-solve cost ~ aug^2, so
+                        # 1.3x base => ~1.7x solve cost -- bounded, unlike the old uncapped 1.7e9 blowup).
+                        # A hard clamp to sqrt(d) disabled the booster entirely once cur filled to sqrt(d).
+                        _overshoot = float(os.environ.get("HCI_BOOST_OVERSHOOT", "1.3"))
+                        _ceil = int(_overshoot * max(int(sqd_dim ** 0.5), int(cur_a.size), int(cur_b.size)))
+                        _mn = max(0, min(hci_boost_max, _ceil - int(cur_a.size)))
+                        new_a = _hci_boost_strings(core_a, cur_a, norb, num_elec_a, _mn, hci_boost_ncore,
+                                                   h1=elec_props.one_body_tensor, h2=elec_props.two_body_tensor)
+                        new_b = _hci_boost_strings(core_b, cur_b, norb, num_elec_b, _mn, hci_boost_ncore,
+                                                   h1=(elec_props.one_body_tensor_b if elec_props.one_body_tensor_b is not None else elec_props.one_body_tensor),
+                                                   h2=(elec_props.two_body_tensor_bb if elec_props.two_body_tensor_bb is not None else elec_props.two_body_tensor))
+                        if new_a.size or new_b.size:
+                            aug_a = np.unique(np.concatenate([cur_a, new_a])) if new_a.size else cur_a
+                            aug_b = np.unique(np.concatenate([cur_b, new_b])) if new_b.size else cur_b
+                            r2 = asyncio.run(davidson_solver.run(
+                                ci_strings=(aug_a, aug_b),
+                                one_body_tensor=elec_props.one_body_tensor,
+                                two_body_tensor=elec_props.two_body_tensor,
+                                norb=norb, nelec=elec_props.num_electrons,
+                                one_body_tensor_b=elec_props.one_body_tensor_b,
+                                two_body_tensor_ab=elec_props.two_body_tensor_ab,
+                                two_body_tensor_bb=elec_props.two_body_tensor_bb,
+                            ))
+                            if r2.energy < sbd_result.energy:
+                                logger.info("[diag] recovery %d/%d batch %d HCI-boost: +%d/%d dets a/b, "
+                                            "dE=%.6f", recovery_step + 1, n_recovery_steps, batch + 1,
+                                            int(new_a.size), int(new_b.size), r2.energy - sbd_result.energy)
+                                sbd_result = r2; this_carryover = _stack_spin_carryover(
+                                    carryover_a=r2.carryover_bitstrings, carryover_b=r2.carryover_bitstrings_b, norb=norb)
+                                this_net_dim = int(len(aug_a) * len(aug_b))
+                                this_save_kwargs = dict(alphadets=aug_a, betadets=aug_b)
+                    else:
+                        cur = np.asarray(this_save_kwargs["alphadets"], dtype=np.longlong)
+                        _overshoot = float(os.environ.get("HCI_BOOST_OVERSHOOT", "1.3"))
+                        _ceil = int(_overshoot * max(int(sqd_dim ** 0.5), int(cur.size)))
+                        _mn = max(0, min(hci_boost_max, _ceil - int(cur.size)))
+                        new = _hci_boost_strings(core_a, cur, norb, num_elec_a, _mn, hci_boost_ncore,
+                                                 h1=elec_props.one_body_tensor, h2=elec_props.two_body_tensor)
+                        if new.size:
+                            aug = np.unique(np.concatenate([cur, new]))
+                            r2 = asyncio.run(davidson_solver.run(
+                                ci_strings=(aug, aug), one_body_tensor=elec_props.one_body_tensor,
+                                two_body_tensor=elec_props.two_body_tensor, norb=norb,
+                                nelec=elec_props.num_electrons))
+                            if r2.energy < sbd_result.energy:
+                                logger.info("[diag] recovery %d/%d batch %d HCI-boost: +%d dets, dE=%.6f",
+                                            recovery_step + 1, n_recovery_steps, batch + 1,
+                                            int(new.size), r2.energy - sbd_result.energy)
+                                sbd_result = r2; this_carryover = r2.carryover_bitstrings
+                                this_net_dim = int(len(aug) ** 2); this_save_kwargs = dict(alphadets=aug)
+                except Exception as _hci_e:  # booster must never break a run
+                    logger.warning("[diag] recovery %d/%d batch %d HCI-boost skipped (%s)",
+                                   recovery_step + 1, n_recovery_steps, batch + 1, _hci_e)
 
             this_energy = sbd_result.energy + elec_props.nuclear_repulsion_energy
             batch_energies.append(float(this_energy))
@@ -823,6 +964,14 @@ def walker_sqd(
             carryover_acquisition = len(cur_keys - prev_carryover_keys)
         prev_carryover_keys = cur_keys
 
+        # Compute excitation counts (S/D/T/Q/higher) from the best batch's determinant lists.
+        # For UHF: compute separately for alpha and beta. For RHF: alpha only (beta=alpha).
+        exc_a = _compute_excitation_counts(save_kwargs.get("alphadets", np.array([])), num_elec_a)
+        if "betadets" in save_kwargs and save_kwargs["betadets"] is not None:
+            exc_b = _compute_excitation_counts(save_kwargs["betadets"], num_elec_b)
+        else:
+            exc_b = exc_a  # RHF: beta = alpha
+
         recovery_trace.append(
             {
                 "step": int(recovery_step),
@@ -838,6 +987,9 @@ def walker_sqd(
                 "carryover_acquisition": int(carryover_acquisition),
                 "occ_a": step_occ_a.tolist(),
                 "occ_b": step_occ_b.tolist(),
+                # Excitation counts per spin (HF/S/D/T/Q/>=5) for per-step plotting.
+                "exc_a": exc_a,
+                "exc_b": exc_b,
             }
         )
         logger.info(
@@ -847,6 +999,31 @@ def walker_sqd(
 
         # Feed the batch-averaged occupancies into the next recovery pass (self-consistency).
         avg_occ = (step_occ_a, step_occ_b)
+
+        # Persist checkpoint AFTER updating avg_occ so a resume re-enters at the NEXT step with the
+        # occupancies this step produced. Atomic (tmp + replace) so a kill mid-write can't corrupt
+        # it. best_energy/best_carryover are the running best across all steps so far.
+        if _ckpt_path is not None:
+            try:
+                _co_save = (best_carryover if best_carryover is not None
+                            else np.empty((0, 0), dtype=bool))
+                # NB: np.savez appends ".npz" to a *string* path -> writing to a file HANDLE
+                # instead keeps the exact tmp name so os.replace() finds it (atomic rename).
+                _tmp = _ckpt_path + ".tmp"
+                with open(_tmp, "wb") as _fh:
+                    np.savez(
+                        _fh,
+                        occ_a=np.asarray(step_occ_a, dtype=np.float64),
+                        occ_b=np.asarray(step_occ_b, dtype=np.float64),
+                        next_step=np.int64(recovery_step + 1),
+                        best_energy=np.float64(best_energy if best_energy is not None else 0.0),
+                        carryover=np.asarray(_co_save, dtype=bool),
+                    )
+                os.replace(_tmp, _ckpt_path)
+                logger.info("[ckpt] wrote %s (next_step=%d, best=%.6f)",
+                            _ckpt_path, recovery_step + 1, float(best_energy or 0.0))
+            except Exception as _sexc:  # checkpointing must never break the calculation
+                logger.info("[ckpt] save skipped (%s: %s)", type(_sexc).__name__, str(_sexc)[:160])
         # Feed the best batch's carryover determinants forward too. Without this the loop re-uses
         # the ORIGINAL `carryover` argument every step (empty on a fresh walker), so with
         # carryover_type>0 the high-weight determinants found in step N are discarded at step N+1
@@ -885,6 +1062,7 @@ def walker_sqd(
         n_recovery_steps=n_recovery_steps,
         n_batches=n_batches,
         seed_cisd=seed_cisd,
+        recomb_boost=recomb_boost,
         sqd_data=str(best_report_s3),
         recovery_trace=recovery_trace,
         last_updated=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -941,6 +1119,85 @@ def _safe_run_logger():
 
 
 _CISD_CACHE: dict[tuple[int, int, int], NpStrict1DArrayLL] = {}
+
+
+def _sd_children(det: int, norb: int, num_elec: int) -> set[int]:
+    """All singles+doubles CONNECTED to a single-spin determinant `det` (bit-space, popcount conserved).
+    Applied to a det that is itself a double/triple this yields triples/quadruples/pentuples relative to
+    HF -> importance-based high-rank generation (ASCI/HCI style) from a high-weight parent. Same bit
+    convention as _cisd_strings (occupied = set bits)."""
+    occ = [p for p in range(norb) if (det >> p) & 1]
+    virt = [p for p in range(norb) if not ((det >> p) & 1)]
+    out: set[int] = set()
+    for i in occ:  # singles
+        di = det & ~(1 << i)
+        for a in virt:
+            out.add(di | (1 << a))
+    for xi in range(len(occ)):  # doubles
+        i = occ[xi]; di = det & ~(1 << i)
+        for xj in range(xi + 1, len(occ)):
+            j = occ[xj]; dij = di & ~(1 << j)
+            for xa in range(len(virt)):
+                a = virt[xa]; da = dij | (1 << a)
+                for xb in range(xa + 1, len(virt)):
+                    out.add(da | (1 << virt[xb]))
+    return out
+
+
+def _excitation_amplitude(parent: int, child: int, h1, h2) -> float:
+    """|H_{child,parent}| proxy for the ONE-SPIN excitation connecting parent->child (same popcount).
+    Single (p->q):  |h1[p,q]|. Double (pq->rs): |g_psqt - g_ptqs| antisymmetrized 2e integral.
+    The driving-integral magnitude (the |H_ai| in the SHCI/ASCI |H_ai . c_i| criterion), computed
+    cheaply from the FCIDUMP tensors. Returns 0.0 if tensors unavailable or rank not 1/2."""
+    removed = parent & ~child
+    added = child & ~parent
+    norb = h1.shape[0]
+    r = [p for p in range(norb) if (removed >> p) & 1]
+    a = [p for p in range(norb) if (added >> p) & 1]
+    if len(r) == 1 and len(a) == 1:
+        return abs(float(h1[r[0], a[0]]))
+    if len(r) == 2 and len(a) == 2 and h2 is not None:
+        p, q = r; s, t = a
+        try:
+            return abs(float(h2[p, s, q, t]) - float(h2[p, t, q, s]))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _hci_boost_strings(core_ints: np.ndarray, existing_ints: np.ndarray, norb: int,
+                       num_elec: int, max_new: int, n_core: int,
+                       h1=None, h2=None) -> NpStrict1DArrayLL:
+    """HCI/ASCI importance booster (OPT-IN): from the top-weight 'core' determinants (rank-ordered
+    carryover, |c|-proxy), generate single+double connected children and return up to `max_new` NEW
+    determinant ints RANKED BY IMPORTANCE:
+        score(a) = max over parent cores i of ( w_i * |H_{a,i}| )
+    with w_i the parent rank weight (top core highest) and |H_{a,i}| the driving integral
+    (_excitation_amplitude). Without h1/h2 the score degrades to parent-rank only (still core-importance,
+    better than arbitrary integer-value truncation). Refs: SHCI (Holmes/Tubman/Umrigar 2016), ASCI
+    (Tubman 2016), CIPSI (Huron/Malrieu 1973)."""
+    if max_new <= 0 or core_ints.size == 0:
+        return np.empty(0, dtype=np.longlong)
+    existing = set(int(x) for x in existing_ints.tolist())
+    core = [int(x) for x in np.atleast_1d(core_ints).tolist()[:max(1, n_core)]]
+    core_set = set(core)
+    ncore = len(core)
+    best = {}
+    for idx, dt in enumerate(core):
+        w = (ncore - idx) / ncore
+        for ch in _sd_children(dt, norb, num_elec):
+            if ch in existing or ch in core_set:
+                continue
+            amp = _excitation_amplitude(dt, ch, h1, h2) if h1 is not None else 1.0
+            s = w * amp
+            if s > best.get(ch, -1.0):
+                best[ch] = s
+    if not best:
+        return np.empty(0, dtype=np.longlong)
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    new = [d for d, _ in ranked[:max_new]]
+    new.sort()
+    return np.array(new, dtype=np.longlong) if new else np.empty(0, dtype=np.longlong)
 
 
 def _cisd_strings(norb: int, num_elec: int, level: int) -> NpStrict1DArrayLL:
@@ -1016,6 +1273,93 @@ def _cisd_strings(norb: int, num_elec: int, level: int) -> NpStrict1DArrayLL:
     return arr
 
 
+def _recombine_same_spin_candidates(
+    ci_strs_unique: NpStrict1DArrayLL,
+    ci_probs_unique: NpStrict1DArrayF64,
+    hartreefock: int,
+    existing: set[int],
+    max_parent_rank: int = 2,
+    max_parents: int = 250,
+    max_new: int = 20000,
+) -> NpStrict1DArrayLL:
+    """Same-spin recombination candidate booster (opt-in, see ``recomb_boost``).
+
+    Synthesizes new rank-3/4 (T/Q) determinant candidates for one spin channel by unioning the
+    excitation-delta bitmasks (relative to HF) of pairs of already-sampled, DISJOINT rank<=2 (S/D)
+    determinants -- i.e. two independently-observed excitations that don't touch the same orbitals
+    combine into one higher-rank candidate. Zero Hamiltonian-matrix-element evaluation and zero new
+    quantum sampling: candidates are ranked purely by the product of the parents' already-measured
+    sampled frequency (``ci_probs_unique``), a quantum-native importance proxy. ``max_parents``
+    keeps only the most frequent rank<=2 determinants before the O(n^2) pair loop, bounding cost.
+
+    Validated locally (real Fe4S4 raw pool + real checkpoint occupancy, controlled same-dimension
+    A/B test) to beat plain frequency-weighted sampling for the marginal determinant budget; see
+    docs/2026-08-04/README.md.
+    """
+    order = np.argsort(-ci_probs_unique)
+    parents: list[tuple[int, float, int]] = []
+    for idx in order:
+        d = int(ci_strs_unique[idx])
+        if d == hartreefock:
+            continue
+        delta = d ^ hartreefock
+        rank = bin(delta).count("1") // 2
+        if 1 <= rank <= max_parent_rank:
+            parents.append((d, float(ci_probs_unique[idx]), delta))
+        if len(parents) >= max_parents:
+            break
+
+    scored: dict[int, float] = {}
+    n = len(parents)
+    for i in range(n):
+        di, wi, deltai = parents[i]
+        for j in range(i + 1, n):
+            dj, wj, deltaj = parents[j]
+            if deltai & deltaj:  # overlapping orbitals -> skip, keep it disjoint-only
+                continue
+            cand = hartreefock ^ deltai ^ deltaj
+            if cand == di or cand == dj or cand in existing:
+                continue
+            score = wi * wj
+            prev = scored.get(cand)
+            if prev is None or score > prev:
+                scored[cand] = score
+
+    if not scored:
+        return np.empty(0, dtype=np.longlong)
+    ranked = sorted(scored.items(), key=lambda kv: -kv[1])[:max_new]
+    return np.array([d for d, _ in ranked], dtype=np.longlong)
+
+
+def _augment_seed_with_recombination(
+    seed_strings: NpStrict1DArrayLL,
+    ci_strs_unique: NpStrict1DArrayLL,
+    ci_probs_unique: NpStrict1DArrayF64,
+    ci_strs_carryover: NpStrict1DArrayLL,
+    hartreefock: int,
+    recomb_max_parents: int,
+) -> NpStrict1DArrayLL:
+    """Append same-spin recombination candidates onto ``seed_strings`` (never raises)."""
+    try:
+        existing = set(ci_strs_carryover.tolist())
+        if seed_strings.size:
+            existing.update(seed_strings.tolist())
+        existing.add(hartreefock)
+        recomb_strings = _recombine_same_spin_candidates(
+            ci_strs_unique, ci_probs_unique, hartreefock, existing,
+            max_parents=recomb_max_parents,
+        )
+        if recomb_strings.size:
+            return (
+                np.concatenate([seed_strings, recomb_strings]) if seed_strings.size else recomb_strings
+            )
+    except Exception:
+        logger = _safe_run_logger()
+        if logger is not None:
+            logger.warning("[diag] recomb_boost failed; continuing without it", exc_info=True)
+    return seed_strings
+
+
 def _merge_with_seed(
     hartreefock: int,
     ci_strs_carryover: NpStrict1DArrayLL,
@@ -1082,6 +1426,8 @@ def subsample_close_shell(
     rng: np.random.Generator | None = None,
     seed_cisd: int = 0,
     seed_budget_frac: float = 1.0,
+    recomb_boost: bool = False,
+    recomb_max_parents: int = 250,
 ) -> NpStrict1DArrayLL:
     # Use an explicit per-walker Generator when provided so concurrent walkers draw INDEPENDENT
     # subspaces (and there is no thread race on a shared global). Falls back to MODULE_RNG only for
@@ -1125,6 +1471,11 @@ def subsample_close_shell(
 
     # Classically-seeded low-excitation determinants (QSCI+SD); empty when seed_cisd == 0.
     seed_strings = _cisd_strings(norb, num_elec_a, seed_cisd)
+    if recomb_boost:
+        seed_strings = _augment_seed_with_recombination(
+            seed_strings, ci_strs_unique, ci_probs_unique, ci_strs_carryover,
+            hartreefock, recomb_max_parents,
+        )
 
     def _draw_new(budget: int) -> NpStrict1DArrayLL:
         # Choose sampled bitstrings not already in carryover or the seed. Subspace dim preserved.
@@ -1164,6 +1515,8 @@ def subsample_open_shell(
     rng: np.random.Generator | None = None,
     seed_cisd: int = 0,
     seed_budget_frac: float = 1.0,
+    recomb_boost: bool = False,
+    recomb_max_parents: int = 250,
 ) -> tuple[NpStrict1DArrayLL, NpStrict1DArrayLL]:
     """Build separate alpha and beta CI string lists from bitstrings (open-shell / UHF).
 
@@ -1197,6 +1550,8 @@ def subsample_open_shell(
         rng=rng,
         seed_cisd=seed_cisd,
         seed_budget_frac=seed_budget_frac,
+        recomb_boost=recomb_boost,
+        recomb_max_parents=recomb_max_parents,
     )
     ci_b = _subsample_one_spin(
         ci_strs=ci_strs_b,
@@ -1208,6 +1563,8 @@ def subsample_open_shell(
         rng=rng,
         seed_cisd=seed_cisd,
         seed_budget_frac=seed_budget_frac,
+        recomb_boost=recomb_boost,
+        recomb_max_parents=recomb_max_parents,
     )
     return ci_a, ci_b
 
@@ -1222,6 +1579,8 @@ def _subsample_one_spin(
     rng: np.random.Generator | None = None,
     seed_cisd: int = 0,
     seed_budget_frac: float = 1.0,
+    recomb_boost: bool = False,
+    recomb_max_parents: int = 250,
 ) -> NpStrict1DArrayLL:
     """Dedup + carryover + HF-at-index-0 for a single spin channel.
 
@@ -1251,6 +1610,11 @@ def _subsample_one_spin(
 
     # Classically-seeded low-excitation determinants for this spin (QSCI+SD); empty if seed_cisd==0.
     seed_strings = _cisd_strings(norb, num_elec, seed_cisd)
+    if recomb_boost:
+        seed_strings = _augment_seed_with_recombination(
+            seed_strings, ci_strs_unique, ci_probs_unique, ci_strs_carryover,
+            hartreefock, recomb_max_parents,
+        )
 
     def _draw_new(budget: int) -> NpStrict1DArrayLL:
         forced = np.concatenate((ci_strs_carryover, seed_strings)) if seed_strings.size else ci_strs_carryover
