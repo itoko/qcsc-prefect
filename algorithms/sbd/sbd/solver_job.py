@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -561,6 +562,22 @@ class SBDSolverJob(Block):
         )
 
 
+def _dir_size_bytes(path: Path) -> int:
+    """Sum file sizes under ``path`` (top-level only, non-recursive), tolerating a file
+    that disappears between listing and stat (the solver process may write/clean up its
+    own temp files concurrently with this scan) -- a diagnostic number should never crash
+    the actual solve.
+    """
+    total = 0
+    for f in path.iterdir():
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except FileNotFoundError:
+            continue
+    return total
+
+
 @task(name="solve_eigenstate")
 async def _run_sbd_inner(
     *,
@@ -576,7 +593,20 @@ async def _run_sbd_inner(
 ) -> SBDResult:
     base_work_dir = Path(solver.root_dir).expanduser().resolve()
     job_work_dir = _make_job_work_dir(base_work_dir)
+    logger = get_run_logger()
 
+    # Throughput/IO diagnostics -- same spirit as block2's own per-sweep log lines
+    # (Time sweep, TFLOP/SWP, Dmem/Imem/Hmem, Tread/Twrite) so SQD's own solver call has
+    # comparable, at-a-glance timing/throughput/disk numbers in the log, not just the
+    # final energy. Real FLOP counts aren't available from Python's side without
+    # instrumenting the C++ binary itself, so we report a throughput PROXY instead
+    # (det-pairs/rank / wall-time) and label it explicitly as a proxy, not a measured FLOP rate.
+    n_a = len(ci_strings[0])
+    n_b = len(ci_strings[1])
+    n_ranks = max(1, solver.adet_comm_size * solver.bdet_comm_size)
+    dets_per_rank_proxy = (n_a / max(1, solver.adet_comm_size)) * (n_b / max(1, solver.bdet_comm_size))
+
+    t_prep0 = time.perf_counter()
     _prep_files(
         work_dir=job_work_dir,
         ci_strings=ci_strings,
@@ -589,7 +619,17 @@ async def _run_sbd_inner(
         two_body_tensor_ab=two_body_tensor_ab,
         two_body_tensor_bb=two_body_tensor_bb,
     )
+    t_prep = time.perf_counter() - t_prep0
 
+    input_bytes = _dir_size_bytes(job_work_dir)
+    logger.info(
+        "[diag] solve input: n_a=%d n_b=%d ranks=%d (a=%d x b=%d) dets_per_rank_proxy=%.0f "
+        "input_disk=%.1fMB (Tprep=%.2fs)",
+        n_a, n_b, n_ranks, solver.adet_comm_size, solver.bdet_comm_size,
+        dets_per_rank_proxy, input_bytes / 1e6, t_prep,
+    )
+
+    t_solve0 = time.perf_counter()
     result = await run_job_from_blocks(
         command_block_name=solver.command_block_name,
         execution_profile_block_name=solver.execution_profile_block_name,
@@ -601,6 +641,16 @@ async def _run_sbd_inner(
         timeout_seconds=solver.timeout_seconds,
         metrics_artifact_key=solver.metrics_artifact_key,
     )
+    t_solve = time.perf_counter() - t_solve0
+
+    output_bytes = _dir_size_bytes(job_work_dir) - input_bytes
+    throughput_proxy = (dets_per_rank_proxy * n_ranks) / t_solve if t_solve > 0 else float("nan")
+    logger.info(
+        "[diag] solve output: exit_status=%s Tsolve=%.1fs (%.2fh) output_disk_delta=%.1fMB "
+        "throughput_proxy=%.3e det-pairs/s (NOT a measured FLOP rate -- see comment)",
+        result.exit_status, t_solve, t_solve / 3600, output_bytes / 1e6, throughput_proxy,
+    )
+
     if result.exit_status != 0:
         raise RuntimeError(f"SBDSolverJob failed: exit_status={result.exit_status}")
 

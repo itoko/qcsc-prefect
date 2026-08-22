@@ -42,6 +42,15 @@ OMP = int(os.environ.get("ROQUO_OMPTHREADS", "140"))
 ADET_COMM_SIZE = int(os.environ.get("FE4S4_ADET_COMM_SIZE", "1"))
 BDET_COMM_SIZE = int(os.environ.get("FE4S4_BDET_COMM_SIZE", "1"))
 TASK_COMM_SIZE = int(os.environ.get("FE4S4_TASK_COMM_SIZE", "1"))
+# Davidson subspace size (--block, "max_nb" in davidson_thrust.h). Real GPU memory driver:
+# per-rank Davidson working set = (2*block+1) * W_size * 8 bytes, W_size = (dets_per_spin/a)
+# * (dets_per_spin/b) (confirmed by reading sbd_mpi/include/sbd/chemistry/tpb/sbdiag.h +
+# davidson_thrust.h directly, not inferred). Default 20 preserves the proven d3e10 behavior
+# exactly; d4e10 at the same grid has 1.33x d3e10's per-rank W (200,000^2 vs 173,205^2 dets),
+# so block=20 there needs ~91GB/rank in Davidson vectors alone (SLURM sacct confirmed ~115GB/
+# rank average on the crashed job) vs d3e10's ~68GB/rank -- block=15 brings d4e10 back down to
+# d3e10's own proven footprint without touching the grid/node count at all.
+DAVIDSON_BLOCK = int(os.environ.get("FE4S4_DAVIDSON_BLOCK", "20"))
 # HPC target: "slurm" (per-solve sbatch) or "local" (in-allocation, for multi-node)
 HPC_TARGET = os.environ.get("FE4S4_HPC_TARGET", "slurm")
 # NCCL pre-commands (H2+H3 multi-node fixes from qcsc-multinode-fix)
@@ -261,10 +270,15 @@ def main() -> None:
         "--walltime", "12:00:00",
         "--carryover-ratio", "0.5", "--carryover-type", "1",
         "--do-rdm", str(DO_RDM),
-        "--solver-timeout-seconds", "43200",
+        # Raised from 43200 (12h): both d3e10 and d4e10 trajectories have hit real per-step
+        # times exceeding 12h (d4e10 step 3 was killed mid-solve by this exact timeout,
+        # confirmed via the "Local command timed out after 43200.0 seconds: srun" error) --
+        # 20h gives real headroom above the observed ceiling while still catching a genuinely
+        # hung solve eventually, rather than disabling the timeout outright.
+        "--solver-timeout-seconds", "72000",
         "--work-dir", str(work_dir),
         "--saved-samples", ",".join(pools),
-        "--iteration", "5", "--block", "20",
+        "--iteration", "5", "--block", str(DAVIDSON_BLOCK),
         "--sbd-executable", diag_gpu, "--sbd-executable-uhf", diag_gpu_uhf,
     ]
     # Pass MPI grid comm sizes (multi-node only; single-GPU defaults to a=1,b=1)
