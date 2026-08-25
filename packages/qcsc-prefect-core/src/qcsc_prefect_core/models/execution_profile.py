@@ -23,6 +23,7 @@ class ExecutionProfile:
     mpiprocs: int | None = None
     ompthreads: int | None = None
     walltime: str | None = None  # "HH:MM:SS"
+    mem: str | None = None  # scheduler-specific unit, e.g. "32gb" (PBS select chunk mem=)
 
     # runtime
     launcher: Launcher = "single"

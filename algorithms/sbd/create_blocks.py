@@ -72,6 +72,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-nodes", type=int)
     parser.add_argument("--mpiprocs", type=int)
     parser.add_argument("--ompthreads", type=int)
+    parser.add_argument(
+        "--mem",
+        help=(
+            "Memory per node for the PBS select chunk, e.g. '32gb' (Miyabi only). "
+            "Unset means the scheduler's own server-side default is used, which on Miyabi-G "
+            "has been observed to reserve ~100GB/node regardless of actual usage -- set this "
+            "explicitly to avoid large multi-node jobs stalling on cluster-wide memory "
+            "availability rather than actual solver memory needs."
+        ),
+    )
     parser.add_argument("--modules", nargs="+")
     parser.add_argument("--mpi-options", nargs="*")
     parser.add_argument("--pre-commands", nargs="*")
@@ -304,6 +314,7 @@ def _env_values() -> dict[str, Any]:
         "sbd_executable_uhf": env_first_str("SBD_EXECUTABLE_UHF"),
         "launcher": env_first_str("SBD_LAUNCHER", "MIYABI_LAUNCHER", "FUGAKU_LAUNCHER"),
         "walltime": env_first_str("SBD_WALLTIME", "MIYABI_WALLTIME", "FUGAKU_WALLTIME"),
+        "mem": env_first_str("SBD_MEM", "MIYABI_MEM", "FUGAKU_MEM"),
         "num_nodes": env_first_int("SBD_NUM_NODES", "MIYABI_NUM_NODES", "FUGAKU_NUM_NODES"),
         "mpiprocs": env_first_int("SBD_MPIPROCS", "MIYABI_MPIPROCS", "FUGAKU_MPIPROCS"),
         "ompthreads": env_first_int("SBD_OMPTHREADS", "MIYABI_OMPTHREADS", "FUGAKU_OMPTHREADS"),
@@ -482,6 +493,8 @@ def main() -> None:
     mpiprocs = int(_pick_value(args.mpiprocs, config.get("mpiprocs"), env.get("mpiprocs"), 4))
     ompthreads_raw = _pick_value(args.ompthreads, config.get("ompthreads"), env.get("ompthreads"))
     ompthreads = int(ompthreads_raw) if ompthreads_raw is not None else None
+    mem_raw = _pick_value(args.mem, config.get("mem"), env.get("mem"))
+    mem = str(mem_raw).strip() if mem_raw is not None else None
 
     modules_default = ["intel/2023.2.0", "impi/2021.10.0"] if is_miyabi else []
     modules = _normalize_str_list(
@@ -682,6 +695,7 @@ def main() -> None:
         mpiprocs=mpiprocs,
         ompthreads=ompthreads,
         walltime=walltime,
+        mem=mem,
         launcher=launcher,
         mpi_options=mpi_options or [],
         modules=modules or [],
