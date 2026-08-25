@@ -184,10 +184,96 @@ the alpha/beta RDM blocks and would be wrong for a genuine UHF run -- only trust
 Davidson-solved `"sbd: Energy = ..."` line, which comes from the already-UHF-aware Hamiltonian
 machinery and is unaffected. A real fix belongs upstream in `r-ccs-cms/sbd`.
 
-**Not yet done:** running against the full production-scale sample pool or a larger determinant
-subset (this pass deliberately used 200 shots as a first live-binary check); a multi-round HCI
-outer-loop driver (`run_gdb_hci_recover.py`, referenced in the build scripts' comments but not
-yet written) that would feed each round's `--carryoverfile` output back in as the next round's
-`--detfiles`, mirroring `run_recover.py`'s existing multi-step SQD pattern; and any comparison of
-the resulting energy/subspace composition against the SQD trajectory at a matched subspace
-dimension.
+**Not yet done (at time of writing above):** running against the full production-scale sample
+pool or a larger determinant subset (this pass deliberately used 200 shots as a first
+live-binary check); a multi-round HCI outer-loop driver; and any comparison of the resulting
+energy/subspace composition against the SQD trajectory at a matched subspace dimension.
+
+## 7. Real multi-round HCI convergence study (starting from the BS-UHF HF determinant)
+
+Following collaborator guidance (external review of the HCI approach): don't seed from SQD
+sample-pool determinants for the standard HCI reference; start from the **single BS-UHF
+Hartree-Fock determinant** and let heat-bath expansion build the variational space outward from
+there, sweeping the heat-bath cutoff and checking energy convergence rather than fixing a
+determinant-count target up front. `--heatbath_truncation` (a `|c|^2`-weight threshold, not a
+determinant-count cap -- see the code comment in `carryover.h`'s `WeightTruncation`) left at
+`0.0` throughout, i.e. no pre-truncation before expansion, matching the collaborator's own stated
+practice. Davidson `--tolerance 1.0e-5`, `--iteration 50` (generous headroom, not fixed low).
+
+**Single-determinant sanity check** (`gdb_diag_uhf`, `--heatbath_cutoff 1.0e-3`, seed = the
+72-bit BS-UHF HF determinant string): reproduced `E = -327.0809169678712 Ha`, matching the
+independently-computed BS-UHF reference energy (`-327.08091697 Ha`, `<S^2>=8.877`) to 10
+decimal places -- confirms the whole HF-seed -> merged-FCIDUMP -> `gdb_diag_uhf` pipeline is
+correct before committing to a real multi-round run.
+
+### Stage 1: fixed cutoff = 1e-4, single node
+
+**Job**: PJM 50884271, `#PJM -L "node=1" -L "rscgrp=small" -L "elapse=07:00:00" --mpi
+"max-proc-per-node=16"` -- 16 MPI ranks total, `--b_comm_size 2 --t_comm_size 1` (so
+`h_comm_size = 16/(2*1) = 8`). Each round re-invokes `gdb_diag_uhf` fresh (no
+`--loadname`/`--savename` in this stage) against the previous round's deduplicated
+`--carryovername` output as the next round's `--detfiles`; script:
+`algorithms/sbd/native/../../../run_hci_multiround.sh` (deployed at
+`/vol0206/data/ra010014/u14924/u14924_space/gdb_hci/run_hci_multiround.sh` on Fugaku).
+
+| Round | n_det in | n_det out | Energy (Ha) | ΔE vs prev round (mHa) | Wall (s) | Davidson (s) | Heatbath (s) |
+|---|---|---|---|---|---|---|---|
+| 0 | 1 | 53,169 | -327.0809169678712 | -- | 30.1 | 0.005 | 0.19 |
+| 1 | 53,169 | 143,704 | -327.1605311509047 | -79.63 | 365.8 | 109.3 | 216.8 |
+| 2 | 143,704 | 239,932 | -327.1990585145335 | -38.53 | 1054.0 | 404.3 | 588.6 |
+| 3 | 239,932 | 257,143 | -327.2049636125996 | -5.91 | 1868.0 | 800.8 | 981.0 |
+
+Basis growth is already slowing sharply by round 3 (+67% round 1->2, only +7.2% round 2->3),
+consistent with approaching saturation at this cutoff -- most Slater-Condon-coupled candidates
+above the `1e-4` threshold have already been found. Reference points: DMRG (SU2, D=4000,
+block2) = **-327.239 Ha**; best SQD checkpoint (Miyabi-G, d=2e10, step 85) = **-327.234400 Ha**.
+Round 3 sits **34.0 mHa above DMRG** and **29.6 mHa above best SQD**, down from 79.6 mHa (round
+1) above the BS-UHF starting point -- HCI is recovering correlation energy monotonically and is
+closing on both references, at a real per-round compute cost that roughly doubles round over
+round as the basis grows (heatbath-expansion time dominates total wall time throughout, not
+Davidson).
+
+### Stage 2: tighter cutoff = 1e-5, multi-node with checkpoint/restart
+
+Once growth at `1e-4` visibly saturates (or the single-node job's 7h elapse/6-round budget is
+exhausted, whichever comes first), the run continues at a tighter cutoff seeded from the last
+`1e-4` detfile actually produced -- cheaper than restarting from the bare HF determinant, since
+`1e-5` mostly just adds newly-eligible smaller-coupling determinants on top of what `1e-4`
+already found.
+
+**Node/rank config**: scaled from 1 node/16 ranks to **4 nodes / 64 total ranks**
+(`#PJM -L "node=4" -L "rscgrp=large" --mpi "max-proc-per-node=16"`), `--b_comm_size 8`
+(raised from 2), `--t_comm_size 1` unchanged -- keeps `h_comm_size = 64/(8*1) = 8` identical to
+Stage 1, so the 4x extra ranks land entirely on `b_comm`, the dimension that shards the
+determinant basis/Davidson vector, which is the axis actually under memory/compute pressure as
+the basis grows past ~250k determinants. `rscgrp=large` confirmed via this project's own
+`run_fe4s4_recover_fugaku_d3e10.py` comments to have no node-count floor and to accept an 8h
+elapse limit at real scale (used there at 12,100 nodes).
+
+**Checkpoint/restart**: every round now also passes `--savename wavefunction_1e5_round<N>.dat`,
+persisting the actual Davidson wavefunction (`sbd::SaveWavefunction`/`LoadWavefunction` in
+`caop/basic/restart.h`) rather than only the determinant list. A resubmitted job passes the
+previous round's saved wavefunction back in via `--loadname`, warm-starting Davidson instead of
+re-solving from a cold guess. Verified against the actual `LoadWavefunction` source that this is
+safe across a growing/reordered basis: it does a per-determinant `lower_bound` lookup against
+the *current* basis, carries over the coefficient for every determinant present in both the old
+and new basis, leaves newly-added determinants at a zero initial guess, and re-normalizes --
+correct for exactly the round-to-round scenario here (basis strictly grows and is freshly sorted
+each round). One real constraint: the save file is sharded by `mpi_rank_b`
+(`statefilename(name, mpi_rank_b)`), so a reload is only valid if `--b_comm_size` matches between
+the save and load runs -- kept fixed at 8 throughout this stage for that reason.
+
+A small persistent `hci_1e5_state.txt` (`last_completed_round,detfile,wavefile`) drives resume
+logic: on start, if the state file exists, resume from `last_completed_round+1` using its
+recorded detfile/wavefile; if a round's `gdb_diag_uhf` call exits non-zero, the state file is
+*not* advanced, so a resubmit retries that same round rather than skipping past a failure. If the
+elapse budget runs low (within 40 min of the 8h limit) before finishing the next round, the
+script self-resubmits (`pjsub "$SELF_SCRIPT"`) and exits cleanly, so the same job chains across
+however many resubmissions the full 1e-5 convergence sweep needs -- mirroring the self-chaining
+pattern already used for the d3e10 SQD jobs elsewhere in this repo. Script:
+`run_hci_multiround_1e5.sh`, staged at
+`/vol0206/data/ra010014/u14924/u14924_space/gdb_hci/run_hci_multiround_1e5.sh`.
+
+Stage 2 results will be appended here as real rounds complete (submission follows Stage 1's
+1e-4 run reaching either true convergence or its own budget limit, so the seed detfile is the
+best one actually available, not a projected one).
