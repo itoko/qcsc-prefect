@@ -133,16 +133,61 @@ class.
 
 ## 6. Status / next steps
 
-- **Not yet built or tested in this project.** `apps/chemistry_gdb_selected_basis_diagonalization`
-  has never been compiled here; no `gdb_diag`-style binary exists anywhere on ROQUO or locally.
-  Confirmed CPU-only (MPI + OpenMP) -- the upstream Makefile/CMakeLists ship no GPU/Thrust build
-  target for this app, unlike the `tpb`-namespace binaries this repo already builds for GPU.
-- A build script (`algorithms/sbd/native/build_sbd_gdb_hci_roquo.sh`) exists in this repo to build
-  it, but building requires a compute-node allocation on ROQUO (`hpcx/2.50` is unavailable on the
-  login node) -- blocked as of this writing on available billing-point quota (both live SQD chains
-  hold the current allocation).
-- Planned first step once quota is available: build `gdb_diag`, run it against our own
-  `fe4s4_zhendongli.txt` FCIDUMP and BS-UHF reference (not the bundled sample FCIDUMP) with
-  `--carryover_type 2` or `3` and real `--heatbath_cutoff`/`--heatbath_truncation` values, and
-  compare the resulting energy/subspace composition against the SQD trajectory at a matched
-  subspace dimension, as a smoke test before writing any outer-loop driver or Prefect wiring.
+**Built and smoke-tested on Fugaku, against real BS-UHF integrals and a real sampled
+determinant subset -- both confirmed working.** ROQUO was not used for the build/run (a
+large-node-count maintenance reservation left only 9 free nodes at the time); Fugaku's
+`mpiFCCpx` toolchain built both the plain (`gdb_diag`) and `-D_UHF` (`gdb_diag_uhf`) variants of
+`apps/chemistry_gdb_selected_basis_diagonalization` on the first attempt via
+`algorithms/sbd/native/build_sbd_gdb_hci_{,uhf_}fugaku.sh` (ROQUO scripts exist as siblings for
+whenever node quota frees up).
+
+Also fetched and built against upstream PR
+[r-ccs-cms/sbd#87](https://github.com/r-ccs-cms/sbd/pull/87) ("Fix and accelerate GDB heatbath
+expansion", open at time of writing) -- a real correctness fix for `HeatbathExpansion` under
+replicated MPI communicator layouts, plus a ~32x-faster integral-driven expansion path
+(`carryover_type=3`). The smoke test below ran against this PR's code, not plain upstream `main`.
+
+**The real single-basis-FCIDUMP gap turned out narrower than the "gdb never sees UHF integrals"
+framing above might suggest.** `oneInt`/`twoInt`'s `-D_UHF` storage layout and every heatbath/
+Davidson call site in `expansion.h`/`qcham.h` are already spin-backing-store-transparent -- the
+missing piece was purely a build flag (`gdb`'s `Makefile`/`Configuration` never passed `-D_UHF`)
+plus a file-format bridge, not new solver logic. Two new scripts close that gap:
+
+- `examples/fe4s4_hci_from_bsuhf_reference/merge_bsuhf_to_uhf_fcidump.py` -- merges the
+  `prepare_bsuhf_fcidump.py`-produced `.alpha.fcidump`/`.beta.fcidump`/`.mixed.npz` triple into
+  the single interleaved-spin-orbital FCIDUMP `-D_UHF`'s `SetupIntegrals` reads, reusing
+  `solver_job.py`'s already-tested `_write_uhf_fcidump` writer as a pure format bridge. Verified
+  against the real Fe4S4 BS-UHF reference: round-trips losslessly and reconstructs
+  `E=-327.08091697 Ha` to 8 decimal places, exactly matching the known BS-UHF energy.
+- `examples/fe4s4_hci_from_bsuhf_reference/pool_to_gdb_detfile.py` -- converts a real subset of
+  the production 5M-shot sample pool into `gdb`'s plain-ASCII interleaved-bit `--detfiles`
+  format (one merged determinant per sampled shot, not a Cartesian product of independently
+  -drawn alpha/beta values). Caught a real bug during verification: the raw saved pool is
+  genuinely unfiltered hardware data (most shots do not have the correct particle number -- only
+  245 of ~2M unique bitstrings in `fe4s4_uhf_5M_zhendongli.npz` survive Hamming-weight
+  post-selection), so post-selection had to be added before the top-N-by-probability sampling
+  step.
+
+**Live-binary result** (`gdb_diag_uhf`, real `fe4s4_bsuhf.uhf.fcidump`, 200 real post-selected
+determinants from the production pool, `--carryover_type 0` then `2`): both runs completed
+cleanly. Baseline Davidson energy `-323.4286516396394 Ha` (physically sensible for a 200
+-determinant subset of the full ~173,205x173,205 SQD subspace -- well above the full
+`-327.08 Ha` ground state, not NaN/inf/wildly wrong). Heat-bath run reproduced the identical
+energy and printed real `"start heatbath expansion"`/`"end heatbath expansion"` timing (3.8ms),
+confirming the expansion machinery runs correctly against genuine UHF integrals end-to-end. The
+carryover set came back empty at this tiny scale/cutoff combination -- expected, not a bug (same
+behavior seen on the bundled toy example).
+
+**Known landmine, explicitly deferred:** `main.cc`'s post-solve RDM-derived diagnostic energy
+printout (`"one-body energy"`/`"two-body energy"` lines) hardcodes an RHF-style combination of
+the alpha/beta RDM blocks and would be wrong for a genuine UHF run -- only trust the
+Davidson-solved `"sbd: Energy = ..."` line, which comes from the already-UHF-aware Hamiltonian
+machinery and is unaffected. A real fix belongs upstream in `r-ccs-cms/sbd`.
+
+**Not yet done:** running against the full production-scale sample pool or a larger determinant
+subset (this pass deliberately used 200 shots as a first live-binary check); a multi-round HCI
+outer-loop driver (`run_gdb_hci_recover.py`, referenced in the build scripts' comments but not
+yet written) that would feed each round's `--carryoverfile` output back in as the next round's
+`--detfiles`, mirroring `run_recover.py`'s existing multi-step SQD pattern; and any comparison of
+the resulting energy/subspace composition against the SQD trajectory at a matched subspace
+dimension.
