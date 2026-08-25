@@ -41,6 +41,13 @@
 # (statefilename(name, mpi_rank_b)), so --loadname is only valid if --b_comm_size matches
 # between the save and load runs -- kept fixed at 8 throughout this stage for that reason.
 
+# IMPORTANT for real deployments: this errors out immediately (PJM job produces a one-line
+# .out and nothing else runs) unless GDB_HCI_DIR is actually exported before pjsub, e.g. via
+# `#PJM -x GDB_HCI_DIR=/real/path` or by hardcoding the cd target below to match how
+# run_hci_multiround.sh itself is deployed. A real submission of this exact script hit this
+# (job never got past this line) because the deployed copy on Fugaku was scp'd straight from
+# this repo file without either step -- check the deployed copy's actual `cd` line, not just
+# this template, before assuming a submitted job is really running.
 cd "${GDB_HCI_DIR:?set GDB_HCI_DIR to the directory holding gdb_diag_uhf and the FCIDUMP}"
 
 FCIDUMP=fe4s4_bsuhf.uhf.fcidump
