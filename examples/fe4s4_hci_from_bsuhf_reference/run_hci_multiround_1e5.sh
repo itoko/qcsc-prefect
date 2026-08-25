@@ -1,6 +1,6 @@
 #!/bin/bash
-#PJM -L "node=4"
-#PJM -L "rscgrp=large"
+#PJM -L "node=2"
+#PJM -L "rscgrp=small"
 #PJM -g ra010014
 #PJM -L "elapse=08:00:00"
 #PJM --mpi "max-proc-per-node=16"
@@ -11,12 +11,20 @@
 # heat-bath cutoff (1e-5), seeded from the LAST detfile the 1e-4 run produced (converged basis
 # at that cutoff, or the last round it reached before its own elapse budget cut it off).
 #
-# Scale-out: 4 nodes x 16 ranks/node = 64 total MPI ranks (vs the 1e-4 run's 1 node x 16). The
+# Scale-out: 2 nodes x 16 ranks/node = 32 total MPI ranks (vs the 1e-4 run's 1 node x 16). The
 # real parallel dimension for a growing determinant basis is b_comm_size, since
 # h_comm_size = mpi_size / (t_comm_size * b_comm_size) and b_comm shards the basis/Davidson
 # vector across ranks -- t_comm_size stays 1 (unused dimension here), b_comm_size raised
-# 2 -> 8 so the extra 4x ranks land on the axis that's actually under memory/compute pressure
-# as the basis grows past 240k determinants, keeping h_comm_size=8 unchanged from the 1e-4 run.
+# 2 -> 8 so the extra ranks land on the axis that's actually under memory/compute pressure as
+# the basis grows past 240k determinants; h_comm_size drops from 8 (Stage 1) to 4 here, which is
+# fine -- h_comm is just a replica/history dimension derived as whatever's left over
+# (mpi_size/(t_comm_size*b_comm_size)), not a physics-correctness-sensitive parameter.
+#
+# rscgrp note (real PJM behavior, not assumed): rscgrp=large REJECTED node=4 with "node=4 is
+# less than the lower limit (385)" -- large has a real 385-node floor on this system, not the
+# "no floor found" this repo's earlier exploration assumed from absence of evidence. rscgrp=small
+# accepts node=2 without complaint, so this script uses small at a modest 2-node scale-out
+# instead of chasing large's 385-node minimum for a job that only needs ~32 ranks.
 #
 # Checkpoint/restart: --savename after every round persists the actual Davidson wavefunction
 # (not just the determinant list) via sbd::SaveWavefunction; a resubmitted job detects the last
@@ -43,7 +51,7 @@ N_ROUNDS_TOTAL=10          # overall stop condition across ALL resubmissions, no
 LOGFILE=hci_multiround_timing_1e5.log
 STATEFILE=hci_1e5_state.txt   # "round_completed,detfile,wavefile" of the last finished round
 SELF_SCRIPT="$(readlink -f "$0")"
-NODE_COUNT=4
+NODE_COUNT=2
 MPI_RANKS_PER_NODE=16
 TOTAL_RANKS=$((NODE_COUNT * MPI_RANKS_PER_NODE))
 B_COMM_SIZE=8
@@ -75,7 +83,11 @@ for round in $(seq "$START_ROUND" $((N_ROUNDS_TOTAL - 1))); do
   ELAPSED_SO_FAR=$(( $(date +%s) - JOB_START ))
   if [ "$ELAPSED_SO_FAR" -ge "$((ELAPSE_BUDGET_SECONDS - 2400))" ]; then
     echo "=== stopping before round ${round}: ${ELAPSED_SO_FAR}s elapsed, within 40min of the ${ELAPSE_BUDGET_SECONDS}s budget -- self-resubmitting ==="
-    pjsub "$SELF_SCRIPT"
+    # -x PJM_LLIO_GFSCACHE=/vol0002 is required on this filesystem (the vol0002-hosted data
+    # area) -- a plain `pjsub "$SELF_SCRIPT"` is rejected with "The current directory is
+    # contained in /vol0002, so set PJM_LLIO_GFSCACHE to /vol0002." confirmed by a real pjsub
+    # call when first submitting this script.
+    pjsub -x PJM_LLIO_GFSCACHE=/vol0002 "$SELF_SCRIPT"
     echo "=== resubmitted $SELF_SCRIPT, exiting this job ==="
     exit 0
   fi
