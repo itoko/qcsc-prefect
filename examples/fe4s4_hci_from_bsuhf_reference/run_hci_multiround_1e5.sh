@@ -1,6 +1,6 @@
 #!/bin/bash
-#PJM -L "node=8"
-#PJM -L "rscgrp=small"
+#PJM -L "node=385"
+#PJM -L "rscgrp=large"
 #PJM -g ra010014
 #PJM -L "elapse=08:00:00"
 #PJM --mpi "max-proc-per-node=16"
@@ -11,22 +11,23 @@
 # LAST detfile the 1e-4 run produced (converged basis at that cutoff, or the last round it
 # reached before its own elapse budget cut it off).
 #
-# 8 nodes x 16 ranks/node = 128 total ranks, b_comm_size=32, t_comm_size=1
-# (h_comm_size=128/(32*1)=4). Scaled up from the validated 1-node/16-rank/b_comm_size=8 config
-# after a REAL OOM kill: round 7 (heatbath expansion at 1e-5) grew the basis from 259,429 to
-# 7,719,923 determinants -- round 8's Davidson attempt at 1 node/16 ranks died in 71s with exit
-# code 137 (SIGKILL, i.e. out-of-memory), confirming a basis this size genuinely needs more
-# ranks on the b_comm (basis-sharding) dimension, not a queue-wait/config issue. 8 nodes chosen
-# over 4 given how hard the OOM hit (71s, not a slow degradation) -- erring toward more headroom
-# rather than another undersized attempt.
+# 385 nodes x 16 ranks/node = 6160 total ranks, b_comm_size=770, t_comm_size=1
+# (h_comm_size=6160/(770*1)=8, matching Stage 1's replica count exactly). 385 is large's real
+# node floor on this system (confirmed by a real PJM rejection: "node=4 is less than the lower
+# limit (385)").
 #
-# rscgrp history this session, for context: 4 nodes/rscgrp=large REJECTED outright ("node=4 is
-# less than the lower limit (385)" -- large has a hard 385-node floor here); 16 nodes/
-# rscgrp=small showed a real PJM queue estimate ~1 week out; 2 nodes/rscgrp=small STILL showed
-# ~9 days out -- small was backlogged regardless of node count at the time, not specifically
-# penalizing larger requests. 1 node/rscgrp=small is what actually ran (round 7 succeeded there)
-# before hitting this real memory ceiling. No prepost/prepost-mem group exists on Fugaku for
-# this account (that name belongs to a different cluster's queue table, unrelated).
+# Switched to large from small after THREE separate small submissions (2, 8, and 16 nodes, at
+# different points this session) all showed real PJM queue estimates of ~1 week to ~9 days out
+# -- small is backlogged regardless of node count right now, not specifically penalizing larger
+# multi-node requests. Only 1-node/small jobs actually started promptly all session (both Stage
+# 1 and this stage's round 7 ran that way) -- but round 8 needs more than 1 node can hold: round
+# 7's heatbath expansion grew the basis from 259,429 to 7,719,923 determinants, and round 8's
+# Davidson attempt at 1 node/16 ranks/b_comm_size=8 died in 71s with exit code 137 (SIGKILL/
+# OOM). 385/large is a genuinely large jump (770x the OOM'd b_comm_size=8, not incremental) --
+# deliberate, not a mistake: repeating another incremental small-queue attempt would likely just
+# repeat the same multi-day wait a third time for no new information, so this trades unused
+# headroom for actually getting scheduled and validating whether large works for this account
+# at all, given we've never run a real live job there before.
 #
 # Checkpoint/restart: --savename after every round persists the actual Davidson wavefunction
 # (not just the determinant list) via sbd::SaveWavefunction; a resubmitted job detects the last
@@ -60,10 +61,10 @@ N_ROUNDS_TOTAL=10          # overall stop condition across ALL resubmissions, no
 LOGFILE=hci_multiround_timing_1e5.log
 STATEFILE=hci_1e5_state.txt   # "round_completed,detfile,wavefile,b_comm_size" of the last finished round
 SELF_SCRIPT="$(readlink -f "$0")"
-NODE_COUNT=8
+NODE_COUNT=385
 MPI_RANKS_PER_NODE=16
 TOTAL_RANKS=$((NODE_COUNT * MPI_RANKS_PER_NODE))
-B_COMM_SIZE=32
+B_COMM_SIZE=770
 T_COMM_SIZE=1
 
 if [ -f "$STATEFILE" ]; then
