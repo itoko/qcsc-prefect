@@ -1,5 +1,5 @@
 #!/bin/bash
-#PJM -L "node=1"
+#PJM -L "node=8"
 #PJM -L "rscgrp=small"
 #PJM -g ra010014
 #PJM -L "elapse=08:00:00"
@@ -7,22 +7,26 @@
 #PJM -j
 #PJM -S
 
-# Single-node continuation of run_hci_multiround.sh at a tighter heat-bath cutoff (1e-5),
-# seeded from the LAST detfile the 1e-4 run produced (converged basis at that cutoff, or the
-# last round it reached before its own elapse budget cut it off).
+# Continuation of run_hci_multiround.sh at a tighter heat-bath cutoff (1e-5), seeded from the
+# LAST detfile the 1e-4 run produced (converged basis at that cutoff, or the last round it
+# reached before its own elapse budget cut it off).
 #
-# 1 node x 16 ranks/node = 16 total ranks, b_comm_size=8, t_comm_size=1 (h_comm_size=16/(8*1)=2)
-# -- this EXACTLY matches Stage 1's own validated single-node config, deliberately not scaled up.
+# 8 nodes x 16 ranks/node = 128 total ranks, b_comm_size=32, t_comm_size=1
+# (h_comm_size=128/(32*1)=4). Scaled up from the validated 1-node/16-rank/b_comm_size=8 config
+# after a REAL OOM kill: round 7 (heatbath expansion at 1e-5) grew the basis from 259,429 to
+# 7,719,923 determinants -- round 8's Davidson attempt at 1 node/16 ranks died in 71s with exit
+# code 137 (SIGKILL, i.e. out-of-memory), confirming a basis this size genuinely needs more
+# ranks on the b_comm (basis-sharding) dimension, not a queue-wait/config issue. 8 nodes chosen
+# over 4 given how hard the OOM hit (71s, not a slow degradation) -- erring toward more headroom
+# rather than another undersized attempt.
 #
-# Real multi-node attempts tried and abandoned this session, in order: 4 nodes/rscgrp=large
-# REJECTED outright ("node=4 is less than the lower limit (385)" -- large has a hard 385-node
-# floor here); 16 nodes/rscgrp=small showed a real PJM queue estimate ~1 week out; 2 nodes/
-# rscgrp=small STILL showed ~9 days out -- confirming small is currently backlogged regardless
-# of node count, not specifically penalizing larger multi-node requests. Checked pjacl -g
-# ra010014 directly: only small/int resource groups exist for this account; no prepost/
-# prepost-mem group exists on Fugaku for this account (that name belongs to a different
-# cluster's queue table, unrelated). Falling back to 1 node trades scale-out for actually
-# running promptly, matching how Stage 1 itself started immediately at this exact size.
+# rscgrp history this session, for context: 4 nodes/rscgrp=large REJECTED outright ("node=4 is
+# less than the lower limit (385)" -- large has a hard 385-node floor here); 16 nodes/
+# rscgrp=small showed a real PJM queue estimate ~1 week out; 2 nodes/rscgrp=small STILL showed
+# ~9 days out -- small was backlogged regardless of node count at the time, not specifically
+# penalizing larger requests. 1 node/rscgrp=small is what actually ran (round 7 succeeded there)
+# before hitting this real memory ceiling. No prepost/prepost-mem group exists on Fugaku for
+# this account (that name belongs to a different cluster's queue table, unrelated).
 #
 # Checkpoint/restart: --savename after every round persists the actual Davidson wavefunction
 # (not just the determinant list) via sbd::SaveWavefunction; a resubmitted job detects the last
@@ -54,18 +58,31 @@ FCIDUMP=fe4s4_bsuhf.uhf.fcidump
 HEATBATH_CUTOFF=1.0e-5
 N_ROUNDS_TOTAL=10          # overall stop condition across ALL resubmissions, not per-job
 LOGFILE=hci_multiround_timing_1e5.log
-STATEFILE=hci_1e5_state.txt   # "round_completed,detfile,wavefile" of the last finished round
+STATEFILE=hci_1e5_state.txt   # "round_completed,detfile,wavefile,b_comm_size" of the last finished round
 SELF_SCRIPT="$(readlink -f "$0")"
-NODE_COUNT=1
+NODE_COUNT=8
 MPI_RANKS_PER_NODE=16
 TOTAL_RANKS=$((NODE_COUNT * MPI_RANKS_PER_NODE))
-B_COMM_SIZE=8
+B_COMM_SIZE=32
 T_COMM_SIZE=1
 
 if [ -f "$STATEFILE" ]; then
-  IFS=',' read -r LAST_ROUND DETFILE LOADWAVE < "$STATEFILE"
+  IFS=',' read -r LAST_ROUND DETFILE LOADWAVE SAVED_B_COMM_SIZE < "$STATEFILE"
   START_ROUND=$((LAST_ROUND + 1))
-  echo "=== RESUMING from state file: last completed round ${LAST_ROUND}, detfile=${DETFILE}, wavefile=${LOADWAVE} ==="
+  # --loadname's save file is sharded by mpi_rank_b (statefilename(name, mpi_rank_b) in
+  # caop/basic/restart.h), so it's only valid to load if b_comm_size is UNCHANGED from the
+  # run that wrote it. Real case this guards against: round 7 OOM'd round 8 at b_comm_size=8,
+  # so this resume intentionally scales to a larger b_comm_size -- loading round 7's
+  # 8-sharded wavefunction under 32-way sharding would read wrong/incomplete data. Drop the
+  # stale wavefunction reference (cold-start Davidson on the detfile instead) whenever
+  # b_comm_size changed between the save and this run.
+  # A state file from before this field existed (empty SAVED_B_COMM_SIZE) is treated as
+  # UNKNOWN, not as "assume compatible" -- unknown means unsafe to load.
+  if [ "${SAVED_B_COMM_SIZE:-}" != "$B_COMM_SIZE" ]; then
+    echo "=== b_comm_size changed or unrecorded (saved='${SAVED_B_COMM_SIZE:-<unknown>}', this run=${B_COMM_SIZE}) -- dropping stale --loadname, cold-starting Davidson ==="
+    LOADWAVE=""
+  fi
+  echo "=== RESUMING from state file: last completed round ${LAST_ROUND}, detfile=${DETFILE}, wavefile=${LOADWAVE:-<none>} ==="
 else
   # First invocation: seed from the LAST detfile the 1e-4 run produced.
   DETFILE=$(ls -v detfile_round*.txt 2>/dev/null | grep -v '_1e5_' | tail -1)
@@ -151,7 +168,7 @@ for round in $(seq "$START_ROUND" $((N_ROUNDS_TOTAL - 1))); do
   echo "ROUND ${round} SUMMARY: n_det ${N_IN} -> ${N_OUT}, energy=${ENERGY}, wall=${WALL}s, davidson=${DAVIDSON_S}s, heatbath=${HEATBATH_S}s"
 
   # Advance the state file only after a fully successful round -- this is the resume point.
-  echo "${round},${NEXT_DETFILE},${SAVEWAVE}" > "$STATEFILE"
+  echo "${round},${NEXT_DETFILE},${SAVEWAVE},${B_COMM_SIZE}" > "$STATEFILE"
 
   if [ "$N_OUT" -eq "$N_IN" ]; then
     echo "=== basis unchanged (${N_OUT} dets) -- HCI converged at 1e-5, stopping for good at round ${round} ==="
