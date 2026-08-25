@@ -83,3 +83,4 @@ nav:
       - PyPI Release Guide: release.md
       - QCSC Prefect API: reference/qcsc_prefect_api.md
       - Native Qiskit API: reference/native_qiskit_api.md
+      - "SBD gdb Heat-Bath CI & Selection Gap": reference/sbd_gdb_heatbath_and_selection_gap.md
