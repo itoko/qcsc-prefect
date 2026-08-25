@@ -1,5 +1,5 @@
 #!/bin/bash
-#PJM -L "node=16"
+#PJM -L "node=2"
 #PJM -L "rscgrp=small"
 #PJM -g ra010014
 #PJM -L "elapse=08:00:00"
@@ -11,25 +11,20 @@
 # heat-bath cutoff (1e-5), seeded from the LAST detfile the 1e-4 run produced (converged basis
 # at that cutoff, or the last round it reached before its own elapse budget cut it off).
 #
-# Scale-out: 16 nodes x 16 ranks/node = 256 total MPI ranks (vs the 1e-4 run's 1 node x 16). The
+# Scale-out: 2 nodes x 16 ranks/node = 32 total MPI ranks (vs the 1e-4 run's 1 node x 16). The
 # real parallel dimension for a growing determinant basis is b_comm_size, since
 # h_comm_size = mpi_size / (t_comm_size * b_comm_size) and b_comm shards the basis/Davidson
-# vector across ranks -- t_comm_size stays 1 (unused dimension here), b_comm_size raised
-# 8 -> 32 (an 8x scale-out from Stage 1's validated b_comm_size=8) so the extra ranks land on
-# the axis that's actually under memory/compute pressure as the basis grows past 240k
-# determinants; h_comm_size stays 8, unchanged from Stage 1 -- h_comm is just a replica/history
-# dimension derived as whatever's left over (mpi_size/(t_comm_size*b_comm_size)), not a
-# physics-correctness-sensitive parameter, so keeping it fixed while scaling b_comm isolates the
-# actual variable being tested.
+# vector across ranks -- t_comm_size stays 1 (unused dimension here), b_comm_size=8 matches
+# Stage 1's already-validated value exactly (h_comm_size=32/(8*1)=4, vs Stage 1's h_comm_size=8
+# -- h_comm is just a replica/history dimension derived as whatever's left over, not a
+# physics-correctness-sensitive parameter).
 #
-# Picked 16 nodes deliberately as an intermediate step, not the maximum available: rscgrp=large
-# REJECTED node=4 with a real PJM error ("node=4 is less than the lower limit (385)") -- large
-# has a hard 385-node floor on this system. Jumping straight to 385 nodes would be a 96x scale-out
-# of b_comm_size (8 -> 770) with zero prior validation of this code path beyond 32 ranks; if that
-# broke (MPI comm pattern, load imbalance, a bug only visible at scale) we'd be debugging blind
-# at 385 nodes, which is slow and expensive to iterate on. 16 nodes/256 ranks (b_comm_size=32) is
-# a more conservative 8x step to confirm the scale-out is correct before committing to large's
-# 385-node floor for a further jump.
+# Picked 2 nodes, not 16: the 16-node/256-rank config was tried first and showed a real PJM
+# queue estimate of ~1 week out (rscgrp=small is apparently heavily contended at that node
+# count) -- cancelled before it ran. rscgrp=large REJECTED node=4 outright with "node=4 is less
+# than the lower limit (385)" -- large has a hard 385-node floor on this system. 2 nodes is the
+# smallest real multi-node step (validates MPI works across node boundaries at all) while
+# staying inside whatever range of rscgrp=small actually schedules promptly.
 #
 # Checkpoint/restart: --savename after every round persists the actual Davidson wavefunction
 # (not just the determinant list) via sbd::SaveWavefunction; a resubmitted job detects the last
@@ -56,10 +51,10 @@ N_ROUNDS_TOTAL=10          # overall stop condition across ALL resubmissions, no
 LOGFILE=hci_multiround_timing_1e5.log
 STATEFILE=hci_1e5_state.txt   # "round_completed,detfile,wavefile" of the last finished round
 SELF_SCRIPT="$(readlink -f "$0")"
-NODE_COUNT=16
+NODE_COUNT=2
 MPI_RANKS_PER_NODE=16
 TOTAL_RANKS=$((NODE_COUNT * MPI_RANKS_PER_NODE))
-B_COMM_SIZE=32
+B_COMM_SIZE=8
 T_COMM_SIZE=1
 
 if [ -f "$STATEFILE" ]; then
