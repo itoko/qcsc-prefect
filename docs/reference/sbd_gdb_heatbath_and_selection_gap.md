@@ -233,47 +233,91 @@ closing on both references, at a real per-round compute cost that roughly double
 round as the basis grows (heatbath-expansion time dominates total wall time throughout, not
 Davidson).
 
-### Stage 2: tighter cutoff = 1e-5, multi-node with checkpoint/restart
+### Stage 2: tighter cutoff = 1e-5
 
-Once growth at `1e-4` visibly saturates (or the single-node job's 7h elapse/6-round budget is
-exhausted, whichever comes first), the run continues at a tighter cutoff seeded from the last
-`1e-4` detfile actually produced -- cheaper than restarting from the bare HF determinant, since
-`1e-5` mostly just adds newly-eligible smaller-coupling determinants on top of what `1e-4`
-already found.
+Once round 5 visibly saturated at `1e-4` (259,139 -> 259,429 determinants, +0.11%; final
+energy **-327.205577 Ha**, see the table above extended through round 5 in the timing log),
+Stage 2 continued at `--heatbath_cutoff 1.0e-5`, seeded from `1e-4`'s final detfile -- cheaper
+than restarting from the bare HF determinant, since `1e-5` mostly adds newly-eligible
+smaller-coupling determinants on top of what `1e-4` already found.
 
-**Node/rank config**: scaled from 1 node/16 ranks to **4 nodes / 64 total ranks**
-(`#PJM -L "node=4" -L "rscgrp=large" --mpi "max-proc-per-node=16"`), `--b_comm_size 8`
-(raised from 2), `--t_comm_size 1` unchanged -- keeps `h_comm_size = 64/(8*1) = 8` identical to
-Stage 1, so the 4x extra ranks land entirely on `b_comm`, the dimension that shards the
-determinant basis/Davidson vector, which is the axis actually under memory/compute pressure as
-the basis grows past ~250k determinants. `rscgrp=large` confirmed via this project's own
-`run_fe4s4_recover_fugaku_d3e10.py` comments to have no node-count floor and to accept an 8h
-elapse limit at real scale (used there at 12,100 nodes).
+**Round 7** (still on Stage 1's validated 1-node/16-rank/`b_comm_size=8` config, `rscgrp=small`):
+ran successfully. Heatbath expansion at the tighter cutoff grew the basis from **259,429 to
+7,719,923 determinants** (a ~30x jump, as expected from a 10x-tighter cutoff) in
+`wall=3971.2s` (`davidson=2653.1s`, `heatbath=1157.8s`). Davidson's energy for this round
+(diagonalizing the *old*, still-259k, basis before the new expansion is folded in) reproduced
+`-327.2055877378335 Ha`, matching round 5's converged 1e-4 value as expected.
 
-**Checkpoint/restart**: every round now also passes `--savename wavefunction_1e5_round<N>.dat`,
-persisting the actual Davidson wavefunction (`sbd::SaveWavefunction`/`LoadWavefunction` in
-`caop/basic/restart.h`) rather than only the determinant list. A resubmitted job passes the
-previous round's saved wavefunction back in via `--loadname`, warm-starting Davidson instead of
-re-solving from a cold guess. Verified against the actual `LoadWavefunction` source that this is
-safe across a growing/reordered basis: it does a per-determinant `lower_bound` lookup against
-the *current* basis, carries over the coefficient for every determinant present in both the old
-and new basis, leaves newly-added determinants at a zero initial guess, and re-normalizes --
-correct for exactly the round-to-round scenario here (basis strictly grows and is freshly sorted
-each round). One real constraint: the save file is sharded by `mpi_rank_b`
-(`statefilename(name, mpi_rank_b)`), so a reload is only valid if `--b_comm_size` matches between
-the save and load runs -- kept fixed at 8 throughout this stage for that reason.
+**Round 8 -- real OOM, config scale-out does NOT fix it:** diagonalizing across the new
+7.72M-determinant basis genuinely does not fit in the memory configurations tried so far:
 
-A small persistent `hci_1e5_state.txt` (`last_completed_round,detfile,wavefile`) drives resume
-logic: on start, if the state file exists, resume from `last_completed_round+1` using its
-recorded detfile/wavefile; if a round's `gdb_diag_uhf` call exits non-zero, the state file is
-*not* advanced, so a resubmit retries that same round rather than skipping past a failure. If the
-elapse budget runs low (within 40 min of the 8h limit) before finishing the next round, the
-script self-resubmits (`pjsub "$SELF_SCRIPT"`) and exits cleanly, so the same job chains across
-however many resubmissions the full 1e-5 convergence sweep needs -- mirroring the self-chaining
-pattern already used for the d3e10 SQD jobs elsewhere in this repo. Script:
+| Attempt | Nodes | Ranks | `b_comm_size` | Memory | Result |
+|---|---|---|---|---|---|
+| 1 | 1 (Fugaku) | 16 | 8 | Fugaku per-node default | **OOM**, exit 137 (SIGKILL) at 71s |
+| 2 | 1 (ROQUO `qr08n01`) | 36 | 36 | 400GB (SLURM "1/4 size" tier) | **Degraded**: 1 real `oom_kill` event (task 27), only 6/36 ranks still alive/printing after; job left in a zombie `RUNNING` state rather than terminating |
+| 3 | 1 (ROQUO `qr08n01`) | 144 | 144 | 1.6TB (full node, `--mem=1600000` -- SLURM's real usable ceiling, ~100GB below `scontrol`'s reported `RealMemory=1715000`) | **Worse degradation**: 2 `oom_kill` events, **43/144 ranks** OOM-killed, same zombie-`RUNNING` pattern |
+
+**This rules out "just needs more total memory."** Going from 36 to 144 ranks on the *same*
+physical node (same 1.6TB ceiling either way) made the failure more severe (1 rank OOM'd at 36
+ranks vs. 43 ranks OOM'd at 144), which is the opposite of what should happen if `b_comm_size`
+were genuinely sharding the 7.72M-determinant basis proportionally across ranks -- more shards
+should mean *less* memory per rank, not more failures. The real implication: something in the
+current `gdb_diag_uhf`/PR #87 heatbath-expansion or Davidson-setup path is replicating
+state whose size scales with the *whole* basis (or with rank count itself) on every rank,
+rather than genuinely partitioning it by `b_comm`, at this basis size. This is a real
+`gdb_diag_uhf`-level scaling gap, not a resource-availability problem -- fixing it would need
+source-level investigation into what `--b_comm_size` actually shards during `make diagonal
+term`/heatbath at this scale, out of scope for this pass.
+
+**Also confirmed real, separately:** in every OOM case, the SLURM/PJM job stayed reported as
+`RUNNING`/`R` well after the OOM kill(s) rather than terminating -- a real robustness gap
+(missing collective-failure propagation) worth flagging upstream, since it means job status
+alone is not a reliable signal that a run is healthy once any rank has died.
+
+**Multi-node scale-out on Fugaku's `large` queue was also explored but never tested against
+round 8 directly**, because `rscgrp=large`'s real system-wide contention (confirmed via
+`pjstat -A`: other users' queued jobs at this account's node-priority tier include 256-node,
+4096-node, and even a single ~36,864-node request competing for the same pool) produced
+multi-day queue estimates (16 nodes/`small`: ~1 week; 2 nodes/`small`: ~9 days; 385
+nodes/`large`, its real node floor confirmed via a live PJM rejection at `node=4`: ~3.5 days)
+regardless of node count requested -- `small` was backlogged independent of size, and `large`'s
+floor of 385 nodes was still a multi-day wait. Checked all 3 real allocation groups this
+account belongs to (`ra010014`, `hp240496`, `trial`) via `pjacl -g <group>`: identical static
+priority/fairshare policy (127/0/100) across all three, and the queued job's own `pjstat -v`
+priority showed the plain default `127` with an empty `REASON` field -- confirming the wait is
+genuine system-wide contention on `large`, not a group-specific deprioritization fixable by
+switching groups. The 385-node job was cancelled once the round-8 OOM was understood to be a
+config/code issue rather than something more nodes would resolve.
+
+**Checkpoint/restart infrastructure built for this stage** (real, tested, but not what
+ultimately blocked round 8 -- the OOM happens before a checkpoint would even be relevant):
+every round also passes `--savename wavefunction_1e5_round<N>.dat`, persisting the actual
+Davidson wavefunction (`sbd::SaveWavefunction`/`LoadWavefunction` in `caop/basic/restart.h`)
+rather than only the determinant list. A resubmitted job passes the previous round's saved
+wavefunction back in via `--loadname`, warm-starting Davidson instead of re-solving from a cold
+guess. Verified against the actual `LoadWavefunction` source that this is safe across a
+growing/reordered basis: it does a per-determinant `lower_bound` lookup against the *current*
+basis, carries over the coefficient for every determinant present in both the old and new
+basis, leaves newly-added determinants at a zero initial guess, and re-normalizes -- correct for
+exactly the round-to-round scenario here (basis strictly grows and is freshly sorted each
+round). One real constraint, and a real bug this session caught before it could bite: the save
+file is sharded by `mpi_rank_b` (`statefilename(name, mpi_rank_b)`), so a reload is only valid
+if `--b_comm_size` matches between the save and load runs -- the driver script's state file now
+records `b_comm_size` alongside the wavefile path and drops a stale `--loadname` (cold-starting
+Davidson instead) whenever it doesn't match the current run's value, rather than silently
+loading mismatched shards.
+
+A small persistent `hci_1e5_state.txt` (`last_completed_round,detfile,wavefile,b_comm_size`)
+drives resume logic: on start, if the state file exists, resume from `last_completed_round+1`
+using its recorded detfile/wavefile; if a round's `gdb_diag_uhf` call exits non-zero, the state
+file is *not* advanced, so a resubmit retries that same round rather than skipping past a
+failure. If the elapse budget runs low (within 40 min of the 8h limit) before finishing the next
+round, the script self-resubmits (`pjsub "$SELF_SCRIPT"`) and exits cleanly. Script:
 `run_hci_multiround_1e5.sh`, staged at
 `/vol0206/data/ra010014/u14924/u14924_space/gdb_hci/run_hci_multiround_1e5.sh`.
 
-Stage 2 results will be appended here as real rounds complete (submission follows Stage 1's
-1e-4 run reaching either true convergence or its own budget limit, so the seed detfile is the
-best one actually available, not a projected one).
+**Status: paused here.** The Stage 1 (`1e-4`) result (`-327.205577 Ha`, 33.4 mHa above DMRG,
+28.8 mHa above best SQD) stands as the real, reproducible HCI-vs-DMRG/SQD data point from this
+investigation. Pushing to `1e-5` at this basis size needs either a source-level fix to
+`gdb_diag_uhf`'s memory scaling, or a fundamentally different multi-node distribution strategy
+than tried here -- not further config/node-count tuning.
