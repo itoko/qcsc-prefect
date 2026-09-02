@@ -136,10 +136,50 @@ dimensions that a single GPU's HBM cannot hold, e.g. `sqd_dim = 1e9`, become tra
 **NCCL multi-GPU** binaries with `build_sbd_mpi.sh` (RHF) and `build_sbd_mpi_uhf.sh` (UHF). These
 target a fork that adds the multi-rank / non-CUDA-aware-MPI support the upstream tree lacks.
 
+Two build recipes are proven and tracked in this repo — pick one:
+
+- **`build_sbd_mpi_uhf_hpcx250.sh`** (native, recommended default): links against the standalone
+  `hpcx/2.50` module (HPC-X OpenMPI 5), *not* NVHPC's own bundled `comm_libs/hpcx` and *not*
+  `nvhpc-openmpi/26.5` — that distinction fixed a real NCCL bootstrap ring deadlock seen at
+  64–100 ranks on the wrong MPI stack. This is what every proven production chain on ROQUO
+  actually runs (see job 31118 below).
+- **`build_sbd_mpi_uhf_container.sh`** (container-isolated): compiles entirely inside
+  `nvcr.io/nvidia/nvhpc:26.5-devel` (its own bundled `nvc++`/`hpcx-2.50`/CUDA), with zero
+  involvement of ROQUO's shared module filesystem. Use this if you hit a fresh-compile issue that
+  a native rebuild can't explain (e.g. a binary that resolves identical libraries/flags to a
+  known-working one but still fails at MPI init) — building inside the container rules out
+  anything tied to shared-module/toolchain state on the host. Otherwise, prefer the native recipe;
+  the container path exists as an isolation tool, not because it's faster or better maintained.
+
+### GenerateExcitation OMP livelock fix — `OMP_NUM_THREADS` can now be `>1`
+
+Under `-gpu=mem:unified`, `GenerateExcitation` (`include/sbd/chemistry/tpb/helper.h`) used to
+reallocate two small `std::vector<int>` scratch buffers (`cr`, `an`) on the heap every loop
+iteration, inside a `#pragma omp parallel for` region. Every allocation routes through NVHPC's
+managed-memory pool allocator; with tens of thousands of iterations × many OMP threads, contention
+on the pool allocator's lock livelocks (observed 600+ billion CAS retries in a live hang —
+[r-ccs-cms/sbd#80](https://github.com/r-ccs-cms/sbd/issues/80)). **Fix:** hoist `cr`/`an` outside
+the parallel loop, one allocation per thread, reused via `OrbitalDifference`'s own
+`.clear()` at the top of each call (correctness-preserving — confirmed `OrbitalDifference` always
+clears both vectors before writing). Apply this patch to your `sbd_mpi/` checkout before building
+either recipe above; a PR is pending upstream.
+
+Validated at `OMP_NUM_THREADS=8` on a real 36-node/144-rank production step (~4h11m wall-clock),
+matching the native `OMP_NUM_THREADS=1` per-step pace (~5h08m/step, measured from checkpoint
+timestamps on job 31118) — no regression from raising the thread count.
+
+> [!NOTE]
+> `OMP_NUM_THREADS` does **not** speed up the Davidson/mult solve itself — there are zero
+> `#pragma omp` directives in `davidson_thrust.h` or `mult_thrust.h` (that work is GPU-parallel via
+> CUDA/Thrust, not CPU-threaded). It only affects the `GenerateExcitation`/"helper construction"
+> setup phase that runs once per recovery step. Don't expect raising it to make Davidson faster —
+> the actual lever for that is the MPI grid (`adet_comm_size`/`bdet_comm_size`, more nodes).
+
 ### 1. Clone the fork (not vendored in this repo)
 
 The multi-GPU source lives in `native/sbd_mpi/` (gitignored — do not commit the ~large tree). Clone
-Ryusei Wakizaka's fork, `non-cuda-aware-mpi` branch, then apply the NCCL warm-up fix:
+Ryusei Wakizaka's fork, `non-cuda-aware-mpi` branch, then apply the NCCL warm-up fix and the
+GenerateExcitation fix above:
 
 ```bash
 cd algorithms/sbd/native
@@ -158,54 +198,101 @@ carryover vectors before building — see `build_sbd_mpi*.sh` header.)
 
 ### 2. Build (on a GB200 compute/login node with the modules)
 
+Native recipe (recommended default):
+
 ```bash
-sbatch build_sbd_mpi.sh        # -> native/diag-gpu-mpi       (RHF / restricted)
-sbatch build_sbd_mpi_uhf.sh    # -> native/diag-gpu_uhf-mpi   (UHF / open-shell, adds -D_UHF)
+sbatch build_sbd_mpi_uhf_hpcx250.sh    # -> native/diag-gpu_uhf-mpi-hpcx250
 ```
 
-Both use the CMake `nvhpc-thrust` preset with NCCL + cuBLAS + rank-distribution:
+Container-isolated recipe (only if you need to rule out shared-module/toolchain drift):
 
 ```bash
-module load cuda/13.2 nvhpc/26.5
-cmake --preset nvhpc-thrust \
+sbatch build_sbd_mpi_uhf_container.sh  # -> native/diag-gpu_uhf-mpi-container
+```
+
+The older, generic scripts (`build_sbd_mpi.sh` / `build_sbd_mpi_uhf.sh`, targeting whatever
+`nvhpc`/`hpcx` module happens to resolve on `PATH`) still work but don't pin the MPI stack — use
+the `_hpcx250` recipe unless you have a specific reason not to. All three use the same CMake
+`nvhpc-thrust` preset with NCCL + cuBLAS + rank-distribution:
+
+```bash
+module load gcc/14 nvhpc/26.5
+module load hpcx/2.50   # load AFTER nvhpc so its mpic++/PATH takes precedence over nvhpc's bundled hpcx
+cmake -S . -B build/hpcx250-thrust --toolchain cmake/toolchains/nvhpc.cmake \
+  -DSBD_GPU_BACKEND=thrust -DSBD_GPU_ARCH=cc100 \
   -DSBD_USE_NCCL=ON -DSBD_USE_CUBLAS=ON \
   -DSBD_USE_RANK_DISTRIBUTION=ON -DSBD_USE_BLOCK_RANK_DISTRIBUTION=ON \
-  -DCMAKE_CXX_FLAGS="-DSBD_PREFECT -DSBD_NON_CUDA_AWARE_MPI -I<nccl_include>" \
+  -DCMAKE_CXX_FLAGS="-D_UHF -DSBD_PREFECT -DSBD_NON_CUDA_AWARE_MPI -I<nccl_include>" \
   -DCMAKE_EXE_LINKER_FLAGS="-L<nccl>/lib -lnccl -L<cublas> -lcublas -cudalib=cublas"
-cmake --build build/nvhpc-thrust --target tpb_diag        # add -D_UHF to CXX_FLAGS for the UHF binary
+cmake --build build/hpcx250-thrust --target tpb_diag
 ```
 
-Verify the link: `ldd native/diag-gpu-mpi | grep -iE 'nccl|mpi|cublas'` should show
-`libnccl.so.2`, `libmpi.so.40` (HPC-X OpenMPI 5), and `libcublas`.
+Verify the link: `ldd native/diag-gpu_uhf-mpi-hpcx250 | grep -iE 'nccl|mpi|cublas'` should show
+`libnccl.so.2`, `libmpi.so.40` (the standalone HPC-X OpenMPI 5, not nvhpc's bundled copy — check
+with `readelf -d` that `RUNPATH` points at `hpcx/2.50`'s tree), and `libcublas`.
 
-### 3. Run it — **use `mpirun`, not `srun`**
+### 3. Run it — `srun --mpi=pmix`, validated up to 36 nodes / 144 ranks
 
-**Critical:** ROQUO's `srun` cannot bootstrap the HPC-X OpenMPI 5 that these binaries link — under
-every available `--mpi` plugin (`none`, `pmi2`, `cray_shasta`) each rank initializes as its own
-`MPI_COMM_WORLD` of size 1, and the solver aborts with
-`std::invalid_argument: MPI Size of twister is not a square of a integer`. Only `mpirun -np N`
-(from the loaded `hpcx` module) gives a real N-rank world. This is what the tutorial's
-"Open MPI fails with PMI / PMIx errors under `srun`" note means — set `launcher="mpirun"`.
-
-For a 4-GPU single-node run, request a full node and split the beta-determinant communicator:
+The native `_hpcx250` binary launches with plain `srun`, using the PMIx MPI plugin:
 
 ```bash
-#SBATCH --gres=gpu:4 --ntasks-per-node=4
-module load cuda/13.2 nvhpc/26.5            # puts hpcx mpirun on PATH
-mpirun -np 4 ./diag-gpu_uhf-mpi \
-  --task_comm_size 1 --adet_comm_size 1 --bdet_comm_size 4 \
-  --block 20 --iteration 5 --tolerance 0.01 ... \
+#SBATCH --nodes=32 --gres=gpu:4 --ntasks-per-node=4
+module load gcc/14 nvhpc/26.5
+module load hpcx/2.50
+srun --mpi=pmix --gpu-bind=closest ./diag-gpu_uhf-mpi-hpcx250 \
+  --task_comm_size 1 --adet_comm_size 8 --bdet_comm_size 16 \
+  --block 20 --iteration 5 --tolerance 0.01 \
   --adetfile AlphaDets.bin --bdetfile BetaDets.bin --carryoverfile carryover.txt
 ```
 
-- The rank product `task_comm_size × adet_comm_size × bdet_comm_size × h_comm_size` must equal the
-  MPI world size (`-np N`). For 4 GPUs on one node: `bdet_comm_size=4`, the rest `1`
-  (`h_comm_size` is derived as `world / (task·adet·bdet)`).
-- GPU binding is automatic: `main.cc` does `cudaSetDevice(mpi_rank % cudaGetDeviceCount())`, so with
-  `--gres=gpu:4` rank *i* lands on GPU *i*. Do **not** pass srun's `--gpu-bind`.
-- `-DSBD_NON_CUDA_AWARE_MPI` (CPU-staged MPI) is compiled in so the binary is **multi-node-ready**,
-  but only 4-GPU single-node has been validated to date; a genuine 2+ node run is untested.
+This is the actual launcher a real production job (32 nodes, `a=8 × b=16 = 128` ranks) has run
+continuously across 150+ recovery steps. A 36-node / `a=8 × b=18 = 144`-rank grid has also been
+validated (Fe4S4 UHF at `sqd_dim=3e10`). Both far exceed the earlier single-node/4-GPU-only
+testing — multi-node `srun` launches are proven, not experimental.
 
-The sweep launcher `sweep/run_fe4s4_mgpu.sh` wires all of this via env
-(`FE4S4_LAUNCHER=mpirun`, `FE4S4_MPI_OPTIONS=-np,4`, `FE4S4_BDET_COMM_SIZE=4`,
-`FE4S4_DIAG_BIN=diag-gpu-mpi`, `FE4S4_DIAG_BIN_UHF=diag-gpu_uhf-mpi`).
+- The rank product `task_comm_size × adet_comm_size × bdet_comm_size × h_comm_size` must equal the
+  total MPI world size (`nodes × ntasks-per-node`) — same constraint documented for Fugaku sizing.
+  Pick `adet_comm_size`/`bdet_comm_size` as close to a square grid as the node count allows.
+- GPU binding is automatic: `main.cc` does `cudaSetDevice(mpi_rank % cudaGetDeviceCount())`, so with
+  `--gres=gpu:4` rank *i* lands on GPU *i*. Do **not** additionally pass srun's `--gpu-bind` if the
+  binary already does its own device binding — `--gpu-bind=closest` above is for NUMA/PCIe
+  locality, not device selection.
+
+**Running the container-isolated binary** requires `apptainer exec`, not bare `srun` — the binary
+depends on the container's own glibc/library ABI (Ubuntu 24.04, glibc 2.39) and will fail to load
+on the bare host. Wrap it per-rank:
+
+```bash
+SIF="$HOME/qcsc-prefect/algorithms/sbd/native/containers/nvhpc-26.5-devel.sif"
+OMPI_LIB="/opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/hpcx/hpcx-2.50/ompi5"
+apptainer exec --nv \
+  --bind /var/spool/slurmd:/var/spool/slurmd --bind /tmp:/tmp \
+  --env "OPAL_PREFIX=${OMPI_LIB}" --env "TMPDIR=<a container-visible writable dir>" \
+  --env "PATH=${OMPI_LIB}/bin:$PATH" \
+  "$SIF" ./diag-gpu_uhf-mpi-container --adet_comm_size 8 --bdet_comm_size 18 ...
+```
+
+Then launch that wrapper with the same `srun --mpi=pmix --gpu-bind=closest` as above (one wrapper
+invocation per rank). Three flags are required, each fixing a real failure mode hit at multi-rank
+scale:
+
+- `--bind /var/spool/slurmd:/var/spool/slurmd` — SLURM's PMIx rendezvous point lives at
+  `/var/spool/slurmd/pmix.<jobid>.0/`, outside Apptainer's default bind set (`$HOME`, `/tmp`,
+  `/proc`, `/sys`, `/dev`). Without this bind, every rank silently falls back to a size-1
+  singleton MPI world (`rank=0/1` for every rank) instead of joining the real job — no error, just
+  wrong behavior, so check `MPI_Init_thread`'s reported rank/size explicitly if debugging this.
+- `--env OPAL_PREFIX=...` — the container's OpenMPI has a build-time-baked help-file path
+  (`/proj/libraries/nv/...`) that doesn't exist on ROQUO; this override points it at the
+  container's real install location instead.
+- `--env TMPDIR=...` — OpenMPI's default session directory (`/scratch`) is read-only inside the
+  container's mount namespace; point `TMPDIR` at a path under `$HOME` (bind-mounted automatically)
+  instead.
+
+This exact recipe was validated at 36 nodes / 144 ranks (`sqd_dim=3e10`, real Fe4S4 UHF recovery).
+
+The Fe4S4 sweep launcher (`sweep/run_fe4s4_gpu_roquo.py`, gitignored — not part of this repo's
+tracked source, synced separately) wires all of the above via env vars:
+`FE4S4_ADET_COMM_SIZE`/`FE4S4_BDET_COMM_SIZE` for the grid, `FE4S4_HPCX250=1` to select the native
+`-hpcx250` binary, and `FE4S4_CONTAINER_TALKATIVE=1` to select the container-isolated binary (this
+also switches the internal launcher options to include the `apptainer exec` wrapper automatically
+— no manual wrapper script needed when going through the sweep launcher).

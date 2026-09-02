@@ -149,6 +149,38 @@ venv.bak/
 # figures live in docs/<date>/ instead. Ignore the whole directory.
 algorithms/sbd/sweep/
 
+# DMRG (block2) reference runs -- scratch/run data + build artifacts synced to Fugaku
+# out-of-band, not git. Final numbers/figures for the manuscript get copied into
+# docs/<date>/ once validated, same convention as algorithms/sbd/sweep/.
+docs/dmrg/
+
+# Investigation/incident writeups, support-ticket drafts, and LaTeX report scratch --
+# useful in-session but not part of the tracked documentation set. Same convention as
+# docs/2026-07-22/ etc. below: promote a specific file out of here deliberately if it
+# should ship (e.g. into docs/reference/ with a real doc PR), don't accumulate by default.
+docs/reference/*_report.md
+docs/reference/*_reply*.md
+docs/reference/*_reproducer.md
+docs/reference/*_investigation_*.md
+docs/reference/*_backtrace_*.md
+docs/reference/*email*.md
+docs/reference/*_draft.md
+docs/reference/*.aux
+docs/reference/*.out
+docs/reference/*.toc
+docs/reference/*.tex
+docs/reference/*.pdf
+docs/reference/*.html
+docs/reference/roquo_*.md
+docs/reference/sbd_dev_reply_*.md
+docs/reference/jcahpc_*.md
+docs/reference/extrapolation_error_bar_reviewer_response.md
+
+# Active-jobs scratch tracker and architecture sketches -- session bookkeeping, not
+# part of the tracked repo.
+/ACTIVE_JOBS.md
+*.drawio
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -270,6 +302,10 @@ docs/2026-07-26/
 
 # Future-work brainstorm for the manuscript, not for publication/commit
 docs/2026-08-04/README.md
+
+# Manuscript working directory (LaTeX source/build artifacts, figures, notes) --
+# synced/edited out-of-band, not tracked in git.
+docs/2026-08-04/
 
 # Notebook-fetched example data (downloaded at run time, not vendored)
 examples/sbd_uhf_recover_any_molecule/data/
