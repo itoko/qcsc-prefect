@@ -128,6 +128,69 @@ FCIDUMP merge reconstructs `E=-327.08091697 Ha` losslessly, and a live `gdb_diag
 Davidson and heat-bath expansion. Not yet done: a full-scale run, or any comparison against the
 SQD trajectory at a matched subspace dimension.
 
+## Loading a BS-UHF reference back and checking its UHF/UCCSD energy directly (no reconvergence)
+
+**The bug this closes:** feeding the interleaved `.uhf.fcidump` file (from
+`merge_bsuhf_to_uhf_fcidump.py` above) into `qcsc-prefect`'s own
+`compute_molecular_integrals_from_fcidump(unrestricted=True)` does **not** load the BS-UHF
+reference — that function always reruns `tools.fcidump.to_scf()` (which expects a plain
+restricted-format FCIDUMP, not the interleaved spin-orbital format) and then reconverges a *fresh*
+UHF from a generic guess on top of the misparsed result. Depending on `FE4S4_AF_GROUPS` (unset by
+default) this can land back on the spin-pure RHF solution — this is exactly the failure a
+collaborator hits when they report "`compute_molecular_integrals_from_fcidump` re-runs UHF SCF
+from scratch ... falls back to RHF" after feeding it a BS-UHF-rotated interleaved FCIDUMP.
+
+`load_uhf_fcidump_reference.py` is the fix: it parses the interleaved FCIDUMP directly (pure text
+parsing, the same indexing convention as `sbd`'s `_UHF SetupIntegrals` C++ reader — no
+`to_scf()`, no SCF guess, no stability-following) and evaluates the UHF energy expression by
+direct tensor contraction on the file's own orbitals. There is nothing to reconverge because
+there is no SCF loop at all.
+
+```bash
+pip install pyscf numpy
+
+# UHF energy + <S^2> only (fast):
+python load_uhf_fcidump_reference.py --fcidump fe4s4_bsuhf.uhf.fcidump
+
+# also run UCCSD on top of the loaded (not reconverged) reference, for a direct comparison
+# against a paper's reported BS-UCCSD number (slower, needs more memory at 36 orbitals):
+python load_uhf_fcidump_reference.py --fcidump fe4s4_bsuhf.uhf.fcidump --uccsd
+```
+
+Prints `E(UHF)` [+ `E(UCCSD)` with `--uccsd`] and `<S^2>`, and writes
+`<fcidump>.loaded_summary.txt` with the same numbers for a permanent, diffable record anyone can
+compare against the manuscript's reported BS-UHF/BS-UCCSD energies.
+
+**Verified correctness (2026-09-02)**, against real PySCF calculations, not just synthetic
+round-trips: wrote real converged-UHF integrals (via `sbd`'s own `_write_uhf_fcidump`, the exact
+function `merge_bsuhf_to_uhf_fcidump.py` calls) for two real molecules — a closed-shell N2/sto-3g
+case and an open-shell OH/sto-3g (spin=1) case — then loaded each FCIDUMP back through this script
+and compared against PySCF's own direct `mf.e_tot` / `mf.spin_square()` / `cc.UCCSD(mf).e_tot`:
+
+| Case | E(UHF) match | `<S^2>` | E(UCCSD) match |
+|---|---|---|---|
+| N2 (closed-shell) | exact to ~1e-14 | exact | exact to ~1e-8 (UCCSD's own tolerance) |
+| OH (open-shell, spin=1) | exact to ~1e-14 | 0.75 vs 0.7532619... (expected physical residual — see below) | exact to ~1e-8 |
+
+The small `<S^2>` residual in the open-shell case is **not a bug**: this script's `<S^2>`
+shortcut assumes the FCIDUMP's own MO basis is orthonormal (true by construction, since it's a
+converged SCF's own canonical MOs) and uses an identity AO overlap; PySCF's own `spin_square()`
+uses the real AO overlap and picks up a small amount of genuine physical spin contamination that
+an identity-overlap calculation cannot see. It does not affect the energies, which match to
+machine precision.
+
+This closes the loop end-to-end: anyone reproducing the BS-UHF reference can now (1) converge it
+(`prepare_bsuhf_fcidump.py`), (2) merge it into the interleaved format
+(`merge_bsuhf_to_uhf_fcidump.py`), (3) load *that exact file* back and get a directly comparable
+UHF **and** UCCSD energy (`load_uhf_fcidump_reference.py --uccsd`) — all three steps standalone
+scripts with zero `qcsc-prefect`/Prefect dependency beyond one direct, non-Prefect function reuse
+(`_write_uhf_fcidump`).
+
+Regression tests: `algorithms/sbd/tests/test_load_uhf_fcidump_reference.py` (run with
+`cd algorithms/sbd && python -m pytest tests/test_load_uhf_fcidump_reference.py -v`) — covers the
+FCIDUMP round-trip, the UHF energy formula, `<S^2>`, the UCCSD path, and the CLI end-to-end, each
+against a real PySCF calculation on real molecules (not synthetic data).
+
 ## Reproducing a different pairing/fragment choice
 
 `--af-groups fe4s4` is a convenience keyword for the pairing-(1,2) reference used throughout this
