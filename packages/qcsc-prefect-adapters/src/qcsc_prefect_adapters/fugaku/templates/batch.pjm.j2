@@ -63,6 +63,15 @@ case "${QCSC_PREFECT_EXECUTABLE}" in
     fi
     ;;
 esac
+{% if launcher == "mpiexec" %}
+case "${QCSC_PREFECT_EXECUTABLE}" in
+  */*)
+    if command -v llio_transfer >/dev/null 2>&1; then
+      llio_transfer "${QCSC_PREFECT_EXECUTABLE}"
+    fi
+    ;;
+esac
+{% endif %}
 {% if launcher == "single" %}
 {% set base_cmd = '"${QCSC_PREFECT_EXECUTABLE}"' %}
 {% elif launcher == "mpiexec" %}

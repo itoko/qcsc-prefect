@@ -243,8 +243,12 @@ def _default_block_names(*, hpc_target: str, solver_mode: str) -> dict[str, str]
 def _normalize_modules_for_target(
     *, is_miyabi: bool, solver_mode: str, modules: list[str] | None
 ) -> list[str]:
-    if is_miyabi and solver_mode == "gpu":
-        return []
+    # NOTE: this used to force an empty module list for is_miyabi + solver_mode=="gpu"
+    # unconditionally, discarding any --modules the caller passed. That was a stopgap for when
+    # Miyabi-G had no real GPU module defaults wired up; verified on real hardware that PBS batch
+    # jobs on Miyabi-G do NOT inherit the submitting shell's loaded modules (a multi-node solve
+    # needing libnccl.so.2 fails with a shared-library error otherwise), so the caller-supplied
+    # modules (e.g. ["nvidia/25.9"]) must actually be honored here.
     return list(modules or [])
 
 

@@ -166,7 +166,17 @@ async def run_miyabi_job(
         job_id,
         watch_poll_interval=watch_poll_interval,
         timeout_seconds=timeout_seconds,
+        # output.out is a fixed convention (see batch.pbs.j2's #PBS -o line) for every
+        # Miyabi job, so this fallback is safe to apply unconditionally: qstat -fH can
+        # purge a finished job from history before a poll observes it there (confirmed
+        # in production), which would otherwise spin this loop until timeout_seconds.
+        stdout_fallback_path=work_dir / "output.out",
     )
+    if final_status_any.get("_fallback"):
+        logger.warning(
+            "job_id=%s: qstat -fH never confirmed completion; %s",
+            job_id, final_status_any["_fallback"],
+        )
 
     # Type-cast-ish: existing artifact builder expects dict[str, str]
     final_status: dict[str, str] = {str(k): str(v) for k, v in final_status_any.items()}
