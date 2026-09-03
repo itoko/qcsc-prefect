@@ -35,6 +35,14 @@ os.environ["SBD_MPI_OPTIONS"] = "-n,1"
 SHOTS = int(float(os.environ.get("SHOTS", "5000000")))
 NSHOT_BATCHES = int(os.environ.get("NSHOT_BATCHES", "5"))
 
+# Error-aware LUCJ layout (the verified standard, per the audit + kobe hardware check). Default ON
+# for Fe4S4; ab_stride=4 is the only feasible alpha-beta coupling on Heron (denser collapses back).
+ERR_AWARE_LAYOUT = os.environ.get("ERR_AWARE_LAYOUT", "1") == "1"
+AB_STRIDE = int(os.environ.get("AB_STRIDE", "4"))
+TWOQ_ERR_THR = float(os.environ.get("TWOQ_ERR_THR", "1.0"))
+READOUT_ERR_THR = float(os.environ.get("READOUT_ERR_THR", "0.1"))
+LAYOUT_CONN = os.environ.get("LAYOUT_CONN", "heavy-hex")
+
 
 def main() -> None:
     if C.MOLECULE not in C.MOLECULES:
@@ -95,7 +103,14 @@ def main() -> None:
         n_batches=1,
         quantum_source=qsrc,
         solver_block_ref="sbd_solver_job/davidson-solver-gpu",
-        circ_params=CircuitParameters(n_lucj_layers=1),
+        circ_params=CircuitParameters(
+            n_lucj_layers=1,
+            use_error_aware_layout=ERR_AWARE_LAYOUT,
+            ab_stride=AB_STRIDE,
+            two_qubit_error_threshold=TWOQ_ERR_THR,
+            readout_error_threshold=READOUT_ERR_THR,
+            layout_connectivity=LAYOUT_CONN,
+        ),
         de_params=DEParameters(num_walkers=1, iterations=1, randomization_factor=0.2, fxc=0.5),
     )
     e = riken_sqd_de(params)

@@ -72,7 +72,7 @@ def main() -> None:
         n_recovery_steps=args.max_recovery,
         n_batches=args.n_batches,
         quantum_source="saved",
-        solver_block_ref="sbd_solver_job/davidson-solver",
+        solver_block_ref=os.environ.get("SWEEP_SOLVER_BLOCK_REF", "sbd_solver_job/davidson-solver"),
         circ_params=CircuitParameters(n_lucj_layers=args.n_lucj_layers),
         de_params=DEParameters(num_walkers=1, iterations=1, randomization_factor=0.2, fxc=0.5),
     )

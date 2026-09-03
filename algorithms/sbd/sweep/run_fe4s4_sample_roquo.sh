@@ -21,14 +21,15 @@ export UV_CACHE_DIR="/tmp/uvcache_$USER"; export TMPDIR="/tmp/uvtmp_$USER"
 mkdir -p "$UV_CACHE_DIR" "$TMPDIR"
 
 export FE_MOL="${FE_MOL:-fe4s4}"
-export FE4S4_FCIDUMP="$SWEEP/fcidump_Fe4S4_MO.txt"
+export FE4S4_FCIDUMP="${FE4S4_FCIDUMP:-$SWEEP/fcidump_Fe4S4_MO.txt}"
 export FE2S2_FCIDUMP="$SWEEP/fe2s2_40q.fcidump"
 export FE4S4_METHOD="${METHOD:-rhf}"
 export ROQUO_OMPTHREADS="${ROQUO_OMPTHREADS:-140}"
 
-# IBM creds (kobe) from gitignored .env.local.
-if [[ -f "$SWEEP/.env.local" ]]; then source "$SWEEP/.env.local"; else
-  echo "ERROR: $SWEEP/.env.local missing (IBM_API_KEY/IBM_CRN/IBM_BACKEND)"; exit 1; fi
+# IBM creds from gitignored env file (ENV_FILE overrides; default .env.local = kobe).
+ENV_FILE="${ENV_FILE:-$SWEEP/.env.local}"
+if [[ -f "$ENV_FILE" ]]; then source "$ENV_FILE"; else
+  echo "ERROR: $ENV_FILE missing (IBM_API_KEY/IBM_CRN/IBM_BACKEND)"; exit 1; fi
 export FE2S2_QSRC="${FE2S2_QSRC:-real-device}"
 
 cd "$SBD"

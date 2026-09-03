@@ -42,6 +42,17 @@ OMP = int(os.environ.get("ROQUO_OMPTHREADS", "140"))
 ADET_COMM_SIZE = int(os.environ.get("FE4S4_ADET_COMM_SIZE", "1"))
 BDET_COMM_SIZE = int(os.environ.get("FE4S4_BDET_COMM_SIZE", "1"))
 TASK_COMM_SIZE = int(os.environ.get("FE4S4_TASK_COMM_SIZE", "1"))
+_TOTAL_RANKS = ADET_COMM_SIZE * BDET_COMM_SIZE * TASK_COMM_SIZE
+# Davidson ITERATION CAP (--iteration). Was hardcoded to 5, which is why steps ended on the cap
+# rather than on --tolerance: at d=1e11 the 5th iteration still gained 4.5 mHa with tol=0.043
+# against a 0.01 target. Default kept at 5 so existing launchers are unchanged.
+DAVIDSON_ITERATION = os.environ.get("FE4S4_DAVIDSON_ITERATION", "5")
+
+# Extra flags appended verbatim to the solver command line, comma-separated. Chiefly for
+# warm-starting Davidson from the previous step's CI vector:
+#   FE4S4_SOLVER_USER_ARGS="--savename,wf_warm.bin,--loadname,wf_warm.bin"
+SOLVER_USER_ARGS = os.environ.get("FE4S4_SOLVER_USER_ARGS", "").strip()
+
 # Davidson subspace size (--block, "max_nb" in davidson_thrust.h). Real GPU memory driver:
 # per-rank Davidson working set = (2*block+1) * W_size * 8 bytes, W_size = (dets_per_spin/a)
 # * (dets_per_spin/b) (confirmed by reading sbd_mpi/include/sbd/chemistry/tpb/sbdiag.h +
@@ -73,6 +84,16 @@ NUM_WALKERS = int(os.environ.get("NUM_WALKERS", "1"))
 # gradient can decrease gradually toward oo_grad_tol without over-rotating on the fixed RDMs.
 OO_TRUST_RADIUS = float(os.environ.get("OO_TRUST_RADIUS", "0.5"))
 OO_MAXITER = int(os.environ.get("OO_MAXITER", "300"))
+
+# HCI (heat-bath-CI-flavored) importance booster. OPT-IN, default off (matches every other
+# opt-in booster in sqd.py: FlowParameters default hci_boost=0).
+HCI_BOOST = int(os.environ.get("HCI_BOOST", "0"))
+HCI_BOOST_MAX = int(os.environ.get("HCI_BOOST_MAX", "20000"))
+HCI_BOOST_NCORE = int(os.environ.get("HCI_BOOST_NCORE", "200"))
+
+# Carryover type, hardcoded to 1 in every driver invocation until now. Made env-overridable to
+# test types 2/3 (SinglesExtendHalfdets). See sbdiag.h:695-738.
+CARRYOVER_TYPE = os.environ.get("CARRYOVER_TYPE", "1")
 # OO_RESOLVE_RDMS=1: rigorous self-consistent path -- re-diagonalize the fixed CI subspace in the
 # rotated basis (in-process solve_fermion) each orbital step so the gradient is the true MCSCF
 # gradient and the energy stays variational (>= FCI). Fast (in-process); the correct convergent mode.
@@ -102,7 +123,7 @@ os.environ.setdefault("OMP_NUM_THREADS", str(OMP))
 # "srun --mpi=pmix --gpu-bind=closest (PMIx; mpirun nested fails)"). Mixing these up is
 # exactly the bug found 2026-07-31 (srun rejecting --map-by on the ompi4 build) -- so the
 # launcher AND its options must be selected together per stack, not just the launcher name.
-if os.environ.get("FE4S4_TALKATIVE", "0") == "1" or os.environ.get("FE4S4_CONTAINER_TALKATIVE", "0") == "1":
+if os.environ.get("FE4S4_TALKATIVE", "0") == "1" or os.environ.get("FE4S4_CONTAINER_TALKATIVE", "0") == "1" or os.environ.get("FE4S4_CONTAINER_TALKATIVE_DEBUGTIMING", "0") == "1":
     os.environ["SBD_LAUNCHER"] = "srun"
     # ROQUO support's rank-to-node mapping suggestion: our app uses a 2D adet x bdet grid
     # while their nccl-tests reproducer uses a flat layout; --distribution=block:block forces
@@ -118,6 +139,15 @@ elif os.environ.get("FE4S4_HPCX250", "0") == "1":
     # restrictive RLIMIT_MEMLOCK from the submitting shell that compute nodes don't otherwise
     # see. The plain `ulimit -n 65536` in the launch script (no --propagate) is harmless and
     # sufficient to test the FD-exhaustion hypothesis without this side effect.
+    # DO NOT add --cpu-bind / --cpus-per-task here. Tried 2026-08-29 and it BREAKS the run:
+    #   NCCL error invalid usage at framework/nccl_utility.h:75 (ncclCommInitRank), 38s in.
+    # Reason: main.cc picks its GPU with  myDevice = mpi_rank % numDevices  (line ~40), relying on
+    # every rank seeing ALL 4 GPUs. Measured CUDA_VISIBLE_DEVICES per rank:
+    #   --gpu-bind=closest alone            -> 0,1,2,3 for every rank -> rank%4 = 0,1,2,3  (correct)
+    #   + --cpu-bind=cores --cpus-per-task=36 -> 0,1 for every rank   -> rank%2 = 0,1,0,1  (2 ranks
+    #                                             per GPU -> NCCL rejects the duplicate device)
+    # Pinning CPUs narrows what SLURM considers the closest GPUs. Any CPU-binding change here
+    # would need main.cc to derive its device from SLURM_LOCALID instead of mpi_rank%numDevices.
     os.environ["SBD_MPI_OPTIONS"] = "--mpi=pmix,--gpu-bind=closest"
 elif os.environ.get("FE4S4_NVHPCMPI", "0") == "1" or os.environ.get("FE4S4_CC100", "0") == "1":
     os.environ["SBD_LAUNCHER"] = "mpirun"
@@ -126,7 +156,28 @@ elif os.environ.get("FE4S4_NVHPCMPI", "0") == "1" or os.environ.get("FE4S4_CC100
     os.environ["SBD_MPI_OPTIONS"] = "--map-by,ppr:4:node,--bind-to,none"
 else:
     os.environ["SBD_LAUNCHER"] = "srun"
-    os.environ["SBD_MPI_OPTIONS"] = "--gpu-bind=closest"
+    # BUG FIX (2026-09-02): plain `srun --gpu-bind=closest` with no explicit rank count inherits
+    # the OUTER allocation's full task count. For a single-rank (a=1 x b=1) job this is a real
+    # correctness bug, not just a performance one -- verified directly on ROQUO:
+    #   outer --ntasks=1 -> inner srun fails outright: "No step_layout given for pending step"
+    #     (the parent Python subprocess then hangs forever waiting on a step that never starts --
+    #     0% GPU util, ~100% CPU, indefinitely; cost 6 wasted probe jobs before being traced).
+    #   outer --ntasks=4, inner srun with NO -n -> FOUR duplicate diag-gpu_uhf processes launch
+    #     against the same a=1xb=1 input, all pinned to the same GPU (measured: 45 GB combined
+    #     memory vs one rank's correct ~11 GB) -- silently wrong, not even a crash.
+    #   outer --ntasks=4, inner `srun --gpu-bind=closest -n1 --overlap` -> exactly one correct
+    #     process, verified end to end (real solve, correct timing, correct output).
+    # _TOTAL_RANKS is computed at module top (ADET_COMM_SIZE*BDET_COMM_SIZE*TASK_COMM_SIZE, all
+    # defined before this point) specifically so it is genuinely in scope here. Only the
+    # total_ranks==1 case is touched; the multi-node path (total_ranks>1, e.g. the working
+    # 144-rank d3e10 production runs) stays byte-identical, per the standing "DO NOT add
+    # --cpu-bind/--cpus-per-task" warning on the FE4S4_HPCX250 branch above: per-rank resource
+    # narrowing on the multi-node path has previously broken NCCL's ncclCommInitRank by changing
+    # which GPUs each rank can see, and -n/--overlap on a >1-rank srun risks the same class of harm.
+    if _TOTAL_RANKS == 1:
+        os.environ["SBD_MPI_OPTIONS"] = "--gpu-bind=closest,-n1,--overlap"
+    else:
+        os.environ["SBD_MPI_OPTIONS"] = "--gpu-bind=closest"
 
 
 def _pool_paths() -> list[str]:
@@ -178,6 +229,14 @@ def main() -> None:
             # this STILL hits rank=0/1 on MPI_Init_thread, the module change is conclusively
             # ruled out as the cause -- confirms the bug is unrelated to that one admin diff.
             mpi_suffix = "-mpi-oldmodule-talkative"
+        elif os.environ.get("FE4S4_CONTAINER_TALKATIVE_DEBUGTIMING", "0") == "1":
+            # One-off profiling build: identical to FE4S4_CONTAINER_TALKATIVE but points at a
+            # binary compiled with -DSBD_DEBUG_MULT -DSBD_DEBUG_DAVIDSON (separate binary name,
+            # never overwrites the production diag-gpu_uhf-mpi-container). Added 2026-09-03 to
+            # measure real time_mult/time_comm/time_slid split per mult.run() call, to check
+            # whether the un-batched per-pair InnerProduct Allreduces in davidson_thrust.h are a
+            # real bottleneck at 144+ rank scale. Not used by any production launcher.
+            mpi_suffix = "-mpi-container-talkative-debugtiming"
         elif os.environ.get("FE4S4_CONTAINER_TALKATIVE", "0") == "1":
             # Multi-node test of the container-isolated build (nvhpc-26.5-devel.sif, own
             # bundled hpcx-2.50, ZERO ROQUO shared-module involvement during compilation).
@@ -228,6 +287,24 @@ def main() -> None:
             mpi_suffix = "-mpi-safeallreduce" if os.environ.get("FE4S4_SAFE_ALLREDUCE", "1") == "1" else "-mpi"
     else:
         mpi_suffix = ""
+
+    # Explicit escape hatch, applied AFTER the chain above so it composes with any selection.
+    # Set FE4S4_BINARY_SUFFIX to override the binary suffix outright, e.g.
+    #     FE4S4_BINARY_SUFFIX=-mpi-upstream-main-talkative
+    # which selects the wrapper that writes each rank's stdout/stderr to
+    # runs/solver_logs/rank_<N>.log (FE4S4_TALKATIVE_LOGDIR to relocate).
+    #
+    # This exists because the Prefect local runtime launches the solver with stdout=PIPE +
+    # `await proc.communicate()` (adapters/.../fugaku/runtime.py:39-42), which reads until EOF --
+    # so the solver's per-iteration "Davidson iteration <it>.<ib> <E...>" lines
+    # (davidson_thrust.h:579) are invisible for the entire run. On the 9-hour d=1e11 step this
+    # left no way to tell which Davidson iteration was in flight or what the energy was; gdb
+    # could not recover them either, since -Kfast optimizes `it` and `E` out of the DWARF.
+    _suffix_override = os.environ.get("FE4S4_BINARY_SUFFIX", "")
+    if _suffix_override:
+        print(f"[launcher] FE4S4_BINARY_SUFFIX overrides {mpi_suffix!r} -> {_suffix_override!r}")
+        mpi_suffix = _suffix_override
+
     diag_gpu = os.path.join(p["diag"], f"diag-gpu{mpi_suffix}")
     diag_gpu_uhf = os.path.join(p["diag"], f"diag-gpu_uhf{mpi_suffix}")
 
@@ -268,7 +345,7 @@ def main() -> None:
         "--mpiprocs", str(total_ranks),
         "--ompthreads", "36",
         "--walltime", "12:00:00",
-        "--carryover-ratio", "0.5", "--carryover-type", "1",
+        "--carryover-ratio", "0.5", "--carryover-type", CARRYOVER_TYPE,
         "--do-rdm", str(DO_RDM),
         # Raised from 43200 (12h): both d3e10 and d4e10 trajectories have hit real per-step
         # times exceeding 12h (d4e10 step 3 was killed mid-solve by this exact timeout,
@@ -278,10 +355,16 @@ def main() -> None:
         "--solver-timeout-seconds", "72000",
         "--work-dir", str(work_dir),
         "--saved-samples", ",".join(pools),
-        "--iteration", "5", "--block", str(DAVIDSON_BLOCK),
+        "--iteration", DAVIDSON_ITERATION, "--block", str(DAVIDSON_BLOCK),
         "--sbd-executable", diag_gpu, "--sbd-executable-uhf", diag_gpu_uhf,
     ]
     # Pass MPI grid comm sizes (multi-node only; single-GPU defaults to a=1,b=1)
+    if SOLVER_USER_ARGS:
+        # MUST use --flag=value, not ["--flag", value]: the value itself starts with \"--\"
+        # (e.g. \"--savename,wf_warm.bin\") and argparse then treats it as another option, failing
+        # with \"expected one argument\" (exit 2). Measured: job 122132 died in 3 s this way.
+        create_blocks_cmd.append(f"--solver-user-args={SOLVER_USER_ARGS}")
+        print(f"[launcher] solver user args: {SOLVER_USER_ARGS}")
     if ADET_COMM_SIZE > 1 or BDET_COMM_SIZE > 1:
         create_blocks_cmd.extend(["--adet-comm-size", str(ADET_COMM_SIZE)])
         create_blocks_cmd.extend(["--bdet-comm-size", str(BDET_COMM_SIZE)])
@@ -316,6 +399,9 @@ def main() -> None:
         oo_maxiter=OO_MAXITER,
         oo_resolve_rdms=bool(OO_RESOLVE_RDMS),
         oo_resolve_maxdim=OO_RESOLVE_MAXDIM,
+        hci_boost=HCI_BOOST,
+        hci_boost_max=HCI_BOOST_MAX,
+        hci_boost_ncore=HCI_BOOST_NCORE,
         quantum_source="saved",
         solver_block_ref="sbd_solver_job/davidson-solver-gpu",
         circ_params=CircuitParameters(n_lucj_layers=1),

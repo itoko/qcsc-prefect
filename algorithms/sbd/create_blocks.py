@@ -85,6 +85,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--modules", nargs="+")
     parser.add_argument("--mpi-options", nargs="*")
     parser.add_argument("--pre-commands", nargs="*")
+    # Extra flags appended verbatim to the solver command line (comma-separated).
+    # e.g. --solver-user-args "--savename,wf_warm.bin,--loadname,wf_warm.bin"
+    parser.add_argument("--solver-user-args")
 
     parser.add_argument("--fugaku-gfscache")
     parser.add_argument("--fugaku-spack-modules", nargs="+")
@@ -581,7 +584,16 @@ def main() -> None:
         _pick_value(args.method, config.get("method"), env.get("method"), "rhf")
     ).strip()
     resource_class = "gpu" if solver_mode == "gpu" else "cpu"
-    user_args = _normalize_str_list(config.get("user_args")) or []
+    # CLI > config > env, matching every other option in this function. Previously this
+    # read config only, so no launcher could set it.
+    user_args = _normalize_str_list(
+        _pick_value(
+            getattr(args, "solver_user_args", None),
+            config.get("user_args"),
+            env.get("user_args"),
+            None,
+        )
+    ) or []
     if is_miyabi and solver_mode == "gpu":
         if "unset OMPI_MCA_mca_base_env_list" not in pre_commands:
             pre_commands.insert(0, "unset OMPI_MCA_mca_base_env_list")

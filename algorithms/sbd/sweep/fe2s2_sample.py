@@ -98,7 +98,7 @@ def main() -> None:
         n_recovery_steps=1,          # sampling pass only; the pool is what we keep
         n_batches=1,
         quantum_source=qsrc,
-        solver_block_ref="sbd_solver_job/davidson-solver",
+        solver_block_ref=os.environ.get("SWEEP_SOLVER_BLOCK_REF", "sbd_solver_job/davidson-solver"),
         circ_params=CircuitParameters(
             n_lucj_layers=args.n_lucj_layers,
             ab_stride=args.ab_stride,

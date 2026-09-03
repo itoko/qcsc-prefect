@@ -51,6 +51,10 @@ MOLECULES: dict[str, dict] = {
         "norb": 36, "nelec": 54, "ms2": 0,
         "default_fcidump": "/2ndfs/ra010014/u14924_space/sweep/fcidump_Fe4S4_MO.txt",
     },
+    "n2_20q": {
+        "norb": 10, "nelec": 14, "ms2": 0,
+        "default_fcidump": "/home/q0000219/qcsc-prefect/algorithms/sbd/sweep/n2_20q.fcidump",
+    },
 }
 
 MOLECULE = os.environ.get("FE_MOL", "fe2s2").strip().lower()
@@ -179,15 +183,30 @@ def build_create_blocks_cmd(
     twirling OFF (it fails on fractional LUCJ rzz gates).
     """
     p = sbd_paths()
+    # HPC target / solver mode are env-overridable so the same builder works on Fugaku (pjsub, the
+    # default) and on ROQUO (SWEEP_HPC_TARGET=local + SWEEP_SOLVER_MODE=gpu -> direct subprocess with
+    # the nvc++ diag-gpu binaries). Fugaku-only flags (--project/--group/--queue/--fugaku-gfscache)
+    # are emitted ONLY for the fugaku target; the local target uses the GPU binaries (no CPU diag_uhf
+    # exists on ROQUO). The post-sample solve is throwaway -- only the persisted pool is reused.
+    hpc_target = os.environ.get("SWEEP_HPC_TARGET", "fugaku")
+    solver_mode = os.environ.get("SWEEP_SOLVER_MODE", "fugaku")
+    if solver_mode == "gpu":
+        exe_rhf = os.path.join(p["diag"], "diag-gpu")
+        exe_uhf = os.path.join(p["diag"], "diag-gpu_uhf")
+    else:
+        exe_rhf, exe_uhf = p["diag_rhf"], p["diag_uhf"]
     cmd = [
         p["python"], os.path.join(p["sbd"], "create_blocks.py"),
-        "--hpc-target", "fugaku",
+        "--hpc-target", hpc_target,
         "--method", method.lower(),
-        "--solver-mode", "fugaku",
-        "--project", "ra010014",
-        "--group", "ra010014",
-        "--queue", queue,
-        "--fugaku-gfscache", "/vol0004:/vol0002",
+        "--solver-mode", solver_mode,
+    ]
+    if hpc_target == "fugaku":
+        cmd += [
+            "--project", "ra010014", "--group", "ra010014", "--queue", queue,
+            "--fugaku-gfscache", "/vol0004:/vol0002",
+        ]
+    cmd += [
         "--num-nodes", str(num_nodes),
         "--mpiprocs", str(num_nodes),
         "--ompthreads", str(ompthreads),
@@ -203,8 +222,8 @@ def build_create_blocks_cmd(
         "--dynamical-decoupling",
         "--dd-sequence", "XY4",
         "--measure-twirling",
-        "--sbd-executable", p["diag_rhf"],
-        "--sbd-executable-uhf", p["diag_uhf"],
+        "--sbd-executable", exe_rhf,
+        "--sbd-executable-uhf", exe_uhf,
     ]
     if saved_samples:
         cmd += ["--saved-samples", ",".join(saved_samples)]
