@@ -625,7 +625,32 @@ def compute_molecular_integrals_from_fcidump(
         # For Fe-S cubanes, an atom-localized (Noodleman) AF guess -- supplied via FE4S4_AF_GROUPS --
         # reaches a ~33 mHa lower BS basin than the energy-ordered guess (better Fe-3d orbitals for
         # SQD to recover on). See _parse_af_groups; unset -> plain energy-ordered AF guess (default).
-        mf = _converge_broken_symmetry_uhf(mf, af_groups=_parse_af_groups())
+        # Deterministic broken-symmetry reference: cache converged UHF MOs so every run
+        # (do_rdm on/off, OO on/off) starts from the IDENTICAL reference. Fe4S4's 400-cycle SCF is
+        # thread/BLAS-order sensitive -> different BS local minima run-to-run otherwise.
+        # Disable with SBD_UHF_CACHE=0; relocate with SBD_UHF_CACHE_DIR.
+        import hashlib as _hl, os as _os
+        _cdir = _os.environ.get("SBD_UHF_CACHE_DIR", _os.path.expanduser("~/.cache/qcsc_uhf"))
+        _key = _hl.sha1((_os.path.abspath(fcidump_file) + "|af=" + str(_parse_af_groups())
+                         + "|nelec=" + str(tuple(mf.mol.nelec))).encode()).hexdigest()[:16]
+        _cpath = _os.path.join(_cdir, f"uhf_bs_{_key}.npz")
+        if _os.environ.get("SBD_UHF_CACHE", "1") != "0" and _os.path.exists(_cpath):
+            _c = np.load(_cpath)
+            mf.mo_coeff = (_c["mo_a"], _c["mo_b"])
+            mf.mo_occ = (_c["occ_a"], _c["occ_b"])
+            mf.mo_energy = (_c["ene_a"], _c["ene_b"])
+            mf.e_tot = float(_c["e_tot"]); mf.converged = True
+            print(f"[uhf-cache] reuse BS-UHF reference {_cpath} (E={mf.e_tot:.6f})")
+        else:
+            mf = _converge_broken_symmetry_uhf(mf, af_groups=_parse_af_groups())
+            try:
+                _os.makedirs(_cdir, exist_ok=True)
+                _moa, _mob = mf.mo_coeff; _oca, _ocb = mf.mo_occ; _ena, _enb = mf.mo_energy
+                np.savez(_cpath, mo_a=_moa, mo_b=_mob, occ_a=_oca, occ_b=_ocb,
+                         ene_a=_ena, ene_b=_enb, e_tot=float(mf.e_tot))
+                print(f"[uhf-cache] saved BS-UHF reference {_cpath} (E={mf.e_tot:.6f})")
+            except Exception as _e:
+                print(f"[uhf-cache] save failed (continuing): {_e}")
         return _build_property_uhf(mf, norb, spin_sq, buf)
 
     # Run HF calculation with Newton method.

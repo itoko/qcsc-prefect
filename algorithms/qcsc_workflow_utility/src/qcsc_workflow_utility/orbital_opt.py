@@ -569,6 +569,8 @@ def resolve_orbitals_self_consistent(
     energy_tol: float = 1e-7,
     trust_radius: float = 0.1,
     oo_maxiter: int = 40,
+    resolve_backend: str = "solve_fermion",
+    davidson_solver=None,
     use_jax: bool | None = None,
     logger=None,
 ) -> tuple["ElectronicProperties", float, float, int]:
@@ -631,6 +633,62 @@ def resolve_orbitals_self_consistent(
     # repulsion to compare against total energies / references. Rotating orbitals never changes it.
     nuc = float(elec_props.nuclear_repulsion_energy)
 
+    # ── Re-diagonalization backend selection ────────────────────────────────────────────────
+    # The fixed subspace is re-solved in the current (rotated) basis by either the in-process CPU
+    # solve_fermion (default) or the native GPU Davidson (SBDSolverJob) -- the SAME solver the main
+    # SQD loop uses. The GPU path uses the FULL UHF integral blocks (h1_a/h1_b/aa/ab/bb) and returns
+    # RDMs in prqs-storage (matching solver_job.py); solve_fermion uses alpha integrals only and
+    # returns pqrs-storage. Hence rdm2_notation differs per backend.
+    _resolve_notation = "prqs" if resolve_backend == "davidson_gpu" else "pqrs"
+    if resolve_backend == "davidson_gpu":
+        if davidson_solver is None:
+            raise ValueError(
+                "resolve_backend='davidson_gpu' requires davidson_solver=<SBDSolverJob>."
+            )
+        if not getattr(davidson_solver, "do_rdm", 0):
+            raise ValueError(
+                "resolve_backend='davidson_gpu' requires the solver block do_rdm>=1 "
+                "(the re-solve needs full RDMs); got do_rdm=0."
+            )
+        import asyncio
+        _na, _nb = (num_elec if num_elec is not None else elec_props.num_electrons)
+        _norb = int(np.asarray(elec_props.one_body_tensor).shape[0])
+
+    def _resolve_diagonalize(ci_pair, ep_cur, *, want_rdms):
+        """Re-diagonalize the fixed subspace `ci_pair` in basis `ep_cur`.
+
+        Returns (E_total, rdms) where rdms is (rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb) in
+        `_resolve_notation` storage when want_rdms, else None.
+        """
+        if resolve_backend == "davidson_gpu":
+            # Native GPU Davidson on the fixed subspace (no sampling), full UHF integral blocks.
+            # NOTE: even want_rdms=False (line-search energy) evals compute RDMs here because the
+            # block's do_rdm>=1; the RDM cost is negligible at validation norb. A do_rdm=0 solver
+            # copy for the energy-only evals is a possible future micro-opt.
+            r = asyncio.run(davidson_solver.run(
+                ci_strings=(ci_pair[0], ci_pair[1]),
+                one_body_tensor=ep_cur.one_body_tensor,
+                two_body_tensor=ep_cur.two_body_tensor,
+                norb=_norb, nelec=(_na, _nb),
+                one_body_tensor_b=ep_cur.one_body_tensor_b,
+                two_body_tensor_ab=ep_cur.two_body_tensor_ab,
+                two_body_tensor_bb=ep_cur.two_body_tensor_bb,
+            ))
+            E = float(r.energy) + nuc
+            if not want_rdms:
+                return E, None
+            return E, (r.rdm1, r.rdm1_b, r.rdm2, r.rdm2_ab, r.rdm2_bb)
+        # default: in-process CPU solve_fermion (alpha integrals; pqrs-storage RDMs).
+        e_el, sci, _occ, _s2 = solve_fermion(
+            ci_pair, ep_cur.one_body_tensor, ep_cur.two_body_tensor, open_shell=open_shell,
+        )
+        E = float(e_el) + nuc
+        if not want_rdms:
+            return E, None
+        r1 = sci.rdm(rank=1, spin_summed=False)
+        r2 = sci.rdm(rank=2, spin_summed=False)
+        return E, (r1[0], r1[1], r2[0], r2[1], r2[-1])
+
     ep = elec_props
     prev_e = None
     e = float("nan")
@@ -640,15 +698,8 @@ def resolve_orbitals_self_consistent(
         # (1)+(2) re-diagonalize the fixed subspace in the current basis -> fresh energy + RDMs.
         # solve_fermion returns (energy, SCIState, avg_occupancies, spin_sq); SCIState.rdm(rank,
         # spin_summed=False) gives the per-spin blocks in pqrs-storage.
-        e, sci, _occ, _s2 = solve_fermion(
-            ci, ep.one_body_tensor, ep.two_body_tensor, open_shell=open_shell,
-        )
-        e = float(e) + nuc
-        rdm1 = sci.rdm(rank=1, spin_summed=False)   # shape (2, norb, norb) -> alpha, beta
-        rdm2 = sci.rdm(rank=2, spin_summed=False)   # shape (3 or 4, norb, norb, norb, norb)
-        rdm1_aa, rdm1_bb = rdm1[0], rdm1[1]
-        # qiskit-addon-sqd 2-RDM spin blocks: [aa, ab, bb] (spin_summed=False).
-        rdm2_aa, rdm2_ab, rdm2_bb = rdm2[0], rdm2[1], rdm2[-1]
+        e, _rdms = _resolve_diagonalize(ci, ep, want_rdms=True)
+        rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb = _rdms
 
         if logger is not None:
             logger.info(
@@ -681,13 +732,10 @@ def resolve_orbitals_self_consistent(
         for _ls in range(6):
             Ua, Ub, e_oo, grad_norm = optimize_orbitals(
                 ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
-                rdm2_notation="pqrs", trust_radius=tr, maxiter=oo_maxiter, use_jax=use_jax,
+                rdm2_notation=_resolve_notation, trust_radius=tr, maxiter=oo_maxiter, use_jax=use_jax,
             )
             ep_try = rotate_electronic_properties(ep, Ua, Ub)
-            e_try, _sci2, _o2, _s2b = solve_fermion(
-                ci, ep_try.one_body_tensor, ep_try.two_body_tensor, open_shell=open_shell,
-            )
-            e_try = float(e_try) + nuc
+            e_try, _ = _resolve_diagonalize(ci, ep_try, want_rdms=False)
             if e_try <= e + 1e-12:  # true energy decreased -> accept
                 ep = ep_try
                 accepted = True
@@ -713,7 +761,5 @@ def resolve_orbitals_self_consistent(
         prev_e = e
 
     # Final re-solve in the (accepted) basis for the reported energy -- RDMs consistent with H.
-    e_final, _sci, _occ, _s2 = solve_fermion(
-        ci, ep.one_body_tensor, ep.two_body_tensor, open_shell=open_shell,
-    )
-    return ep, float(e_final) + nuc, float(grad_norm), macro
+    e_final, _ = _resolve_diagonalize(ci, ep, want_rdms=True)
+    return ep, float(e_final), float(grad_norm), macro

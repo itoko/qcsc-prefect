@@ -60,8 +60,8 @@ int main(int argc, char * argv[]) {
   int N;
   double energy;
   std::vector<double> density;
-  std::vector<std::vector<size_t>> co_adet;
-  std::vector<std::vector<size_t>> co_bdet;
+  sbd::det_vector<size_t, sbd::det_kind::half> co_adet;
+  sbd::det_vector<size_t, sbd::det_kind::half> co_bdet;
   std::vector<std::vector<double>> one_p_rdm;
   std::vector<std::vector<double>> two_p_rdm;
   sbd::FCIDump fcidump;
@@ -88,8 +88,8 @@ int main(int argc, char * argv[]) {
   /**
      setup determinants for alpha and beta spin orbitals
    */
-  std::vector<std::vector<size_t>> adet;
-  std::vector<std::vector<size_t>> bdet;
+  sbd::det_vector<size_t, sbd::det_kind::half> adet;
+  sbd::det_vector<size_t, sbd::det_kind::half> bdet;
   if( mpi_rank == 0 ) {
     sbd::LoadAlphaDets(adetfile,adet,sbd_data.bit_length,L);
     std::cout << "Loaded " << adet.size() << " alpha determinants." << std::endl;
@@ -136,7 +136,7 @@ int main(int argc, char * argv[]) {
     // Pack a carryover determinant list into the SBD binary format:
     // (L+7)/8 bytes per config, big-endian bit order, sbd::makestring index ordering.
     auto write_carryover = [&](const std::string & filename,
-                               const std::vector<std::vector<size_t>> & co_dets) {
+                               const sbd::det_vector<size_t, sbd::det_kind::half> & co_dets) {
       std::ofstream ofs(filename, std::ios::binary);
       std::vector<uint8_t> bytes(bytes_per_config);
       for (size_t i = 0; i < co_dets.size(); ++i) {

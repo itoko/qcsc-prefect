@@ -697,6 +697,39 @@ def walker_sqd(
                     num_elec_a, num_elec_b,
                 )
 
+        if bitstrings_post.shape[0]:
+            _alpha_i, _beta_i = _spin_halves_as_ints(bitstrings_post, norb)
+            _hf_a = (1 << num_elec_a) - 1
+            _hf_b = (1 << num_elec_b) - 1
+            _tot = np.array([
+                bin(int(a) ^ _hf_a).count("1") // 2 + bin(int(b) ^ _hf_b).count("1") // 2
+                for a, b in zip(_alpha_i, _beta_i)
+            ])
+            _p = np.asarray(probs_post, dtype=np.float64)
+            _psum = float(_p.sum())
+            _p = _p / _psum if _psum > 0 else _p
+            logger.info(
+                "[exc-pop] recovery %d/%d prob-weighted population: "
+                "HF=%.4f {1-2}=%.4f {3}=%.4f {4}=%.4f {>4}=%.4f",
+                recovery_step + 1, n_recovery_steps,
+                float(_p[_tot == 0].sum()),
+                float(_p[(_tot >= 1) & (_tot <= 2)].sum()),
+                float(_p[_tot == 3].sum()),
+                float(_p[_tot == 4].sum()),
+                float(_p[_tot > 4].sum()),
+            )
+            logger.info(
+                "[exc-cnt] recovery %d/%d post-select config counts: "
+                "HF=%d {1-2}=%d {3}=%d {4}=%d {>4}=%d  total=%d",
+                recovery_step + 1, n_recovery_steps,
+                int((_tot == 0).sum()),
+                int(((_tot >= 1) & (_tot <= 2)).sum()),
+                int((_tot == 3).sum()),
+                int((_tot == 4).sum()),
+                int((_tot > 4).sum()),
+                int(_tot.size),
+            )
+
         # K-batch SQD (arXiv:2405.05068): draw n_batches independent subspaces from the SAME
         # recovered distribution, diagonalize each, then take the MINIMUM energy as the variational
         # estimate and the MEAN occupancy across batches to feed the next recovery pass. A single

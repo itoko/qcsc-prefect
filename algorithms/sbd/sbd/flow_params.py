@@ -374,6 +374,12 @@ class FlowParameters(BaseModel):
         title="OO Self-Consistency Tolerance",
         gt=0.0,
     )
+    oo_de_tol: float = Field(
+        default=1e-4,
+        description="OO stop threshold on per-trial energy gain (solver_energy - OO_energy).",
+        title="OO Energy-Gain Tolerance",
+        gt=0.0,
+    )
     oo_resolve_rdms: bool = Field(
         default=False,
         description=(
@@ -409,4 +415,31 @@ class FlowParameters(BaseModel):
         ),
         title="OO Re-solve Max Subspace",
         ge=1,
+    )
+    oo_resolve_backend: str = Field(
+        default="solve_fermion",
+        description=(
+            "Backend for the oo_resolve_rdms re-diagonalization of the fixed CI subspace in the "
+            "rotated basis. 'solve_fermion' (default) uses the in-process CPU dense/selected-CI "
+            "solver (alpha integrals only, pqrs-storage RDMs). 'davidson_gpu' routes each re-solve "
+            "through the native GPU Davidson (the same SBDSolverJob the main SQD loop uses): it "
+            "solves the full untruncated subspace fast on GPU using the complete UHF integral "
+            "blocks (h1_a/h1_b/aa/ab/bb) and returns prqs-storage RDMs -- consistent with the main "
+            "solve and variational, at the cost of a native-process launch per re-solve."
+        ),
+        title="OO Re-solve Backend",
+    )
+    oo_refire_every_trial: bool = Field(
+        default=False,
+        description=(
+            "If True, do NOT permanently freeze the orbital basis after the first "
+            "stationary point: re-run orbital optimization on EVERY DE trial. Because "
+            "the SQD subspace (sampled bit strings) is re-selected each trial, the "
+            "optimal orbitals can drift; re-firing lets OO track the moving subspace "
+            "(selected-CI-SCF style). The self-consistent resolve path is self-"
+            "regulating: if the subspace is still stationary it converges in ~0-1 "
+            "macro-iters with near-zero rotation. Default False preserves the "
+            "freeze-after-first-stationary behaviour (unchanged for all other runs)."
+        ),
+        title="OO Re-fire Every Trial",
     )

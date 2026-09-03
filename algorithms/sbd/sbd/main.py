@@ -247,6 +247,8 @@ def riken_sqd_de(
                             grad_tol=getattr(parameters, "oo_grad_tol", 1e-3),
                             trust_radius=getattr(parameters, "oo_trust_radius", 0.1),
                             oo_maxiter=getattr(parameters, "oo_maxiter", 40),
+                            resolve_backend=getattr(parameters, "oo_resolve_backend", "solve_fermion"),
+                            davidson_solver=solver,
                             logger=logger,
                         )
                         logger.info(
@@ -254,7 +256,7 @@ def riken_sqd_de(
                             "(%d macro-iters). Hamiltonian rotated for next trial.",
                             i, e_sc, grad_sc, n_macro,
                         )
-                        if grad_sc < getattr(parameters, "oo_grad_tol", 1e-3):
+                        if grad_sc < getattr(parameters, "oo_grad_tol", 1e-3) and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
                                 "Trial %d: orbitals stationary (|grad| < tol) -> freezing basis.", i
                             )
@@ -311,11 +313,17 @@ def riken_sqd_de(
                     else:
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
-                        if grad_norm < oo_gtol:
+                        oo_de_tol = getattr(parameters, "oo_de_tol", 1e-4)
+                        delta_e_oo = (e_solver - e_opt) if e_solver is not None else None
+                        logger.info(
+                            "Trial %d: OO energy gain dE=%s Ha (|g|=%.3e, oo_de_tol=%.1e).",
+                            i, f"{delta_e_oo:.3e}" if delta_e_oo is not None else "n/a",
+                            grad_norm, oo_de_tol,
+                        )
+                        if grad_norm < oo_gtol and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
-                                "Trial %d: orbital gradient |g|=%.3e < %.1e -> orbitals converged "
-                                "(Brillouin). Freezing basis for remaining trials.",
-                                i, grad_norm, oo_gtol,
+                                "Trial %d: OO dE=%.3e Ha < %.1e -> gain negligible. Freezing basis.",
+                                i, delta_e_oo, oo_de_tol,
                             )
                             do_orbital_opt = False
                 except Exception:
@@ -362,13 +370,22 @@ def differential_evolution_trial(
     logger = get_run_logger()
 
     if state.best_index is not None:
-        # Create next generation
-        trial_populations = mutation_and_crossover(
-            current_populations=state.populations,
-            best_index=state.best_index,
-            scaling_factor=parameters.de_params.fxc,
-            crossover_rate=parameters.de_params.cr_prob,
-        )
+        if parameters.de_params.num_walkers < 4:
+            # No differential evolution: DE mutation (a - b + c - d) needs >= 4 distinct
+            # walkers. With fewer, re-evaluate the SAME population each trial; the closed
+            # loop is then driven PURELY by the OO feed-forward (the Hamiltonian rotated
+            # between trials). This is the clean single-ansatz OO-effect measurement, with
+            # no DE exploration confounding whether re-diagonalizing in the rotated basis
+            # lowers the energy.
+            trial_populations = state.populations
+        else:
+            # Create next generation
+            trial_populations = mutation_and_crossover(
+                current_populations=state.populations,
+                best_index=state.best_index,
+                scaling_factor=parameters.de_params.fxc,
+                crossover_rate=parameters.de_params.cr_prob,
+            )
     else:
         # Initialize populations
         trial_populations = initialize_ucj_parameters(
