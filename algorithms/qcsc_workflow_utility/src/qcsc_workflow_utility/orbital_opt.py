@@ -413,7 +413,27 @@ def optimize_orbitals(
         )
 
     e_before = eval_obj(x0)
-    log.info("  [OrbOpt] E before optimization: %.10f Ha", e_before)
+    log.info("  [OrbOpt] E before optimization (jax calculation): %.10f Ha", e_before)
+
+    # Diagnostic: decompose E(U=I) into components so the caller can compare with the solver.
+    _e1a = float(np.einsum("pq,pq->", h1_a, rdm1_aa))
+    _e1b = float(np.einsum("pq,pq->", h1_b  if elec_props.unrestricted else h1_a, rdm1_bb))
+    _e2aa = float(0.5 * np.einsum("pqrs,prqs->", h2_aa, rdm2_aa))
+    _e2ab = float(np.einsum("pqrs,prqs->", h2_ab if elec_props.unrestricted else h2_aa, rdm2_ab))
+    _e2bb = float(0.5 * np.einsum("pqrs,prqs->", h2_bb if elec_props.unrestricted else h2_aa, rdm2_bb))
+    _e_check = nuc + _e1a + _e1b + _e2aa + _e2ab + _e2bb
+    log.info(
+        "  [OrbOpt] E(RDM) decomposition: nuc=%.6f e1a=%.6f e1b=%.6f "
+        "e2aa=%.6f e2ab=%.6f e2bb=%.6f total=%.10f",
+        nuc, _e1a, _e1b, _e2aa, _e2ab, _e2bb, _e_check,
+    )
+    # Trace check: Tr(rdm1_a) should equal N_alpha, Tr(rdm1_b) should equal N_beta
+    _tra = float(np.trace(rdm1_aa))
+    _trb = float(np.trace(rdm1_bb))
+    log.info(
+        "  [OrbOpt] RDM1 trace: Tr(rdm1_a)=%.6f (N_a=%d) Tr(rdm1_b)=%.6f (N_b=%d)",
+        _tra, elec_props.num_electrons[0], _trb, elec_props.num_electrons[1],
+    )
 
     minimize_kwargs: dict = dict(
         fun=eval_obj,
@@ -450,7 +470,7 @@ def optimize_orbitals(
         grad_norm = float(np.linalg.norm(g))
 
     log.info(
-        "  [OrbOpt] E after optimization: %.10f Ha  ΔE=%.4e  |grad|=%.3e  converged=%s  nit=%d",
+        "  [OrbOpt] E after optimization (jax calculation): %.10f Ha  ΔE=%.4e  |grad|=%.3e  converged=%s  nit=%d",
         e_after, e_after - e_before, grad_norm, res.success, res.nit,
     )
     if not res.success:
