@@ -215,6 +215,25 @@ def riken_sqd_de(
         # that the energy rebuilt from the read RDMs (at U=I) matches the solver's Davidson energy
         # before trusting the rotation.
         if do_orbital_opt and best_sbd_result is not None:
+            # Only run OO when this trial produced a new all-time best Davidson energy.
+            # A worse RDM drives the orbital gradient in a non-improving direction; skipping
+            # OO preserves the current basis until a better state arrives.
+            # Disable with OO_SKIP_NONBEST=0 to recover the old (always-fire) behavior.
+            _skip_nonbest = os.environ.get("OO_SKIP_NONBEST", "1") != "0"
+            _rdm_e = best_sbd_result.energy
+            _best_e = state.best_energy()
+            _is_new_best = (
+                _rdm_e is not None and _best_e is not None
+                and abs(_rdm_e - _best_e) < 1e-12
+            )
+            if _skip_nonbest and not _is_new_best:
+                logger.info(
+                    "Trial %d: Davidson %.6f did not beat best %.6f; skipping OO.",
+                    i, _rdm_e if _rdm_e is not None else float("nan"),
+                    _best_e if _best_e is not None else float("nan"),
+                )
+                continue  # skip to next trial
+
             rdm1_aa = best_sbd_result.rdm1
             rdm2_aa = best_sbd_result.rdm2
             if rdm1_aa is not None and rdm2_aa is not None:
@@ -222,8 +241,9 @@ def riken_sqd_de(
                 rdm2_ab = best_sbd_result.rdm2_ab if best_sbd_result.rdm2_ab is not None else rdm2_aa
                 rdm2_bb = best_sbd_result.rdm2_bb if best_sbd_result.rdm2_bb is not None else rdm2_aa
                 logger.info(
-                    "Trial %d: running orbital optimization (norb=%d, unrestricted=%s) ...",
-                    i, elec_props.num_orbitals, unrestricted,
+                    "Trial %d: running orbital optimization (norb=%d, unrestricted=%s, "
+                    "RDM source Davidson=%.10f) ...",
+                    i, elec_props.num_orbitals, unrestricted, _rdm_e,
                 )
 
                 # ── Self-consistent path (oo_resolve_rdms): re-diagonalize the fixed CI subspace
