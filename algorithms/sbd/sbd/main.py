@@ -17,6 +17,7 @@ from qcsc_workflow_utility.chem import (
     NpStrict1DArrayF64,
     NpStrict2DArrayF64,
     compute_molecular_integrals_from_fcidump,
+    refresh_cc_seed,
 )
 from qcsc_workflow_utility.orbital_opt import optimize_orbitals, rotate_electronic_properties
 
@@ -26,6 +27,34 @@ from .lucj import initialize_ucj_parameters
 from .np_type_extension import NpStrict2DArrayBool
 from .solver_job import SBDSolverJob
 from .sqd import walker_sqd
+
+
+def _apply_cc_refresh_and_reseed(elec_props, state, logger, trial_index):
+    """After OO rotation, refresh CC seed and reset DE population/carryover (OO_TO_LUCJ=1)."""
+    oo_to_lucj = int(os.environ.get("OO_TO_LUCJ", "0"))
+    if oo_to_lucj != 1:
+        return elec_props, state
+
+    logger.info("Trial %d: OO_TO_LUCJ=1 -> running CC refresh on rotated Hamiltonian...", trial_index)
+    refreshed = refresh_cc_seed(elec_props)
+    if refreshed is None:
+        logger.warning("Trial %d: CC refresh failed. Keeping old t2/occupancy.", trial_index)
+        return elec_props, state
+
+    old_t2_norm = np.linalg.norm(np.asarray(elec_props.t2))
+    new_t2_norm = np.linalg.norm(np.asarray(refreshed.t2))
+    logger.info(
+        "Trial %d: CC refresh done. ||t2_old||=%.4e -> ||t2_new||=%.4e",
+        trial_index, old_t2_norm, new_t2_norm,
+    )
+
+    state.best_index = None
+    state.energies[:] = 0.0
+    state.carryover = np.full((0, refreshed.num_orbitals), False, dtype=bool)
+    logger.info("Trial %d: DE population reset (best_index=None, carryover cleared) for re-seed.", trial_index)
+
+    return refreshed, state
+
 
 MODULE_RNG = np.random.default_rng(seed=4574)
 THREAD_ENV = {
@@ -302,6 +331,7 @@ def riken_sqd_de(
                             "(%d macro-iters). Hamiltonian rotated for next trial.",
                             i, e_sc, grad_sc, n_macro,
                         )
+                        elec_props, state = _apply_cc_refresh_and_reseed(elec_props, state, logger, i)
                         _oo_prediction = {
                             "trial": i,
                             "e_davidson_source": float(_rdm_e),
@@ -366,6 +396,7 @@ def riken_sqd_de(
                     else:
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+                        elec_props, state = _apply_cc_refresh_and_reseed(elec_props, state, logger, i)
                         _oo_prediction = {
                             "trial": i,
                             "e_davidson_source": float(_rdm_e),
