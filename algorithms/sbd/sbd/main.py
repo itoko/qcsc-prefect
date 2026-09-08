@@ -194,6 +194,10 @@ def riken_sqd_de(
         n_reps=parameters.circ_params.n_lucj_layers,
     )
 
+    # OO effect tracking: store the prediction from the previous trial's OO
+    # so the next trial can compare prediction vs actual Davidson energy.
+    _oo_prediction = None  # dict with trial, e_davidson_source, e_oo_fixed_rdm or e_oo_sc
+
     # Start differential evoluation
     for i in range(parameters.de_params.iterations):
         logger.info(f"Running differential evolution trial {i}")
@@ -208,6 +212,28 @@ def riken_sqd_de(
         )
 
         logger.info(f"Current best energy = {state.best_energy()} (walker {state.best_index})")
+
+        # ── OO effect tracking: compare previous OO prediction with this trial's actual energy ──
+        if _oo_prediction is not None:
+            _prev = _oo_prediction
+            _e_actual = float(best_sbd_result.energy) if best_sbd_result is not None else None
+            if _e_actual is not None:
+                _delta_actual = (_e_actual - _prev["e_davidson_source"]) * 1000
+                _delta_pred = (_prev["e_oo_estimate"] - _prev["e_davidson_source"]) * 1000
+                _gap = (_e_actual - _prev["e_oo_estimate"]) * 1000
+                logger.info(
+                    "Trial %d: OO effect (from trial %d):\n"
+                    "  E_davidson(source, trial %d) [Davidson-GPU, truncated CI]:  %.10f\n"
+                    "  E_oo(%s prediction)          [%s]:  %.10f  (predicted dE=%.1f mHa)\n"
+                    "  E_davidson(actual, trial %d)  [Davidson-GPU, truncated CI]:  %.10f  (actual dE=%.1f mHa)\n"
+                    "  Prediction gap: %.1f mHa (%s)",
+                    i, _prev["trial"],
+                    _prev["trial"], _prev["e_davidson_source"],
+                    _prev["method"], _prev["method_detail"], _prev["e_oo_estimate"], _delta_pred,
+                    i, _e_actual, _delta_actual,
+                    _gap, "overestimate" if _gap < 0 else "underestimate" if _gap > 0 else "exact",
+                )
+            _oo_prediction = None
 
         # ── Orbital optimization (between DE trials) ────────────────────────────
         # Rotate the Hamiltonian integrals using the best walker's RDMs so the next trial starts
@@ -276,6 +302,13 @@ def riken_sqd_de(
                             "(%d macro-iters). Hamiltonian rotated for next trial.",
                             i, e_sc, grad_sc, n_macro,
                         )
+                        _oo_prediction = {
+                            "trial": i,
+                            "e_davidson_source": float(_rdm_e),
+                            "e_oo_estimate": float(e_sc),
+                            "method": "OO-SC",
+                            "method_detail": "JAX+Davidson-GPU, self-consistent re-diag",
+                        }
                         if grad_sc < getattr(parameters, "oo_grad_tol", 1e-3) and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
                                 "Trial %d: orbitals stationary (|grad| < tol) -> freezing basis.", i
@@ -305,8 +338,8 @@ def riken_sqd_de(
                     )
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
                     logger.info(
-                        "Trial %d: orbital optimization energy = %.10f Ha  |grad|=%.3e "
-                        "(solver best = %s)",
+                        "Trial %d: E_oo(fixed-RDM) [JAX L-BFGS-B, fixed RDM + rotated H] = %.10f Ha  "
+                        "|grad|=%.3e  (E_davidson [Davidson-GPU] = %s)",
                         i, e_opt, grad_norm,
                         f"{e_solver:.10f}" if e_solver is not None else "n/a",
                     )
@@ -333,6 +366,13 @@ def riken_sqd_de(
                     else:
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+                        _oo_prediction = {
+                            "trial": i,
+                            "e_davidson_source": float(_rdm_e),
+                            "e_oo_estimate": float(e_opt),
+                            "method": "fixed-RDM",
+                            "method_detail": "JAX L-BFGS-B, fixed RDM",
+                        }
                         oo_de_tol = getattr(parameters, "oo_de_tol", 1e-4)
                         delta_e_oo = (e_solver - e_opt) if e_solver is not None else None
                         logger.info(
