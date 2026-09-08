@@ -30,12 +30,11 @@ from .sqd import walker_sqd
 
 
 def _apply_cc_refresh_and_reseed(elec_props, state, logger, trial_index):
-    """After OO rotation, refresh CC seed and reset DE population/carryover (OO_TO_LUCJ=1)."""
-    oo_to_lucj = int(os.environ.get("OO_TO_LUCJ", "0"))
-    if oo_to_lucj != 1:
-        return elec_props, state
+    """After OO rotation, refresh CC seed and reset DE population/carryover.
 
-    logger.info("Trial %d: OO_TO_LUCJ=1 -> running CC refresh on rotated Hamiltonian...", trial_index)
+    Called only when OO saturation is detected (determinant-space limited).
+    """
+    logger.info("Trial %d: OO saturated -> running CC refresh on rotated Hamiltonian...", trial_index)
     refreshed = refresh_cc_seed(elec_props)
     if refreshed is None:
         logger.warning("Trial %d: CC refresh failed. Keeping old t2/occupancy.", trial_index)
@@ -227,6 +226,11 @@ def riken_sqd_de(
     # so the next trial can compare prediction vs actual Davidson energy.
     _oo_prediction = None  # dict with trial, e_davidson_source, e_oo_fixed_rdm or e_oo_sc
 
+    # CC refresh stagnation trigger: count consecutive trials where OO was skipped
+    # (best not beaten). When the count reaches OO_SAT_STAGNATION (default 2),
+    # fire CC refresh to break out of the determinant-space bottleneck.
+    _consecutive_oo_skips = 0
+
     # Start differential evoluation
     for i in range(parameters.de_params.iterations):
         logger.info(f"Running differential evolution trial {i}")
@@ -243,13 +247,15 @@ def riken_sqd_de(
         logger.info(f"Current best energy = {state.best_energy()} (walker {state.best_index})")
 
         # ── OO effect tracking: compare previous OO prediction with this trial's actual energy ──
+        # Also detect OO saturation: when Davidson improvement is small but the prediction gap
+        # (= determinant-space limitation) is large, the circuit needs updating via CC refresh.
         if _oo_prediction is not None:
             _prev = _oo_prediction
             _e_actual = float(best_sbd_result.energy) if best_sbd_result is not None else None
             if _e_actual is not None:
-                _delta_actual = (_e_actual - _prev["e_davidson_source"]) * 1000
+                _delta_actual = (_e_actual - _prev["e_davidson_source"]) * 1000  # mHa
                 _delta_pred = (_prev["e_oo_estimate"] - _prev["e_davidson_source"]) * 1000
-                _gap = (_e_actual - _prev["e_oo_estimate"]) * 1000
+                _gap = (_e_actual - _prev["e_oo_estimate"]) * 1000  # positive = underperformance
                 logger.info(
                     "Trial %d: OO effect (from trial %d):\n"
                     "  E_davidson(source, trial %d) [Davidson-GPU, truncated CI]:  %.10f\n"
@@ -262,6 +268,8 @@ def riken_sqd_de(
                     i, _e_actual, _delta_actual,
                     _gap, "overestimate" if _gap < 0 else "underestimate" if _gap > 0 else "exact",
                 )
+
+
             _oo_prediction = None
 
         # ── Orbital optimization (between DE trials) ────────────────────────────
@@ -282,11 +290,27 @@ def riken_sqd_de(
                 and abs(_rdm_e - _best_e) < 1e-12
             )
             if _skip_nonbest and not _is_new_best:
-                logger.info(
-                    "Trial %d: Davidson %.6f did not beat best %.6f; skipping OO.",
-                    i, _rdm_e if _rdm_e is not None else float("nan"),
-                    _best_e if _best_e is not None else float("nan"),
-                )
+                _consecutive_oo_skips += 1
+                _oo_to_lucj = int(os.environ.get("OO_TO_LUCJ", "0"))
+                _stagnation_n = int(os.environ.get("OO_SAT_STAGNATION", "2"))
+                if _oo_to_lucj == 1 and _consecutive_oo_skips >= _stagnation_n:
+                    logger.info(
+                        "Trial %d: Davidson %.6f did not beat best %.6f "
+                        "(%d consecutive skips >= %d) -> firing CC refresh to break stagnation.",
+                        i, _rdm_e if _rdm_e is not None else float("nan"),
+                        _best_e if _best_e is not None else float("nan"),
+                        _consecutive_oo_skips, _stagnation_n,
+                    )
+                    elec_props, state = _apply_cc_refresh_and_reseed(elec_props, state, logger, i)
+                    _consecutive_oo_skips = 0
+                else:
+                    logger.info(
+                        "Trial %d: Davidson %.6f did not beat best %.6f; skipping OO "
+                        "(consecutive skips: %d/%d).",
+                        i, _rdm_e if _rdm_e is not None else float("nan"),
+                        _best_e if _best_e is not None else float("nan"),
+                        _consecutive_oo_skips, _stagnation_n,
+                    )
                 continue  # skip to next trial
 
             rdm1_aa = best_sbd_result.rdm1
@@ -295,6 +319,7 @@ def riken_sqd_de(
                 rdm1_bb = best_sbd_result.rdm1_b if best_sbd_result.rdm1_b is not None else rdm1_aa
                 rdm2_ab = best_sbd_result.rdm2_ab if best_sbd_result.rdm2_ab is not None else rdm2_aa
                 rdm2_bb = best_sbd_result.rdm2_bb if best_sbd_result.rdm2_bb is not None else rdm2_aa
+                _consecutive_oo_skips = 0  # OO fires -> reset stagnation counter
                 logger.info(
                     "Trial %d: running orbital optimization (norb=%d, unrestricted=%s, "
                     "RDM source Davidson=%.10f) ...",
@@ -331,7 +356,7 @@ def riken_sqd_de(
                             "(%d macro-iters). Hamiltonian rotated for next trial.",
                             i, e_sc, grad_sc, n_macro,
                         )
-                        elec_props, state = _apply_cc_refresh_and_reseed(elec_props, state, logger, i)
+                        # CC refresh (if needed) is now triggered by stagnation detection above
                         _oo_prediction = {
                             "trial": i,
                             "e_davidson_source": float(_rdm_e),
@@ -396,7 +421,7 @@ def riken_sqd_de(
                     else:
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
-                        elec_props, state = _apply_cc_refresh_and_reseed(elec_props, state, logger, i)
+                        # CC refresh (if needed) is now triggered by stagnation detection above
                         _oo_prediction = {
                             "trial": i,
                             "e_davidson_source": float(_rdm_e),

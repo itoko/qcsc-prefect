@@ -677,8 +677,9 @@ def refresh_cc_seed(elec_props: ElectronicProperties) -> ElectronicProperties | 
 
     This is the CC-refresh step for OO_TO_LUCJ=1: after orbital optimization rotates the
     Hamiltonian, solve CC in the new basis so that t2 and initial_occupancy match the rotated
-    integrals. Returns a new ElectronicProperties with updated t2/occupancy fields, or None
-    if CC fails to converge (caller should keep the old elec_props).
+    integrals. Uses the previous t2 amplitudes (from elec_props) as warm-start initial guess
+    so that UCCSD converges faster in the rotated basis. Returns a new ElectronicProperties
+    with updated t2/occupancy fields, or None if amplitudes contain NaN.
     """
     import logging
 
@@ -747,7 +748,12 @@ def _refresh_cc_seed_rhf(
     mycc = cc.CCSD(mf)
     mycc.max_cycle = max_cycle
     mycc.diis_space = 12
-    mycc.kernel()
+
+    # Warm-start: use old t2 as initial guess for faster convergence in rotated basis.
+    t2_old = np.asarray(elec_props.t2)
+    t1_init = np.zeros((nelec_a, norb - nelec_a))
+    log.info("CC refresh (RHF): warm-start with old ||t2||=%.4e", np.linalg.norm(t2_old))
+    mycc.kernel(t1=t1_init, t2=t2_old)
 
     if not mycc.converged:
         log.warning("CC refresh (RHF): CCSD did not converge after %d cycles. Using unconverged amplitudes.", max_cycle)
@@ -880,7 +886,7 @@ def _refresh_cc_seed_uhf(
     mf.converged = True
 
     mycc = cc.UCCSD(mf)
-    mycc.max_cycle = 5  # DEBUG: short run to check initial E_corr
+    mycc.max_cycle = max_cycle
     mycc.diis_space = 12
     mycc.diis_start_cycle = 20
 
@@ -903,7 +909,20 @@ def _refresh_cc_seed_uhf(
 
     from pyscf.cc.uccsd import _make_eris_incore
     eris = _make_eris_incore(mycc, mycc.mo_coeff, ao2mofn=_ao2mofn)
-    mycc.kernel(eris=eris)
+
+    # Warm-start: use old t1/t2 as initial guess for faster convergence.
+    t2_aa_old = np.asarray(elec_props.t2)
+    t2_ab_old = np.asarray(elec_props.t2_ab)
+    t2_bb_old = np.asarray(elec_props.t2_bb)
+    nocc_a, nocc_b = nelec_a, nelec_b
+    nvir_a, nvir_b = norb - nocc_a, norb - nocc_b
+    t1_a_init = np.zeros((nocc_a, nvir_a))
+    t1_b_init = np.zeros((nocc_b, nvir_b))
+    log.info(
+        "CC refresh (UHF): warm-start with old ||t2aa||=%.4e ||t2ab||=%.4e ||t2bb||=%.4e",
+        np.linalg.norm(t2_aa_old), np.linalg.norm(t2_ab_old), np.linalg.norm(t2_bb_old),
+    )
+    mycc.kernel(t1=(t1_a_init, t1_b_init), t2=(t2_aa_old, t2_ab_old, t2_bb_old), eris=eris)
 
     if not mycc.converged:
         log.warning("CC refresh (UHF): UCCSD did not converge after %d cycles. Using unconverged amplitudes.", max_cycle)
