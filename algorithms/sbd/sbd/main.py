@@ -421,6 +421,37 @@ def riken_sqd_de(
                     else:
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+
+                        # OO_CHECK: re-diagonalize the SAME determinant subspace with the
+                        # ROTATED H to get the true energy after OO (without re-sampling).
+                        # This isolates the OO effect from the re-sampling effect.
+                        if int(os.environ.get("OO_CHECK", "0")) == 1:
+                            _check_adets = getattr(best_sbd_result, "alphadets", None)
+                            _check_bdets = getattr(best_sbd_result, "betadets", None)
+                            if _check_adets is not None:
+                                try:
+                                    import asyncio as _asyncio
+                                    _check_r = _asyncio.run(solver.run(
+                                        ci_strings=(_check_adets, _check_bdets if _check_bdets is not None else _check_adets),
+                                        one_body_tensor=elec_props.one_body_tensor,
+                                        two_body_tensor=elec_props.two_body_tensor,
+                                        norb=elec_props.num_orbitals,
+                                        nelec=elec_props.num_electrons,
+                                        one_body_tensor_b=elec_props.one_body_tensor_b,
+                                        two_body_tensor_ab=elec_props.two_body_tensor_ab,
+                                        two_body_tensor_bb=elec_props.two_body_tensor_bb,
+                                    ))
+                                    _e_check = float(_check_r.energy)
+                                    logger.info(
+                                        "Trial %d: OO_CHECK [Davidson-GPU, same subspace, rotated H]:\n"
+                                        "  E_davidson(before OO) [Davidson-GPU]:  %.10f\n"
+                                        "  E_oo(fixed-RDM)       [JAX L-BFGS-B]:  %.10f\n"
+                                        "  E_check(after OO)     [Davidson-GPU]:  %.10f  (dE=%.1f mHa from before)",
+                                        i, _rdm_e, e_opt, _e_check, (_e_check - _rdm_e) * 1000,
+                                    )
+                                except Exception:
+                                    logger.exception("Trial %d: OO_CHECK failed.", i)
+
                         # CC refresh (if needed) is now triggered by stagnation detection above
                         _oo_prediction = {
                             "trial": i,

@@ -937,12 +937,17 @@ def _refresh_cc_seed_uhf(
         np.linalg.norm(t2_aa_new), np.linalg.norm(t2_ab_new), np.linalg.norm(t2_bb_new),
     )
 
+    # NaN check BEFORE make_rdm1: lambda equation crashes on NaN amplitudes
+    if any(np.any(np.isnan(x)) or np.any(np.isinf(x)) for x in [t2_aa_new, t2_ab_new, t2_bb_new]):
+        log.warning("CC refresh (UHF): NaN/Inf detected in amplitudes. Discarding.")
+        return None
+
     dm_a, dm_b = mycc.make_rdm1()
     occ_a_new = np.diag(dm_a)
     occ_b_new = np.diag(dm_b)
 
-    if any(np.any(np.isnan(x)) for x in [t2_aa_new, t2_ab_new, t2_bb_new, occ_a_new, occ_b_new]):
-        log.warning("CC refresh (UHF): NaN detected in amplitudes or occupancy. Discarding.")
+    if any(np.any(np.isnan(x)) for x in [occ_a_new, occ_b_new]):
+        log.warning("CC refresh (UHF): NaN detected in occupancy. Discarding.")
         return None
 
     return ElectronicProperties(
