@@ -402,6 +402,9 @@ def differential_evolution_trial(
             n_batches=parameters.n_batches,
             seed_cisd=parameters.seed_cisd,
             seed_budget_frac=parameters.seed_budget_frac,
+            hci_boost=parameters.hci_boost,
+            hci_boost_max=parameters.hci_boost_max,
+            hci_boost_ncore=parameters.hci_boost_ncore,
         )
         futs.append(prefect_fut)
 

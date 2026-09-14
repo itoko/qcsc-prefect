@@ -268,6 +268,28 @@ class FlowParameters(BaseModel):
         le=1.0,
     )
 
+    hci_boost: int = Field(
+        default=0,
+        description=(
+            "OPT-IN importance booster (0=OFF default). After each SQD solve, take the high-weight "
+            "core determinants (solver carryover ~ large |c_i|) and generate their single+double "
+            "connected children (=> triples/quadruples/pentuples relative to HF), augment the "
+            "subspace and re-solve once, keeping the lower energy. Grows the subspace by IMPORTANCE "
+            "(Hamiltonian connection to the high-weight core), the counterweight to SQD's "
+            "frequency/occupancy selection which promotes high-rank determinants slowly. SHCI/ASCI/"
+            "CIPSI-style. >0 enables."
+        ),
+        title="HCI Booster", ge=0,
+    )
+    hci_boost_max: int = Field(
+        default=20000, description="Max NEW determinants the HCI booster may add per batch.",
+        title="HCI Booster Max New", ge=0,
+    )
+    hci_boost_ncore: int = Field(
+        default=200, description="How many top-weight carryover determinants to expand as the core.",
+        title="HCI Booster Core Size", ge=1,
+    )
+
     quantum_source: Literal["real-device", "random", "saved"] = Field(
         default="real-device",
         description=(

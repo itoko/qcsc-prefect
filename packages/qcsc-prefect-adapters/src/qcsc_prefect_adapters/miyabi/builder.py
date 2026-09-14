@@ -47,6 +47,8 @@ def to_miyabi_template_kwargs(*, exec_profile: ExecutionProfile, req: MiyabiJobR
         kw["mpiprocs"] = exec_profile.mpiprocs
     if exec_profile.ompthreads is not None:
         kw["ompthreads"] = exec_profile.ompthreads
+    if exec_profile.mem is not None:
+        kw["mem"] = exec_profile.mem
     if exec_profile.walltime is not None:
         kw["walltime"] = exec_profile.walltime
     if exec_profile.modules:

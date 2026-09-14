@@ -227,7 +227,24 @@ def run(
     # ── 1. 分子積分の計算（HF + CCSD）─────────────────────────────────────
     log.info("[1] Computing molecular integrals from FCIDump ...")
     # Prefect @task デコレータを外して直接呼ぶ
+    #
+    # unrestricted is intentionally NOT wired through here: this script's downstream RDM/energy
+    # expressions (below) operate on the single restricted one_body_tensor/two_body_tensor and
+    # would silently produce a wrong (RHF-shaped) energy if fed a UHF ElectronicProperties object
+    # (which also populates one_body_tensor_b/two_body_tensor_ab/etc., ignored here). Passing an
+    # interleaved-spin-orbital UHF FCIDUMP (e.g. from merge_bsuhf_to_uhf_fcidump.py) here would
+    # previously silently fall back to a misparsed RHF result -- see
+    # examples/fe4s4_hci_from_bsuhf_reference/load_uhf_fcidump_reference.py for the actual
+    # "load a BS-UHF reference without reconverging" tool; this debug script stays RHF-only and
+    # now refuses that input loudly instead of misinterpreting it.
     elec_props = compute_molecular_integrals_from_fcidump.fn(fcidump_path)
+    if elec_props.unrestricted:
+        raise ValueError(
+            f"{fcidump_path!r} produced an unrestricted (UHF) ElectronicProperties object, but "
+            "run_local.py's downstream RDM/energy code only handles the restricted case. Use "
+            "examples/fe4s4_hci_from_bsuhf_reference/load_uhf_fcidump_reference.py to load a "
+            "UHF/BS-UHF reference from its interleaved FCIDUMP instead."
+        )
     norb = elec_props.num_orbitals
     nelec = elec_props.num_electrons
     log.info("  norb=%d  nelec=%s", norb, nelec)

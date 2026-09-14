@@ -1033,6 +1033,31 @@ def walker_sqd(
         if step_carryover is not None:
             carryover = step_carryover
 
+        # Persist checkpoint AFTER updating avg_occ so a resume re-enters at the NEXT step with the
+        # occupancies this step produced. Atomic (tmp + replace) so a kill mid-write can't corrupt
+        # it. best_energy/best_carryover are the running best across all steps so far.
+        if _ckpt_path is not None:
+            try:
+                _co_save = (best_carryover if best_carryover is not None
+                            else np.empty((0, 0), dtype=bool))
+                # NB: np.savez appends ".npz" to a *string* path -> writing to a file HANDLE
+                # instead keeps the exact tmp name so os.replace() finds it (atomic rename).
+                _tmp = _ckpt_path + ".tmp"
+                with open(_tmp, "wb") as _fh:
+                    np.savez(
+                        _fh,
+                        occ_a=np.asarray(step_occ_a, dtype=np.float64),
+                        occ_b=np.asarray(step_occ_b, dtype=np.float64),
+                        next_step=np.int64(recovery_step + 1),
+                        best_energy=np.float64(best_energy if best_energy is not None else 0.0),
+                        carryover=np.asarray(_co_save, dtype=bool),
+                    )
+                os.replace(_tmp, _ckpt_path)
+                logger.info("[ckpt] wrote %s (next_step=%d, best=%.6f)",
+                            _ckpt_path, recovery_step + 1, float(best_energy or 0.0))
+            except Exception as _sexc:  # checkpointing must never break the calculation
+                logger.info("[ckpt] checkpoint save failed (non-fatal): %s", _sexc)
+
     logger.debug("Completed configuration recovery loop.")
 
     # Comprehensive end-of-walker summary: distinct-string counts, sqd_dim mapping, per-spin

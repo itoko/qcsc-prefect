@@ -8,6 +8,9 @@
 {%- if ompthreads is defined -%}
 :ompthreads={{ ompthreads }}
 {%- endif -%}
+{%- if mem is defined -%}
+:mem={{ mem }}
+{%- endif -%}
 {%- if walltime is defined %}
 #PBS -l walltime={{ walltime }}
 {%- endif %}

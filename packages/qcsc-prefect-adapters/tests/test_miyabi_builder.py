@@ -38,3 +38,33 @@ def test_render_miyabi_script(tmp_path: Path):
     assert text.index("unset OMPI_MCA_mca_base_env_list") < text.index('export OMP_NUM_THREADS="1"')
     assert text.index('export OMP_NUM_THREADS="1"') < text.index("QCSC_PREFECT_EXECUTABLE")
     assert 'mpirun "${QCSC_PREFECT_EXECUTABLE}" --foo bar' in text
+
+
+def test_render_miyabi_script_with_mem(tmp_path: Path):
+    profile = ExecutionProfile(
+        command_key="hello",
+        num_nodes=2,
+        mpiprocs=1,
+        ompthreads=1,
+        mem="32gb",
+        launcher="mpirun",
+    )
+    req = MiyabiJobRequest(queue_name="normal", project="z30541", executable="/path/to/hello")
+
+    text = render_script(work_dir=tmp_path, exec_profile=profile, req=req)
+
+    assert f"#PBS -l select={profile.num_nodes}:mpiprocs=1:ompthreads=1:mem=32gb" in text
+
+
+def test_render_miyabi_script_without_mem_omits_clause(tmp_path: Path):
+    profile = ExecutionProfile(
+        command_key="hello",
+        num_nodes=2,
+        mpiprocs=1,
+        launcher="mpirun",
+    )
+    req = MiyabiJobRequest(queue_name="normal", project="z30541", executable="/path/to/hello")
+
+    text = render_script(work_dir=tmp_path, exec_profile=profile, req=req)
+
+    assert ":mem=" not in text
