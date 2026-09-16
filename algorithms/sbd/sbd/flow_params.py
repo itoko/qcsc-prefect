@@ -443,3 +443,86 @@ class FlowParameters(BaseModel):
         ),
         title="OO Re-fire Every Trial",
     )
+
+    # ── CR-OO inner loop (alternating CR/OO on a fixed sample pool) ─────────────────────────
+    cr_oo_inner_loop: bool = Field(
+        default=False,
+        description=(
+            "Enable the CR-OO inner loop mode. When True, the workflow samples QC once per "
+            "outer epoch, then alternates CR (configuration recovery) and OO (orbital optimization "
+            "via resolve_orbitals_self_consistent) on the fixed sample pool until joint convergence, "
+            "then runs CC refresh and re-samples with a new LUCJ circuit. Incompatible with "
+            "quantum_source='saved' (raises ValueError). When False, the legacy DE outer loop is used."
+        ),
+        title="CR-OO Inner Loop",
+    )
+    cr_oo_max_cycles: int = Field(
+        default=5,
+        description="Maximum number of CR -> OO alternating cycles per inner loop.",
+        title="CR-OO Max Cycles",
+        ge=1,
+    )
+    cr_oo_max_epochs: int = Field(
+        default=10,
+        description=(
+            "Maximum number of outer epochs (QC sample -> inner loop -> CC refresh). "
+            "Each epoch samples the quantum device once with the current LUCJ circuit."
+        ),
+        title="CR-OO Max Epochs",
+        ge=1,
+    )
+    cr_oo_recovery_steps: int = Field(
+        default=3,
+        description=(
+            "Number of CR (configuration recovery) passes per inner cycle. Overrides "
+            "n_recovery_steps when cr_oo_inner_loop=True. Same raw sample pool is reused."
+        ),
+        title="CR-OO Recovery Steps",
+        ge=1,
+    )
+    cr_oo_energy_tol: float = Field(
+        default=1e-5,
+        description=(
+            "Energy convergence tolerance (Ha) between inner cycles. Convergence requires "
+            "|E_cycle - E_previous_cycle| < cr_oo_energy_tol, where E is the re-diagonalization "
+            "energy in the rotated basis."
+        ),
+        title="CR-OO Energy Tolerance",
+        gt=0.0,
+    )
+    cr_oo_grad_tol: float = Field(
+        default=1e-3,
+        description="Orbital gradient norm convergence threshold for inner loop joint convergence.",
+        title="CR-OO Gradient Tolerance",
+        gt=0.0,
+    )
+    cr_oo_space_tol: float = Field(
+        default=0.05,
+        description=(
+            "Determinant space convergence tolerance. Convergence requires "
+            "1 - Jaccard(D_current, D_previous) < cr_oo_space_tol, where Jaccard is computed "
+            "per-spin and averaged."
+        ),
+        title="CR-OO Space Tolerance",
+        gt=0.0,
+        le=1.0,
+    )
+    cr_oo_consec_converge: int = Field(
+        default=1,
+        description=(
+            "Number of consecutive cycles that must satisfy all three convergence criteria "
+            "(energy, gradient, space) before the inner loop declares convergence. "
+            "Set to 2 for stricter convergence."
+        ),
+        title="CR-OO Consecutive Convergence",
+        ge=1,
+    )
+    cr_oo_refresh_on_max_cycles: bool = Field(
+        default=False,
+        description=(
+            "Whether to run CC refresh even when the inner loop exits at max_cycles without "
+            "converging. When False (default), the outer loop stops if the inner loop does not "
+            "converge. When True, CC refresh proceeds regardless and the next epoch re-samples."
+        ),
+        title="CR-OO Refresh on Max Cycles",
+    )

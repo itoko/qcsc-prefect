@@ -294,6 +294,9 @@ def walker_sqd(
     hci_boost_ncore: int = 200,
     recomb_boost: bool = False,
     recomb_max_parents: int = 250,
+    precomputed_samples: tuple[np.ndarray, np.ndarray] | None = None,
+    return_samples: bool = False,
+    initial_avg_occ: tuple | None = None,
 ) -> tuple[tuple[float, NpStrict2DArrayBool, "SBDResult | None"], dict[str, Any]]:
     logger = get_run_logger()
     davidson_solver = SBDSolverJob.load(solver_block_name)
@@ -313,7 +316,13 @@ def walker_sqd(
     options = Variable.get("sqd_options", default={"params": {"shots": 100_000}})
     runtime = None
 
-    if quantum_source == "real-device":
+    if precomputed_samples is not None:
+        raw_bitstrings, raw_probs = precomputed_samples
+        logger.info(
+            "[precomputed] using externally provided sample pool (%d bitstrings), skipping QC sampling.",
+            raw_bitstrings.shape[0],
+        )
+    elif quantum_source == "real-device":
         try:
             runtime = QuantumRuntime.load("ibm-runner")
         except ValueError as exc:
@@ -546,7 +555,8 @@ def walker_sqd(
         )
 
     logger.debug("Starting configuration recovery and diagonalization.")
-    raw_bitstrings, raw_probs = bit_array_to_arrays(bit_array)
+    if precomputed_samples is None:
+        raw_bitstrings, raw_probs = bit_array_to_arrays(bit_array)
     norb = elec_props.num_orbitals
     num_elec_a, num_elec_b = elec_props.num_electrons
 
@@ -561,7 +571,7 @@ def walker_sqd(
     # avg_occ starts from the CCSD natural-orbital occupancies (per-spin for UHF) and is refreshed
     # each pass from the SBD solver's orbital_occupancies. n_recovery_steps=1 reproduces the
     # previous single-pass behavior exactly.
-    avg_occ = elec_props.initial_occupancy
+    avg_occ = initial_avg_occ if initial_avg_occ is not None else elec_props.initial_occupancy
 
     # ---- checkpoint / resume ----------------------------------------------------------------
     # A long (many-step) recovery run can be killed (wall-clock, node fault, or a native-solver
@@ -1126,7 +1136,10 @@ def walker_sqd(
         last_updated=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     )
 
-    return ((best_energy, best_carryover, best_sbd_result), telemetry)
+    result = ((best_energy, best_carryover, best_sbd_result), telemetry)
+    if return_samples:
+        return (best_energy, best_carryover, best_sbd_result), telemetry, (raw_bitstrings, raw_probs), avg_occ
+    return result
 
 
 def _stack_spin_carryover(

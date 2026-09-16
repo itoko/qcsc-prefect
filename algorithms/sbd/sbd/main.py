@@ -19,7 +19,11 @@ from qcsc_workflow_utility.chem import (
     compute_molecular_integrals_from_fcidump,
     refresh_cc_seed,
 )
-from qcsc_workflow_utility.orbital_opt import optimize_orbitals, rotate_electronic_properties
+from qcsc_workflow_utility.orbital_opt import (
+    optimize_orbitals,
+    resolve_orbitals_self_consistent,
+    rotate_electronic_properties,
+)
 
 from .data_io import extend_table_artifact
 from .flow_params import FlowParameters
@@ -145,6 +149,406 @@ class OptimizerState(BaseModel):
         )
 
 
+import dataclasses
+
+
+@dataclasses.dataclass
+class InnerLoopResult:
+    """Result of a CR-OO inner loop."""
+    converged: bool
+    stop_reason: str  # "converged" or "max_cycles"
+    elec_props: object  # ElectronicProperties
+    final_energy: float
+    final_grad_norm: float
+    final_avg_occ: tuple | None
+    final_carryover: object  # NpStrict2DArrayBool
+    final_sbd_result: object | None  # SBDResult
+    orbital_epoch: int
+    n_cycles: int
+    energy_history: list[float] = dataclasses.field(default_factory=list)
+    grad_history: list[float] = dataclasses.field(default_factory=list)
+    space_overlap_history: list[float] = dataclasses.field(default_factory=list)
+
+
+def _determinant_space_jaccard(dets_prev, dets_curr):
+    """Per-spin Jaccard similarity averaged over alpha and beta."""
+    def _jaccard_1d(a, b):
+        sa, sb = set(a.tolist()), set(b.tolist())
+        if not sa and not sb:
+            return 1.0
+        return len(sa & sb) / len(sa | sb)
+    j_a = _jaccard_1d(dets_prev[0], dets_curr[0])
+    j_b = _jaccard_1d(dets_prev[1], dets_curr[1])
+    return (j_a + j_b) / 2.0
+
+
+def _run_cr_oo_inner_loop(
+    raw_bitstrings,
+    raw_probs,
+    elec_props,
+    initial_avg_occ,
+    initial_carryover,
+    parameters,
+    solver,
+    aa_indices,
+    ab_indices,
+    epoch,
+    orbital_epoch,
+    cc_epoch,
+    population_epoch,
+    sampler_call_count,
+    logger,
+):
+    """Run the CR-OO inner loop on a fixed raw sample pool.
+
+    Alternates CR (configuration recovery) and OO (orbital optimization via
+    resolve_orbitals_self_consistent) until joint convergence or max_cycles.
+    """
+    _, solver_block_name = parse_block_ref(parameters.solver_block_ref)
+    max_cycles = parameters.cr_oo_max_cycles
+    n_recovery = parameters.cr_oo_recovery_steps
+    energy_tol = parameters.cr_oo_energy_tol
+    grad_tol = parameters.cr_oo_grad_tol
+    space_tol = parameters.cr_oo_space_tol
+    consec_required = parameters.cr_oo_consec_converge
+
+    avg_occ = initial_avg_occ
+    carryover = initial_carryover
+    prev_dets = None
+    prev_energy = None
+    consec_converged = 0
+    energy_history = []
+    grad_history = []
+    space_history = []
+    final_sbd_result = None
+
+    for cycle in range(max_cycles):
+        logger.info(
+            "[CR-OO] epoch=%d cycle=%d/%d orbital_epoch=%d cc_epoch=%d population_epoch=%d "
+            "sampler_calls=%d",
+            epoch, cycle + 1, max_cycles, orbital_epoch, cc_epoch, population_epoch,
+            sampler_call_count,
+        )
+
+        # --- CR phase: run recovery passes on the fixed sample pool ---
+        cr_result, cr_telemetry = walker_sqd(
+            trial_index=epoch,
+            walker_index=0,
+            ucj_parameter=np.zeros(1, dtype=np.float64),  # unused with precomputed_samples
+            circuit_params=parameters.circ_params,
+            elec_props=elec_props,
+            aa_indices=aa_indices,
+            ab_indices=ab_indices,
+            carryover=carryover,
+            sqd_dim=parameters.sqd_dim,
+            solver_block_name=solver_block_name,
+            quantum_source=parameters.quantum_source,
+            random_seed=parameters.random_seed,
+            n_recovery_steps=n_recovery,
+            n_batches=parameters.n_batches,
+            seed_cisd=parameters.seed_cisd,
+            seed_budget_frac=parameters.seed_budget_frac,
+            precomputed_samples=(raw_bitstrings, raw_probs),
+            initial_avg_occ=avg_occ,
+        )
+        cr_energy, cr_carryover, sbd_result = cr_result
+        final_sbd_result = sbd_result
+
+        if sbd_result is None:
+            logger.warning("[CR-OO] epoch=%d cycle=%d: CR produced no SBDResult.", epoch, cycle + 1)
+            break
+
+        current_dets = (
+            getattr(sbd_result, "alphadets", None),
+            getattr(sbd_result, "betadets", None),
+        )
+        if current_dets[0] is None:
+            logger.warning("[CR-OO] epoch=%d cycle=%d: no determinant space on SBDResult.", epoch, cycle + 1)
+            break
+
+        # Determinant space overlap
+        space_change = 0.0
+        if prev_dets is not None and prev_dets[0] is not None:
+            j = _determinant_space_jaccard(prev_dets, current_dets)
+            space_change = 1.0 - j
+        space_history.append(space_change)
+
+        logger.info(
+            "[CR-OO] epoch=%d cycle=%d CR done: E_davidson=%.10f det_space alpha=%d beta=%d "
+            "space_change=%.4f",
+            epoch, cycle + 1, cr_energy,
+            current_dets[0].size if current_dets[0] is not None else 0,
+            current_dets[1].size if current_dets[1] is not None else 0,
+            space_change,
+        )
+
+        # --- OO phase: self-consistent MCSCF on the CR determinant space ---
+        rdm1_aa = sbd_result.rdm1
+        if rdm1_aa is None:
+            logger.warning("[CR-OO] epoch=%d cycle=%d: RDMs not available; cannot run OO.", epoch, cycle + 1)
+            break
+
+        try:
+            elec_props, e_oo, grad_norm, n_macro, final_occ = resolve_orbitals_self_consistent(
+                elec_props,
+                current_dets[0],
+                current_dets[1],
+                num_elec=elec_props.num_electrons,
+                resolve_maxdim=getattr(parameters, "oo_resolve_maxdim", 4_000_000),
+                grad_tol=parameters.oo_grad_tol,
+                trust_radius=getattr(parameters, "oo_trust_radius", 0.1),
+                oo_maxiter=getattr(parameters, "oo_maxiter", 40),
+                resolve_backend=getattr(parameters, "oo_resolve_backend", "solve_fermion"),
+                davidson_solver=solver,
+                logger=logger,
+            )
+        except Exception:
+            logger.exception("[CR-OO] epoch=%d cycle=%d: OO failed.", epoch, cycle + 1)
+            break
+
+        orbital_epoch += 1
+        if final_occ is not None:
+            avg_occ = final_occ
+        carryover = cr_carryover if cr_carryover is not None else initial_carryover
+
+        energy_history.append(e_oo)
+        grad_history.append(grad_norm)
+
+        # --- Re-diag for OO effect verification ---
+        import asyncio
+        try:
+            _check_r = asyncio.run(solver.run(
+                ci_strings=(current_dets[0], current_dets[1]),
+                one_body_tensor=elec_props.one_body_tensor,
+                two_body_tensor=elec_props.two_body_tensor,
+                norb=elec_props.num_orbitals,
+                nelec=elec_props.num_electrons,
+                one_body_tensor_b=getattr(elec_props, "one_body_tensor_b", None),
+                two_body_tensor_ab=getattr(elec_props, "two_body_tensor_ab", None),
+                two_body_tensor_bb=getattr(elec_props, "two_body_tensor_bb", None),
+            ))
+            e_rediag = float(_check_r.energy)
+        except Exception:
+            logger.exception("[CR-OO] epoch=%d cycle=%d: re-diag failed, using OO energy.", epoch, cycle + 1)
+            e_rediag = e_oo
+
+        logger.info(
+            "[CR-OO] epoch=%d cycle=%d OO done: E_oo=%.10f E_rediag=%.10f |grad|=%.3e "
+            "n_macro=%d orbital_epoch=%d",
+            epoch, cycle + 1, e_oo, e_rediag, grad_norm, n_macro, orbital_epoch,
+        )
+
+        # --- Joint convergence check ---
+        energy_ok = prev_energy is not None and abs(e_rediag - prev_energy) < energy_tol
+        grad_ok = grad_norm < grad_tol
+        space_ok = prev_dets is not None and space_change < space_tol
+
+        if energy_ok and grad_ok and space_ok:
+            consec_converged += 1
+        else:
+            consec_converged = 0
+
+        logger.info(
+            "[CR-OO] epoch=%d cycle=%d convergence: energy=%s grad=%s space=%s "
+            "consecutive=%d/%d",
+            epoch, cycle + 1,
+            "OK" if energy_ok else "NO",
+            "OK" if grad_ok else "NO",
+            "OK" if space_ok else "NO",
+            consec_converged, consec_required,
+        )
+
+        if consec_converged >= consec_required:
+            logger.info(
+                "[CR-OO] epoch=%d: inner loop CONVERGED at cycle %d.", epoch, cycle + 1,
+            )
+            return InnerLoopResult(
+                converged=True,
+                stop_reason="converged",
+                elec_props=elec_props,
+                final_energy=e_rediag,
+                final_grad_norm=grad_norm,
+                final_avg_occ=avg_occ,
+                final_carryover=carryover,
+                final_sbd_result=final_sbd_result,
+                orbital_epoch=orbital_epoch,
+                n_cycles=cycle + 1,
+                energy_history=energy_history,
+                grad_history=grad_history,
+                space_overlap_history=space_history,
+            )
+
+        prev_dets = current_dets
+        prev_energy = e_rediag
+
+    logger.info(
+        "[CR-OO] epoch=%d: inner loop reached max_cycles=%d without convergence.", epoch, max_cycles,
+    )
+    return InnerLoopResult(
+        converged=False,
+        stop_reason="max_cycles",
+        elec_props=elec_props,
+        final_energy=energy_history[-1] if energy_history else float("nan"),
+        final_grad_norm=grad_history[-1] if grad_history else float("inf"),
+        final_avg_occ=avg_occ,
+        final_carryover=carryover,
+        final_sbd_result=final_sbd_result,
+        orbital_epoch=orbital_epoch,
+        n_cycles=max_cycles,
+        energy_history=energy_history,
+        grad_history=grad_history,
+        space_overlap_history=space_history,
+    )
+
+
+def _run_cr_oo_outer_loop(parameters, elec_props, solver, aa_indices, ab_indices, logger):
+    """Outer epoch loop: QC sample -> CR-OO inner loop -> CC refresh -> new LUCJ -> repeat."""
+    orbital_epoch = 0
+    cc_epoch = 0
+    population_epoch = 0
+    sampler_call_count = 0
+    avg_occ = elec_props.initial_occupancy
+    norb = elec_props.num_orbitals
+    carryover = np.full((0, norb), False, dtype=bool)
+
+    _, solver_block_name = parse_block_ref(parameters.solver_block_ref)
+    best_energy_global = float("inf")
+
+    for epoch in range(parameters.cr_oo_max_epochs):
+        logger.info(
+            "[CR-OO-OUTER] epoch=%d/%d starting. cc_epoch=%d population_epoch=%d",
+            epoch + 1, parameters.cr_oo_max_epochs, cc_epoch, population_epoch,
+        )
+
+        # 1. Generate LUCJ population (single walker)
+        ucj_params = initialize_ucj_parameters(
+            elec_props=elec_props,
+            aa_indices=aa_indices,
+            ab_indices=ab_indices,
+            num_walkers=1,
+            randomization_factor=parameters.de_params.randomization_factor,
+            n_lucj_layers=parameters.circ_params.n_lucj_layers,
+            ucj_optimize=parameters.circ_params.ucj_optimize,
+        )
+        population_epoch += 1
+        ucj_param = ucj_params[0]
+
+        # 2. QC sampling (one call per epoch)
+        first_cr_result, first_telemetry, (raw_bitstrings, raw_probs), first_avg_occ = walker_sqd(
+            trial_index=epoch,
+            walker_index=0,
+            ucj_parameter=ucj_param,
+            circuit_params=parameters.circ_params,
+            elec_props=elec_props,
+            aa_indices=aa_indices,
+            ab_indices=ab_indices,
+            carryover=carryover,
+            sqd_dim=parameters.sqd_dim,
+            solver_block_name=solver_block_name,
+            quantum_source=parameters.quantum_source,
+            random_seed=parameters.random_seed,
+            n_recovery_steps=parameters.cr_oo_recovery_steps,
+            n_batches=parameters.n_batches,
+            seed_cisd=parameters.seed_cisd,
+            seed_budget_frac=parameters.seed_budget_frac,
+            return_samples=True,
+            initial_avg_occ=avg_occ,
+        )
+        sampler_call_count += 1
+
+        first_energy, first_carryover, first_sbd = first_cr_result
+        logger.info(
+            "[CR-OO-OUTER] epoch=%d: QC sampling done. Initial CR energy=%.10f sampler_calls=%d",
+            epoch + 1, first_energy, sampler_call_count,
+        )
+
+        # If max_cycles == 1, use the first pass result directly.
+        # Otherwise, run the inner loop starting from the first pass's state.
+        if parameters.cr_oo_max_cycles <= 1:
+            # Single cycle: use first pass result, no inner loop iteration
+            result = InnerLoopResult(
+                converged=False,
+                stop_reason="max_cycles",
+                elec_props=elec_props,
+                final_energy=first_energy,
+                final_grad_norm=float("inf"),
+                final_avg_occ=first_avg_occ,
+                final_carryover=first_carryover,
+                final_sbd_result=first_sbd,
+                orbital_epoch=orbital_epoch,
+                n_cycles=1,
+            )
+        else:
+            # 3. CR-OO inner loop on fixed pool
+            result = _run_cr_oo_inner_loop(
+                raw_bitstrings=raw_bitstrings,
+                raw_probs=raw_probs,
+                elec_props=elec_props,
+                initial_avg_occ=first_avg_occ if first_avg_occ is not None else avg_occ,
+                initial_carryover=first_carryover if first_carryover is not None else carryover,
+                parameters=parameters,
+                solver=solver,
+                aa_indices=aa_indices,
+                ab_indices=ab_indices,
+                epoch=epoch,
+                orbital_epoch=orbital_epoch,
+                cc_epoch=cc_epoch,
+                population_epoch=population_epoch,
+                sampler_call_count=sampler_call_count,
+                logger=logger,
+            )
+
+        elec_props = result.elec_props
+        orbital_epoch = result.orbital_epoch
+
+        if result.final_energy < best_energy_global:
+            best_energy_global = result.final_energy
+
+        logger.info(
+            "[CR-OO-OUTER] epoch=%d: inner loop done. converged=%s stop_reason=%s "
+            "E=%.10f |grad|=%.3e cycles=%d best_global=%.10f",
+            epoch + 1, result.converged, result.stop_reason,
+            result.final_energy, result.final_grad_norm, result.n_cycles, best_energy_global,
+        )
+
+        # 4. CC refresh decision
+        do_refresh = result.converged or parameters.cr_oo_refresh_on_max_cycles
+        if not do_refresh:
+            logger.warning(
+                "[CR-OO-OUTER] epoch=%d: inner loop did not converge and "
+                "cr_oo_refresh_on_max_cycles=False. Stopping outer loop.",
+                epoch + 1,
+            )
+            break
+
+        logger.info("[CR-OO-OUTER] epoch=%d: running CC refresh on final rotated H...", epoch + 1)
+        refreshed = refresh_cc_seed(elec_props)
+        if refreshed is None:
+            logger.error(
+                "[CR-OO-OUTER] epoch=%d: CC refresh failed (CCSD returned NaN). Aborting.", epoch + 1,
+            )
+            break
+        elec_props = refreshed
+        cc_epoch += 1
+
+        old_t2_norm = np.linalg.norm(np.asarray(result.elec_props.t2) if hasattr(result.elec_props, "t2") else 0)
+        new_t2_norm = np.linalg.norm(np.asarray(refreshed.t2))
+        logger.info(
+            "[CR-OO-OUTER] epoch=%d: CC refresh done. cc_epoch=%d ||t2_new||=%.4e",
+            epoch + 1, cc_epoch, new_t2_norm,
+        )
+
+        # 5. Reset for new epoch
+        avg_occ = refreshed.initial_occupancy
+        carryover = np.full((0, norb), False, dtype=bool)
+
+    logger.info(
+        "[CR-OO-OUTER] finished. total epochs=%d cc_refreshes=%d sampler_calls=%d best_energy=%.10f",
+        min(epoch + 1, parameters.cr_oo_max_epochs), cc_epoch, sampler_call_count, best_energy_global,
+    )
+    return best_energy_global
+
+
 @flow(
     task_runner=_build_task_runner(),
 )
@@ -213,6 +617,20 @@ def riken_sqd_de(
         len(ab_indices),
         len(range(0, elec_props.num_orbitals, 4)),
     )
+
+    # ── CR-OO inner loop mode dispatch ──────────────────────────────────────
+    if getattr(parameters, "cr_oo_inner_loop", False):
+        if parameters.quantum_source == "saved":
+            raise ValueError(
+                "cr_oo_inner_loop=True requires live QC sampling (quantum_source='real-device' "
+                "or 'random'). quantum_source='saved' is incompatible because CC refresh "
+                "requires re-sampling with a new LUCJ circuit. Use cr_oo_inner_loop=False for "
+                "saved-pool offline diagonalization."
+            )
+        logger.info("CR-OO inner loop mode enabled. Entering outer epoch loop.")
+        return _run_cr_oo_outer_loop(
+            parameters, elec_props, solver, aa_indices, ab_indices, logger,
+        )
 
     state = OptimizerState.from_parameters(
         num_walkers=parameters.de_params.num_walkers,
@@ -346,7 +764,7 @@ def riken_sqd_de(
                             resolve_orbitals_self_consistent,
                         )
                         _elec_props_before_oo = elec_props
-                        elec_props, e_sc, grad_sc, n_macro = resolve_orbitals_self_consistent(
+                        elec_props, e_sc, grad_sc, n_macro, _sc_occ = resolve_orbitals_self_consistent(
                             elec_props,
                             best_sbd_result.alphadets,
                             best_sbd_result.betadets,

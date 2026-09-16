@@ -705,7 +705,7 @@ def resolve_orbitals_self_consistent(
     davidson_solver=None,
     use_jax: bool | None = None,
     logger=None,
-) -> tuple["ElectronicProperties", float, float, int]:
+) -> tuple["ElectronicProperties", float, float, int, tuple | None]:
     """Fully self-consistent two-step MCSCF on a FIXED CI subspace (the oo_resolve_rdms path).
 
     This is the rigorous alternative to reusing the previous trial's stale RDMs. Each macro
@@ -727,7 +727,9 @@ def resolve_orbitals_self_consistent(
     len(betadets)) and diagonalizes it directly in NumPy/PySCF -- the same subspace the GPU solver
     used, but re-diagonalized in-process. No new determinants, no sampling, no scheduler round-trip.
 
-    Returns ``(rotated_elec_props, final_energy, final_grad_norm, n_macro)``.
+    Returns ``(rotated_elec_props, final_energy, final_grad_norm, n_macro, final_occupancies)``
+    where ``final_occupancies`` is ``(occ_a, occ_b)`` from the final re-diagonalization, or None
+    if the backend does not provide them.
 
     References: two-step MCSCF of Kreplin/Knowles/Werner, J. Chem. Phys. 152, 074102 (2020).
     """
@@ -786,17 +788,14 @@ def resolve_orbitals_self_consistent(
         _na, _nb = (num_elec if num_elec is not None else elec_props.num_electrons)
         _norb = int(np.asarray(elec_props.one_body_tensor).shape[0])
 
-    def _resolve_diagonalize(ci_pair, ep_cur, *, want_rdms):
+    def _resolve_diagonalize(ci_pair, ep_cur, *, want_rdms, want_occupancies=False):
         """Re-diagonalize the fixed subspace `ci_pair` in basis `ep_cur`.
 
-        Returns (E_total, rdms) where rdms is (rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb) in
-        `_resolve_notation` storage when want_rdms, else None.
+        Returns (E_total, rdms, occupancies) where rdms is
+        (rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb) in `_resolve_notation` storage when
+        want_rdms (else None), and occupancies is (occ_a, occ_b) when want_occupancies (else None).
         """
         if resolve_backend == "davidson_gpu":
-            # Native GPU Davidson on the fixed subspace (no sampling), full UHF integral blocks.
-            # NOTE: even want_rdms=False (line-search energy) evals compute RDMs here because the
-            # block's do_rdm>=1; the RDM cost is negligible at validation norb. A do_rdm=0 solver
-            # copy for the energy-only evals is a possible future micro-opt.
             r = asyncio.run(davidson_solver.run(
                 ci_strings=(ci_pair[0], ci_pair[1]),
                 one_body_tensor=ep_cur.one_body_tensor,
@@ -807,19 +806,25 @@ def resolve_orbitals_self_consistent(
                 two_body_tensor_bb=ep_cur.two_body_tensor_bb,
             ))
             E = float(r.energy) + nuc
-            if not want_rdms:
-                return E, None
-            return E, (r.rdm1, r.rdm1_b, r.rdm2, r.rdm2_ab, r.rdm2_bb)
+            rdms = (r.rdm1, r.rdm1_b, r.rdm2, r.rdm2_ab, r.rdm2_bb) if want_rdms else None
+            occ = None
+            if want_occupancies and hasattr(r, "orbital_occupancies") and r.orbital_occupancies is not None:
+                occ = r.orbital_occupancies
+            elif want_occupancies and want_rdms:
+                occ = (np.diag(r.rdm1), np.diag(r.rdm1_b) if r.rdm1_b is not None else np.diag(r.rdm1))
+            return E, rdms, occ
         # default: in-process CPU solve_fermion (alpha integrals; pqrs-storage RDMs).
         e_el, sci, _occ, _s2 = solve_fermion(
             ci_pair, ep_cur.one_body_tensor, ep_cur.two_body_tensor, open_shell=open_shell,
         )
         E = float(e_el) + nuc
-        if not want_rdms:
-            return E, None
-        r1 = sci.rdm(rank=1, spin_summed=False)
-        r2 = sci.rdm(rank=2, spin_summed=False)
-        return E, (r1[0], r1[1], r2[0], r2[1], r2[-1])
+        rdms = None
+        if want_rdms:
+            r1 = sci.rdm(rank=1, spin_summed=False)
+            r2 = sci.rdm(rank=2, spin_summed=False)
+            rdms = (r1[0], r1[1], r2[0], r2[1], r2[-1])
+        occ = tuple(_occ) if want_occupancies and _occ is not None else None
+        return E, rdms, occ
 
     ep = elec_props
     prev_e = None
@@ -830,7 +835,7 @@ def resolve_orbitals_self_consistent(
         # (1)+(2) re-diagonalize the fixed subspace in the current basis -> fresh energy + RDMs.
         # solve_fermion returns (energy, SCIState, avg_occupancies, spin_sq); SCIState.rdm(rank,
         # spin_summed=False) gives the per-spin blocks in pqrs-storage.
-        e, _rdms = _resolve_diagonalize(ci, ep, want_rdms=True)
+        e, _rdms, _ = _resolve_diagonalize(ci, ep, want_rdms=True)
         rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb = _rdms
 
         if logger is not None:
@@ -868,7 +873,7 @@ def resolve_orbitals_self_consistent(
                 gtol=grad_tol,  # inner L-BFGS-B pgtol unified with the SC macro tol (OO_GRAD_TOL)
             )
             ep_try = rotate_electronic_properties(ep, Ua, Ub)
-            e_try, _ = _resolve_diagonalize(ci, ep_try, want_rdms=False)
+            e_try, _, _ = _resolve_diagonalize(ci, ep_try, want_rdms=False)
             if e_try <= e + 1e-12:  # true energy decreased -> accept
                 ep = ep_try
                 accepted = True
@@ -894,5 +899,5 @@ def resolve_orbitals_self_consistent(
         prev_e = e
 
     # Final re-solve in the (accepted) basis for the reported energy -- RDMs consistent with H.
-    e_final, _ = _resolve_diagonalize(ci, ep, want_rdms=True)
-    return ep, float(e_final), float(grad_norm), macro
+    e_final, _, final_occ = _resolve_diagonalize(ci, ep, want_rdms=True, want_occupancies=True)
+    return ep, float(e_final), float(grad_norm), macro, final_occ
