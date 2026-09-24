@@ -485,7 +485,7 @@ def _build_property_uhf(
     # Get PySCF logs dumped into in-memory buffer
     get_run_logger().info(buf.getvalue())
 
-    return ElectronicProperties(
+    props = ElectronicProperties(
         one_body_tensor=h1_a,
         two_body_tensor=h2_aa,
         t2=t2_aa,
@@ -502,6 +502,95 @@ def _build_property_uhf(
         unrestricted=True,
         spin_sq=spin_sq,
     )
+
+    # Opt-in initial orbital optimization: BS-UHF -> UCCSD -> OO -> UCCSD refresh.
+    # Default off (OO_INIT unset/0) so existing runs are byte-for-byte unaffected.
+    if os.environ.get("OO_INIT", "0") == "1":
+        props = _apply_initial_oo(props, mycc, dm_cc_a, dm_cc_b)
+
+    return props
+
+
+def _apply_initial_oo(
+    props: ElectronicProperties,
+    mycc: "cc.uccsd.UCCSD",
+    dm_cc_a: np.ndarray,
+    dm_cc_b: np.ndarray,
+) -> ElectronicProperties:
+    """Insert one orbital-optimization step between the initial BS-UHF UCCSD and the t2 seed.
+
+    Opt-in via ``OO_INIT=1`` (UHF path only). Flow:
+
+        BS-UHF -> UCCSD (already run; 1-/2-RDM in hand)
+               -> OO (rotate orbitals with the fixed UCCSD RDM, two-step MCSCF)
+               -> UCCSD refresh in the rotated basis (fresh t2 / occupancy seed).
+
+    OO needs a *correlated* RDM: the BS-UHF SCF density already satisfies the generalized
+    Brillouin condition (zero orbital gradient), so an SCF-RDM-driven OO cannot move. UCCSD
+    supplies that correlated RDM without needing a CI subspace.
+
+    UCCSD is non-variational and, for large active spaces (e.g. Fe4S4 36o/54e), frequently
+    unconverged, so the rotation is deliberately conservative: a single fixed-RDM OO step with
+    a small trust radius, guarded by an energy check that *discards* the rotation unless the
+    refreshed UCCSD energy is at or below the pre-OO UCCSD energy (safe fallback to the
+    un-rotated reference).
+
+    Thresholds are shared with the DE-loop OO (see sbd/main.py): ``OO_GRAD_TOL`` (1e-3),
+    ``OO_TRUST`` (0.5), ``OO_MAXITER`` (300) -- identical env names and defaults so "all
+    criteria are aligned from the initial OO onward".
+    """
+    from qcsc_workflow_utility.orbital_opt import (
+        optimize_orbitals,
+        rotate_electronic_properties,
+    )
+
+    logger = get_run_logger()
+    e_cc_before = float(mycc.e_tot)
+
+    # UCCSD spin-block 2-RDM in PySCF "pqrs" (chemist) storage. make_rdm1() already matches the
+    # physicist convention optimize_orbitals expects (dm1[p,q] = <q^dag p>), so no transpose.
+    d2aa, d2ab, d2bb = mycc.make_rdm2()
+
+    gtol = float(os.environ.get("OO_GRAD_TOL", "1e-3"))
+    trust = float(os.environ.get("OO_TRUST", "0.5"))
+    maxiter = int(os.environ.get("OO_MAXITER", "300"))
+
+    Ua, Ub, e_oo, grad_norm = optimize_orbitals(
+        props,
+        np.asarray(dm_cc_a),
+        np.asarray(dm_cc_b),
+        np.asarray(d2aa),
+        np.asarray(d2ab),
+        np.asarray(d2bb),
+        rdm2_notation="pqrs",  # UCCSD make_rdm2 storage (NOT the native solver's "prqs")
+        gtol=gtol,
+        trust_radius=trust,
+        maxiter=maxiter,
+    )
+
+    props_rot = rotate_electronic_properties(props, Ua, Ub)
+    props_new, e_cc_after = refresh_cc_seed(props_rot, return_energy=True)
+
+    if (
+        props_new is not None
+        and e_cc_after is not None
+        and np.isfinite(e_cc_after)
+        and e_cc_after <= e_cc_before + 1e-6
+    ):
+        logger.info(
+            "OO_INIT accepted: E(UCCSD before OO)=%.10f  E_oo(fixed-RDM, total)=%.10f  "
+            "|grad|=%.3e  E(UCCSD after OO)=%.10f  dE=%+.3e Ha  (trust=%.3g, gtol=%.1e).",
+            e_cc_before, e_oo, grad_norm, e_cc_after, e_cc_after - e_cc_before, trust, gtol,
+        )
+        return props_new
+
+    logger.warning(
+        "OO_INIT rejected (no energy gain / NaN): E(UCCSD before OO)=%.10f  E_oo=%.10f  "
+        "|grad|=%.3e  E(UCCSD after OO)=%s  -> keeping pre-OO BS-UHF/UCCSD reference.",
+        e_cc_before, e_oo, grad_norm,
+        f"{e_cc_after:.10f}" if e_cc_after is not None else "None",
+    )
+    return props
 
 
 @task(
@@ -672,7 +761,10 @@ def compute_molecular_integrals_from_fcidump(
     return _build_property(mf, norb, spin_sq, buf)
 
 
-def refresh_cc_seed(elec_props: ElectronicProperties) -> ElectronicProperties | None:
+def refresh_cc_seed(
+    elec_props: ElectronicProperties,
+    return_energy: bool = False,
+):
     """Re-run CCSD/UCCSD on the current (rotated) integrals and return updated ElectronicProperties.
 
     This is the CC-refresh step for OO_TO_LUCJ=1: after orbital optimization rotates the
@@ -680,6 +772,10 @@ def refresh_cc_seed(elec_props: ElectronicProperties) -> ElectronicProperties | 
     integrals. Uses the previous t2 amplitudes (from elec_props) as warm-start initial guess
     so that UCCSD converges faster in the rotated basis. Returns a new ElectronicProperties
     with updated t2/occupancy fields, or None if amplitudes contain NaN.
+
+    If ``return_energy`` is True, returns ``(props_or_None, e_tot_or_None)`` instead: the
+    refreshed UCCSD/CCSD total energy accompanies the properties (used by the OO_INIT energy
+    guard). Default False preserves the original single-value return for existing callers.
     """
     import logging
 
@@ -690,15 +786,16 @@ def refresh_cc_seed(elec_props: ElectronicProperties) -> ElectronicProperties | 
     max_cycle = int(os.environ.get("SEED_CCSD_MAX_CYCLE", "200"))
 
     if elec_props.unrestricted:
-        return _refresh_cc_seed_uhf(elec_props, log, max_cycle)
+        return _refresh_cc_seed_uhf(elec_props, log, max_cycle, return_energy)
     else:
-        return _refresh_cc_seed_rhf(elec_props, log, max_cycle)
+        return _refresh_cc_seed_rhf(elec_props, log, max_cycle, return_energy)
 
 
 def _refresh_cc_seed_rhf(
     elec_props: ElectronicProperties,
     log,
     max_cycle: int,
+    return_energy: bool = False,
 ) -> ElectronicProperties | None:
     """CC refresh for RHF."""
     norb = elec_props.num_orbitals
@@ -769,9 +866,9 @@ def _refresh_cc_seed_rhf(
 
     if np.any(np.isnan(t2_new)) or np.any(np.isnan(occ_new)):
         log.warning("CC refresh (RHF): NaN detected in amplitudes or occupancy. Discarding.")
-        return None
+        return (None, None) if return_energy else None
 
-    return ElectronicProperties(
+    props = ElectronicProperties(
         one_body_tensor=elec_props.one_body_tensor,
         two_body_tensor=elec_props.two_body_tensor,
         t2=t2_new,
@@ -782,12 +879,14 @@ def _refresh_cc_seed_rhf(
         open_shell=elec_props.open_shell,
         spin_sq=elec_props.spin_sq,
     )
+    return (props, float(mycc.e_tot)) if return_energy else props
 
 
 def _refresh_cc_seed_uhf(
     elec_props: ElectronicProperties,
     log,
     max_cycle: int,
+    return_energy: bool = False,
 ) -> ElectronicProperties | None:
     """CC refresh for UHF.
 
@@ -940,7 +1039,7 @@ def _refresh_cc_seed_uhf(
     # NaN check BEFORE make_rdm1: lambda equation crashes on NaN amplitudes
     if any(np.any(np.isnan(x)) or np.any(np.isinf(x)) for x in [t2_aa_new, t2_ab_new, t2_bb_new]):
         log.warning("CC refresh (UHF): NaN/Inf detected in amplitudes. Discarding.")
-        return None
+        return (None, None) if return_energy else None
 
     dm_a, dm_b = mycc.make_rdm1()
     occ_a_new = np.diag(dm_a)
@@ -948,9 +1047,9 @@ def _refresh_cc_seed_uhf(
 
     if any(np.any(np.isnan(x)) for x in [occ_a_new, occ_b_new]):
         log.warning("CC refresh (UHF): NaN detected in occupancy. Discarding.")
-        return None
+        return (None, None) if return_energy else None
 
-    return ElectronicProperties(
+    props = ElectronicProperties(
         one_body_tensor=elec_props.one_body_tensor,
         two_body_tensor=elec_props.two_body_tensor,
         t2=t2_aa_new,
@@ -967,5 +1066,6 @@ def _refresh_cc_seed_uhf(
         unrestricted=True,
         spin_sq=elec_props.spin_sq,
     )
+    return (props, float(mycc.e_tot)) if return_energy else props
 
 

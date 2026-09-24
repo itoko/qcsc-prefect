@@ -223,8 +223,9 @@ def riken_sqd_de(
     )
 
     # OO effect tracking: store the prediction from the previous trial's OO
-    # so the next trial can compare prediction vs actual Davidson energy.
-    _oo_prediction = None  # dict with trial, e_davidson_source, e_oo_fixed_rdm or e_oo_sc
+    # so the next trial can compare prediction vs actual Davidson energy. Store
+    # all values here as total energies (including nuclear repulsion).
+    _oo_prediction = None  # dict with trial, e_davidson_source, e_oo_trial_rdm or e_oo_sc
 
     # CC refresh stagnation trigger: count consecutive trials where OO was skipped
     # (best not beaten). When the count reaches OO_SAT_STAGNATION (default 2),
@@ -251,16 +252,19 @@ def riken_sqd_de(
         # (= determinant-space limitation) is large, the circuit needs updating via CC refresh.
         if _oo_prediction is not None:
             _prev = _oo_prediction
-            _e_actual = float(best_sbd_result.energy) if best_sbd_result is not None else None
+            _e_actual = (
+                float(best_sbd_result.energy) + float(elec_props.nuclear_repulsion_energy)
+                if best_sbd_result is not None else None
+            )
             if _e_actual is not None:
                 _delta_actual = (_e_actual - _prev["e_davidson_source"]) * 1000  # mHa
                 _delta_pred = (_prev["e_oo_estimate"] - _prev["e_davidson_source"]) * 1000
                 _gap = (_e_actual - _prev["e_oo_estimate"]) * 1000  # positive = underperformance
                 logger.info(
                     "Trial %d: OO effect (from trial %d):\n"
-                    "  E_davidson(source, trial %d) [Davidson-GPU, truncated CI]:  %.10f\n"
-                    "  E_oo(%s prediction)          [%s]:  %.10f  (predicted dE=%.1f mHa)\n"
-                    "  E_davidson(actual, trial %d)  [Davidson-GPU, truncated CI]:  %.10f  (actual dE=%.1f mHa)\n"
+                    "  E_davidson(source, trial %d) [Davidson-GPU, truncated CI, total]:  %.10f\n"
+                    "  E_oo(%s prediction)          [%s; total]:  %.10f  (predicted dE=%.1f mHa)\n"
+                    "  E_davidson(actual, trial %d)  [Davidson-GPU, truncated CI, total]:  %.10f  (actual dE=%.1f mHa)\n"
                     "  Prediction gap: %.1f mHa (%s)",
                     i, _prev["trial"],
                     _prev["trial"], _prev["e_davidson_source"],
@@ -320,10 +324,13 @@ def riken_sqd_de(
                 rdm2_ab = best_sbd_result.rdm2_ab if best_sbd_result.rdm2_ab is not None else rdm2_aa
                 rdm2_bb = best_sbd_result.rdm2_bb if best_sbd_result.rdm2_bb is not None else rdm2_aa
                 _consecutive_oo_skips = 0  # OO fires -> reset stagnation counter
+                _nuc = float(elec_props.nuclear_repulsion_energy)
                 logger.info(
                     "Trial %d: running orbital optimization (norb=%d, unrestricted=%s, "
-                    "RDM source Davidson=%.10f) ...",
-                    i, elec_props.num_orbitals, unrestricted, _rdm_e,
+                    "E_davidson source: elec=%.10f  total(+nuc)=%.10f  (nuc=%.6f); "
+                    "RDM frozen only within this OO step) ...",
+                    i, elec_props.num_orbitals, unrestricted,
+                    float(_rdm_e), float(_rdm_e) + _nuc, _nuc,
                 )
 
                 # ── Self-consistent path (oo_resolve_rdms): re-diagonalize the fixed CI subspace
@@ -338,14 +345,24 @@ def riken_sqd_de(
                         from qcsc_workflow_utility.orbital_opt import (
                             resolve_orbitals_self_consistent,
                         )
+                        _elec_props_before_oo = elec_props
                         elec_props, e_sc, grad_sc, n_macro = resolve_orbitals_self_consistent(
                             elec_props,
                             best_sbd_result.alphadets,
                             best_sbd_result.betadets,
                             num_elec=elec_props.num_electrons,
                             resolve_maxdim=getattr(parameters, "oo_resolve_maxdim", 4_000_000),
-                            grad_tol=getattr(parameters, "oo_grad_tol", 1e-3),
-                            trust_radius=getattr(parameters, "oo_trust_radius", 0.1),
+                            grad_tol=(
+                                float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
+                                else getattr(parameters, "oo_grad_tol", 1e-3)
+                            ),
+                            trust_radius=(
+                                float(os.environ["OO_TRUST"]) if "OO_TRUST" in os.environ
+                                else getattr(parameters, "oo_trust_radius", 0.1)
+                            ),
+                            # NOTE: oo_maxiter here is MACRO iterations (self-consistent re-diag),
+                            # a different quantity from the L-BFGS inner maxiter unified via
+                            # OO_MAXITER; left on its own param/default deliberately.
                             oo_maxiter=getattr(parameters, "oo_maxiter", 40),
                             resolve_backend=getattr(parameters, "oo_resolve_backend", "solve_fermion"),
                             davidson_solver=solver,
@@ -359,12 +376,70 @@ def riken_sqd_de(
                         # CC refresh (if needed) is now triggered by stagnation detection above
                         _oo_prediction = {
                             "trial": i,
-                            "e_davidson_source": float(_rdm_e),
+                            "e_davidson_source": float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
                             "e_oo_estimate": float(e_sc),
                             "method": "OO-SC",
-                            "method_detail": "JAX+Davidson-GPU, self-consistent re-diag",
+                            "method_detail": "JAX orbital step + fresh RDM each macro-step",
                         }
-                        if grad_sc < getattr(parameters, "oo_grad_tol", 1e-3) and not getattr(parameters, "oo_refire_every_trial", False):
+
+                        # OO_CHECK: the OO-SC orbital step may have converged on a truncated
+                        # subspace. Re-diagonalize the full original determinant subspace with
+                        # the rotated H before leaving this branch, so OO_RESOLVE does not hide
+                        # the full-space energy after truncation.
+                        if int(os.environ.get("OO_CHECK", "0")) == 1:
+                            _check_adets = getattr(best_sbd_result, "alphadets", None)
+                            _check_bdets = getattr(best_sbd_result, "betadets", None)
+                            if _check_adets is not None:
+                                try:
+                                    import asyncio as _asyncio
+                                    _check_r = _asyncio.run(solver.run(
+                                        ci_strings=(
+                                            _check_adets,
+                                            _check_bdets
+                                            if _check_bdets is not None
+                                            else _check_adets,
+                                        ),
+                                        one_body_tensor=elec_props.one_body_tensor,
+                                        two_body_tensor=elec_props.two_body_tensor,
+                                        norb=elec_props.num_orbitals,
+                                        nelec=elec_props.num_electrons,
+                                        one_body_tensor_b=elec_props.one_body_tensor_b,
+                                        two_body_tensor_ab=elec_props.two_body_tensor_ab,
+                                        two_body_tensor_bb=elec_props.two_body_tensor_bb,
+                                    ))
+                                    _e_check = float(_check_r.energy)
+                                    logger.info(
+                                        "Trial %d: OO_CHECK [Davidson-GPU, full original "
+                                        "subspace, rotated H]:\n"
+                                        "  E_davidson(before OO) [Davidson-GPU, total]:  %.10f\n"
+                                        "  E_sc(truncated OO-SC, total) [fresh RDM per "
+                                        "macro-step]: %.10f\n"
+                                        "  E_check(after OO)     [Davidson-GPU]: elec=%.10f "
+                                        "total(+nuc)=%.10f  (dE=%.1f mHa from before)",
+                                        i,
+                                        float(_rdm_e) + float(_elec_props_before_oo.nuclear_repulsion_energy),
+                                        e_sc,
+                                        _e_check,
+                                        _e_check + float(elec_props.nuclear_repulsion_energy),
+                                        (_e_check - _rdm_e) * 1000,
+                                    )
+                                    if _e_check > _rdm_e:
+                                        elec_props = _elec_props_before_oo
+                                        _oo_prediction = None
+                                        logger.warning(
+                                            "Trial %d: OO_CHECK energy increased by %.3e Ha "
+                                            "-> rolling back OO-SC rotation; keeping pre-OO integrals.",
+                                            i, _e_check - _rdm_e,
+                                        )
+                                        continue
+                                except Exception:
+                                    logger.exception("Trial %d: OO_CHECK failed.", i)
+
+                        _grad_tol_sc = (
+                            float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
+                            else getattr(parameters, "oo_grad_tol", 1e-3)
+                        )
+                        if grad_sc < _grad_tol_sc and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
                                 "Trial %d: orbitals stationary (|grad| < tol) -> freezing basis.", i
                             )
@@ -388,14 +463,28 @@ def riken_sqd_de(
                         # to "pqrs"; passing "pqrs"-stored data as prqs (or vice versa) applies a
                         # wrong transpose -> unphysical energy (~-159 Ha for OH). Must be "prqs".
                         rdm2_notation="prqs",
-                        trust_radius=getattr(parameters, "oo_trust_radius", 0.5),
-                        maxiter=getattr(parameters, "oo_maxiter", 300),
+                        # Shared OO thresholds: OO_TRUST / OO_MAXITER env override the flow
+                        # params so the initial OO (chem._apply_initial_oo) and this DE-loop OO
+                        # use identical criteria. Env absent -> unchanged (backward compatible).
+                        trust_radius=(
+                            float(os.environ["OO_TRUST"]) if "OO_TRUST" in os.environ
+                            else getattr(parameters, "oo_trust_radius", 0.5)
+                        ),
+                        maxiter=(
+                            int(os.environ["OO_MAXITER"]) if "OO_MAXITER" in os.environ
+                            else getattr(parameters, "oo_maxiter", 300)
+                        ),
+                        davidson_ref_energy=float(_rdm_e) if _rdm_e is not None else None,
                     )
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
+                    _nuc = float(elec_props.nuclear_repulsion_energy)
                     logger.info(
-                        "Trial %d: E_oo(fixed-RDM) [JAX L-BFGS-B, fixed RDM + rotated H] = %.10f Ha  "
-                        "|grad|=%.3e  (E_davidson [Davidson-GPU] = %s)",
+                        "Trial %d: E_oo(trial-RDM; frozen within OO step) "
+                        "[L-BFGS-B objective on rotated H] = %.10f Ha (total)  "
+                        "|grad|=%.3e  (E_davidson [Davidson-GPU]: elec=%.10f "
+                        "total(+nuc)=%.10f  best-so-far(total) = %s)",
                         i, e_opt, grad_norm,
+                        float(_rdm_e), float(_rdm_e) + _nuc,
                         f"{e_solver:.10f}" if e_solver is not None else "n/a",
                     )
 
@@ -404,21 +493,26 @@ def riken_sqd_de(
                     #     (generalized Brillouin condition, the criterion CASSCF codes use). No
                     #     external DMRG/FCI floor needed -> valid for large systems.
                     # (2) Self-consistency guard: the orbital-optimization energy is computed on
-                    #     the PREVIOUS trial's FIXED RDMs. If it runs far below the solver energy
-                    #     of the SAME state, the fixed RDMs have decoupled from the rotated
-                    #     Hamiltonian (non-variational artifact). Detect that divergence and stop
-                    #     rotating rather than propagate a spurious basis.
-                    oo_gtol = getattr(parameters, "oo_grad_tol", 1e-3)
+                    #     the current trial's RDMs, held fixed only during this OO call. The next
+                    #     Davidson trial refreshes the RDMs. If it runs far below the solver
+                    #     energy of the SAME state, the trial-RDM objective has decoupled from the
+                    #     rotated Hamiltonian (non-variational artifact). Detect that divergence
+                    #     and stop rotating rather than propagate a spurious basis.
+                    oo_gtol = (
+                        float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
+                        else getattr(parameters, "oo_grad_tol", 1e-3)
+                    )
                     oo_sc_tol = getattr(parameters, "oo_selfconsistency_tol", 0.05)  # 50 mHa
                     diverged = (e_solver is not None) and (e_opt < e_solver - oo_sc_tol)
                     if diverged:
                         logger.warning(
                             "Trial %d: OO energy %.6f is %.1f mHa below the solver energy %.6f "
-                            "-> fixed-RDM decoupling (non-variational). NOT rotating; stopping OO.",
+                            "-> trial-RDM objective decoupling (non-variational). NOT rotating; stopping OO.",
                             i, e_opt, (e_solver - e_opt) * 1000.0, e_solver,
                         )
                         do_orbital_opt = False  # freeze the basis; keep running DE without OO
                     else:
+                        _elec_props_before_oo = elec_props
                         elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                         logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
 
@@ -444,21 +538,36 @@ def riken_sqd_de(
                                     _e_check = float(_check_r.energy)
                                     logger.info(
                                         "Trial %d: OO_CHECK [Davidson-GPU, same subspace, rotated H]:\n"
-                                        "  E_davidson(before OO) [Davidson-GPU]:  %.10f\n"
-                                        "  E_oo(fixed-RDM)       [JAX L-BFGS-B]:  %.10f\n"
-                                        "  E_check(after OO)     [Davidson-GPU]:  %.10f  (dE=%.1f mHa from before)",
-                                        i, _rdm_e, e_opt, _e_check, (_e_check - _rdm_e) * 1000,
+                                        "  E_davidson(before OO) [Davidson-GPU, total]: %.10f\n"
+                                        "  E_oo(trial-RDM; frozen within OO step) [L-BFGS-B objective, total]: %.10f\n"
+                                        "  E_check(after OO)     [Davidson-GPU]: elec=%.10f "
+                                        "total(+nuc)=%.10f  (dE=%.1f mHa from before)",
+                                        i,
+                                        float(_rdm_e) + float(_elec_props_before_oo.nuclear_repulsion_energy),
+                                        e_opt,
+                                        _e_check,
+                                        _e_check + float(elec_props.nuclear_repulsion_energy),
+                                        (_e_check - _rdm_e) * 1000,
                                     )
+                                    if _e_check > _rdm_e:
+                                        elec_props = _elec_props_before_oo
+                                        _oo_prediction = None
+                                        logger.warning(
+                                            "Trial %d: OO_CHECK energy increased by %.3e Ha "
+                                            "-> rolling back OO rotation; keeping pre-OO integrals.",
+                                            i, _e_check - _rdm_e,
+                                        )
+                                        continue
                                 except Exception:
                                     logger.exception("Trial %d: OO_CHECK failed.", i)
 
                         # CC refresh (if needed) is now triggered by stagnation detection above
                         _oo_prediction = {
                             "trial": i,
-                            "e_davidson_source": float(_rdm_e),
+                            "e_davidson_source": float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
                             "e_oo_estimate": float(e_opt),
-                            "method": "fixed-RDM",
-                            "method_detail": "JAX L-BFGS-B, fixed RDM",
+                            "method": "trial-RDM",
+                            "method_detail": "L-BFGS-B objective; trial RDM frozen within OO step",
                         }
                         oo_de_tol = getattr(parameters, "oo_de_tol", 1e-4)
                         delta_e_oo = (e_solver - e_opt) if e_solver is not None else None
