@@ -409,17 +409,16 @@ def riken_sqd_de(
                                     ))
                                     _e_check = float(_check_r.energy)
                                     logger.info(
-                                        "Trial %d: OO_CHECK [Davidson-GPU, full original "
-                                        "subspace, rotated H]:\n"
-                                        "  E_davidson(before OO) [Davidson-GPU, total]:  %.10f\n"
-                                        "  E_sc(truncated OO-SC, total) [fresh RDM per "
-                                        "macro-step]: %.10f\n"
-                                        "  E_check(after OO)     [Davidson-GPU]: elec=%.10f "
-                                        "total(+nuc)=%.10f  (dE=%.1f mHa from before)",
+                                        "Trial %d: OO_CHECK [Davidson-GPU, full original subspace, "
+                                        "rotated H] (all energies total, incl. nuclear repulsion):\n"
+                                        "  E_before = E_davidson before OO                           : %.10f\n"
+                                        "  E_sc     = truncated OO-SC energy (fresh RDM per macro-step): %.10f  "
+                                        "(different subspace/definition -- not directly comparable)\n"
+                                        "  E_after  = E_davidson after OO (full subspace, rotated H)  : %.10f\n"
+                                        "  true OO effect = E_after - E_before = %+.4f mHa",
                                         i,
                                         float(_rdm_e) + float(_elec_props_before_oo.nuclear_repulsion_energy),
                                         e_sc,
-                                        _e_check,
                                         _e_check + float(elec_props.nuclear_repulsion_energy),
                                         (_e_check - _rdm_e) * 1000,
                                     )
@@ -537,15 +536,16 @@ def riken_sqd_de(
                                     ))
                                     _e_check = float(_check_r.energy)
                                     logger.info(
-                                        "Trial %d: OO_CHECK [Davidson-GPU, same subspace, rotated H]:\n"
-                                        "  E_davidson(before OO) [Davidson-GPU, total]: %.10f\n"
-                                        "  E_oo(trial-RDM; frozen within OO step) [L-BFGS-B objective, total]: %.10f\n"
-                                        "  E_check(after OO)     [Davidson-GPU]: elec=%.10f "
-                                        "total(+nuc)=%.10f  (dE=%.1f mHa from before)",
+                                        "Trial %d: OO_CHECK [Davidson-GPU, same subspace, rotated H] "
+                                        "(all energies total, incl. nuclear repulsion):\n"
+                                        "  E_before = E_davidson before OO                          : %.10f\n"
+                                        "  E_oo     = fixed trial-RDM L-BFGS objective on rotated H  : %.10f  "
+                                        "(different definition; may dip below E_before via RDM/H decoupling -- not directly comparable)\n"
+                                        "  E_after  = E_davidson after OO (same subspace, rotated H) : %.10f\n"
+                                        "  true OO effect = E_after - E_before = %+.4f mHa",
                                         i,
                                         float(_rdm_e) + float(_elec_props_before_oo.nuclear_repulsion_energy),
                                         e_opt,
-                                        _e_check,
                                         _e_check + float(elec_props.nuclear_repulsion_energy),
                                         (_e_check - _rdm_e) * 1000,
                                     )
@@ -569,17 +569,30 @@ def riken_sqd_de(
                             "method": "trial-RDM",
                             "method_detail": "L-BFGS-B objective; trial RDM frozen within OO step",
                         }
-                        oo_de_tol = getattr(parameters, "oo_de_tol", 1e-4)
-                        delta_e_oo = (e_solver - e_opt) if e_solver is not None else None
+                        # NOT a true OO energy gain. e_solver is the best-so-far Davidson
+                        # eigenvalue (variational, on the truncated CI subspace); e_opt is the
+                        # fixed-trial-RDM L-BFGS objective on the rotated H. Their difference is the
+                        # fixed-RDM / rotated-H DECOUPLING GAP -- how far the objective sits below
+                        # the variational energy -- not an energy change. The true post-OO energy on
+                        # the same subspace is the OO_CHECK line above (E_after - E_before). The
+                        # basis is frozen on the orbital-gradient (Brillouin) criterion, not this gap.
+                        objective_gap = (e_opt - e_solver) if e_solver is not None else None
                         logger.info(
-                            "Trial %d: OO energy gain dE=%s Ha (|g|=%.3e, oo_de_tol=%.1e).",
-                            i, f"{delta_e_oo:.3e}" if delta_e_oo is not None else "n/a",
-                            grad_norm, oo_de_tol,
+                            "Trial %d: OO objective vs solver energy (decoupling diagnostic, NOT a "
+                            "true gain): E_oo(fixed trial-RDM, L-BFGS, total)=%.10f minus "
+                            "E_solver(best-so-far, Davidson, total)=%s = %s Ha "
+                            "(negative => objective dipped below the variational energy; see OO_CHECK "
+                            "for the real post-OO energy). |grad|=%.3e (oo_gtol=%.1e).",
+                            i, e_opt,
+                            f"{e_solver:.10f}" if e_solver is not None else "n/a",
+                            f"{objective_gap:+.3e}" if objective_gap is not None else "n/a",
+                            grad_norm, oo_gtol,
                         )
                         if grad_norm < oo_gtol and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
-                                "Trial %d: OO dE=%.3e Ha < %.1e -> gain negligible. Freezing basis.",
-                                i, delta_e_oo, oo_de_tol,
+                                "Trial %d: |grad|=%.3e < oo_gtol=%.1e -> orbitals stationary "
+                                "(generalized Brillouin condition). Freezing basis.",
+                                i, grad_norm, oo_gtol,
                             )
                             do_orbital_opt = False
                 except Exception:
