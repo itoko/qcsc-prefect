@@ -200,6 +200,61 @@ int main(int argc, char * argv[]) {
       std::cout << "Wrote RDM files (do_rdm=" << do_rdm << "): rdm1_a/b.txt, rdm2_aa/ab/bb.txt"
                 << std::endl;
     }
+
+    // ── In-process RDM-contracted energy (diagnostic; ported from tpb_main.cc:266-317) ──────
+    // Contract the SAME FCIDUMP just loaded here with the SAME RDMs sbd::tpb::diag returned, in a
+    // single process. This makes E_RDM_recon and E_davidson (printed above) directly comparable
+    // without any FCIDUMP round-trip or Python contraction in between, discriminating:
+    //   E_RDM_recon == Davidson energy  -> native is self-consistent; any Python-side Delta is a
+    //                                      FCIDUMP round-trip / integral-convention mismatch.
+    //   E_RDM_recon != Davidson energy  -> native's energy-W and RDM-W differ (solver-side bug).
+    // Uses native's own SetupIntegrals (I0/I1/I2) and index layout, identical to the reference app.
+    if( one_p_rdm.size() != 0 ) {
+      double zerobody = 0.0;
+      double onebody = 0.0;
+      double twobody = 0.0;
+      double I0;
+      sbd::oneInt<double> I1;
+      sbd::twoInt<double> I2;
+      sbd::SetupIntegrals(fcidump,L,N,I0,I1,I2);
+      zerobody = I0;
+      // UHF per-spin contraction: spin-orbital index = 2*orbital + spin (0=alpha, 1=beta).
+      // The earlier version used I1.Value(2io,2jo) / I2.Value(2io,2ia,2jo,2ja) for ALL blocks,
+      // i.e. alpha spin-orbital integrals everywhere -- correct only for RHF. For the spin-expanded
+      // UHF FCIDUMP each block must use its own spin indices, or the beta/opposite-spin pieces are
+      // contracted against the wrong integrals (an RHF-convention artifact, not the RDM's fault).
+      //   1-RDM: block s (0=a,1=b)         -> I1.Value(2io+s, 2jo+s)
+      //   2-RDM: block s+2t (0=aa,1=ba,2=ab,3=bb) -> I2.Value(2io+s, 2ia+s, 2jo+t, 2ja+t)
+      for(int s=0; s < 2; s++) {
+        for(int io=0; io < L; io++) {
+          for(int jo=0; jo < L; jo++) {
+            onebody += I1.Value(2*io+s, 2*jo+s) * one_p_rdm[s][io+L*jo];
+          }
+        }
+      }
+      for(int s=0; s < 2; s++) {
+        for(int t=0; t < 2; t++) {
+          const std::vector<double> & g2 = two_p_rdm[s + 2*t];
+          for(int io=0; io < L; io++) {
+            for(int jo=0; jo < L; jo++) {
+              for(int ia=0; ia < L; ia++) {
+                for(int ja=0; ja < L; ja++) {
+                  twobody += 0.5 * I2.Value(2*io+s, 2*ia+s, 2*jo+t, 2*ja+t)
+                             * g2[io+L*jo+L*L*ia+L*L*L*ja];
+                }
+              }
+            }
+          }
+        }
+      }
+      std::cout << " [RDM-CHECK] Zero-Body energy = " << zerobody << std::endl;
+      std::cout << " [RDM-CHECK] One-Body energy = " << onebody << std::endl;
+      std::cout << " [RDM-CHECK] Two-Body energy = " << twobody << std::endl;
+      std::cout << " [RDM-CHECK] Zero+One+Two-Body (E_RDM_recon) = " << zerobody + onebody + twobody << std::endl;
+      std::cout << " [RDM-CHECK] Davidson energy (E_davidson)    = " << energy << std::endl;
+      std::cout << " [RDM-CHECK] Delta (E_RDM_recon - E_davidson) = "
+                << (zerobody + onebody + twobody) - energy << std::endl;
+    }
   }
 
   /**
