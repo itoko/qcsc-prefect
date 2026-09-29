@@ -25,6 +25,24 @@ Verified: Python replica `|Δr2ab|_max = 6.9e-18`; GPU binary `diag-gpu_uhf_diag
 (NORB=20) `Delta(E_recon - E_davidson): +0.937 mHa -> -6.25e-13 Ha` (job 164204 -> 164217, 2026-09-26).
 See `note/24_sqd_rdm_signbug_fix_resolved.md`.
 
+## Numerical proof (PySCF-equivalent, CPU-only)
+
+`test_rdm_vs_pyscf.py` is a self-contained numerical proof of the fix, with a full write-up in
+`RDM_PYSCF_PROOF.md`. It is a pure-Python + PySCF replica of the correlation kernel (no GPU, no
+compiled SBD binary, zero production impact): it builds all four 2-RDM blocks + the 1-RDM from a
+genuine full-CI vector with both the original and patched kernel logic and compares element-wise to
+PySCF `make_rdm12s`. It shows that patched matches PySCF to ~1e-16 for every block and reconstructs
+the Davidson energy, while the original gets only the opposite-spin ab/ba block wrong (max|Δ| ~1e-2,
+`E_recon` off by ~1–9 mHa) with the 1-RDM and same-spin blocks unchanged.
+
+```bash
+cd ~/qcsc-prefect/algorithms/sbd
+# piggyback on a running allocation (no billing points needed):
+srun --jobid=<running jobid> --overlap -N1 -n1 .venv/bin/python native/patches/test_rdm_vs_pyscf.py
+# or standalone batch (needs points on qc-prj-other02):
+sbatch native/patches/run_rdm_pyscf_test.sbatch
+```
+
 ## Patches and provenance
 
 | patch | target clone | upstream | base HEAD | files |
@@ -58,3 +76,6 @@ cd sbd && git diff -- include/sbd/chemistry/basic/correlation_thrust.h \
 Propose the same fix upstream via fork + PR (push access not required):
 - `github.com/r-ccs-cms/sbd` (GPU 本命)
 - `github.com/rwakizaka/sbd` (MPI fork), if that fork is the long-term MPI source.
+
+Full migration plan — target repos/branches/base HEADs, the fix diff, PR title/body draft, the
+test-artifact strategy, and a pre-filing checklist — is in `UPSTREAM_PR_PLAN.md`.
