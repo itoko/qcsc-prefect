@@ -541,11 +541,13 @@ def optimize_orbitals(
         _oo_trace["it"] += 1
         fk = float(eval_obj(xk))
         if _use_jax:
-            gk = float(np.linalg.norm(np.asarray(grad_jax(xk))))
+            _gk_vec = np.asarray(grad_jax(xk))
+            gk = float(np.linalg.norm(_gk_vec))              # L2 norm
+            gk_max = float(np.max(np.abs(_gk_vec)))          # max-norm == scipy L-BFGS-B pgtol test
             log.info(
                 "  [OrbOpt] L-BFGS-B iter %3d: E_oo=%.10f Ha  dE=%+.3e (vs prev)  "
-                "dE=%+.3e (vs U=I)  |grad|=%.3e",
-                _oo_trace["it"], fk, fk - _oo_trace["prev"], fk - e_before, gk,
+                "dE=%+.3e (vs U=I)  |grad|_2=%.3e  |grad|_inf=%.3e (pgtol)",
+                _oo_trace["it"], fk, fk - _oo_trace["prev"], fk - e_before, gk, gk_max,
             )
         else:
             log.info(
@@ -567,19 +569,21 @@ def optimize_orbitals(
     # Orbital gradient norm at the solution -- the MCSCF convergence signal (Brillouin g->0).
     # Use the analytical JAX gradient when available; else a cheap central finite-difference.
     if _use_jax:
-        grad_norm = float(np.linalg.norm(np.asarray(grad_jax(x_opt))))
+        _g_final = np.asarray(grad_jax(x_opt))
     else:
         h = 1e-6
-        g = np.empty_like(x_opt)
+        _g_final = np.empty_like(x_opt)
         for i in range(x_opt.size):
             xp = x_opt.copy(); xp[i] += h
             xm = x_opt.copy(); xm[i] -= h
-            g[i] = (eval_obj(xp) - eval_obj(xm)) / (2 * h)
-        grad_norm = float(np.linalg.norm(g))
+            _g_final[i] = (eval_obj(xp) - eval_obj(xm)) / (2 * h)
+    grad_norm = float(np.linalg.norm(_g_final))          # L2 norm (reported historically)
+    grad_norm_max = float(np.max(np.abs(_g_final)))      # max-norm == scipy L-BFGS-B pgtol test
 
     log.info(
-        "  [OrbOpt] E after optimization (jax calculation): %.10f Ha  ΔE=%.4e  |grad|=%.3e  converged=%s  nit=%d",
-        e_after, e_after - e_before, grad_norm, res.success, res.nit,
+        "  [OrbOpt] E after optimization (jax calculation): %.10f Ha  ΔE=%.4e  "
+        "|grad|_2=%.3e  |grad|_inf=%.3e (pgtol)  converged=%s  nit=%d",
+        e_after, e_after - e_before, grad_norm, grad_norm_max, res.success, res.nit,
     )
     if not res.success:
         log.warning("  [OrbOpt] optimizer status=%d: %s", res.status, res.message)
@@ -693,7 +697,7 @@ def resolve_orbitals_self_consistent(
     num_elec: tuple[int, int] | None = None,
     resolve_maxdim: int | None = 4_000_000,
     max_macro: int = 20,
-    grad_tol: float = 1e-3,
+    grad_tol: float = 1e-5,
     energy_tol: float = 1e-7,
     trust_radius: float = 0.1,
     oo_maxiter: int = 40,
@@ -861,6 +865,7 @@ def resolve_orbitals_self_consistent(
             Ua, Ub, e_oo, grad_norm = optimize_orbitals(
                 ep, rdm1_aa, rdm1_bb, rdm2_aa, rdm2_ab, rdm2_bb,
                 rdm2_notation=_resolve_notation, trust_radius=tr, maxiter=oo_maxiter, use_jax=use_jax,
+                gtol=grad_tol,  # inner L-BFGS-B pgtol unified with the SC macro tol (OO_GRAD_TOL)
             )
             ep_try = rotate_electronic_properties(ep, Ua, Ub)
             e_try, _ = _resolve_diagonalize(ci, ep_try, want_rdms=False)

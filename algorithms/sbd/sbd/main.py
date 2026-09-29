@@ -352,9 +352,12 @@ def riken_sqd_de(
                             best_sbd_result.betadets,
                             num_elec=elec_props.num_electrons,
                             resolve_maxdim=getattr(parameters, "oo_resolve_maxdim", 4_000_000),
+                            # OO_GRAD_TOL (default 1e-5) drives BOTH the SC macro Brillouin
+                            # convergence AND the inner L-BFGS-B pgtol (threaded through inside
+                            # resolve_orbitals_self_consistent). One knob for the whole OO stack.
                             grad_tol=(
                                 float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
-                                else getattr(parameters, "oo_grad_tol", 1e-3)
+                                else getattr(parameters, "oo_grad_tol", 1e-5)
                             ),
                             trust_radius=(
                                 float(os.environ["OO_TRUST"]) if "OO_TRUST" in os.environ
@@ -436,7 +439,7 @@ def riken_sqd_de(
 
                         _grad_tol_sc = (
                             float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
-                            else getattr(parameters, "oo_grad_tol", 1e-3)
+                            else getattr(parameters, "oo_grad_tol", 1e-5)
                         )
                         if grad_sc < _grad_tol_sc and not getattr(parameters, "oo_refire_every_trial", False):
                             logger.info(
@@ -449,6 +452,13 @@ def riken_sqd_de(
                         )
                     continue  # skip the fixed-RDM path below
 
+                # OO_GRAD_TOL (default 1e-5) is the single OO convergence knob: it feeds BOTH the
+                # inner L-BFGS-B pgtol (gtol= below) AND the outer Brillouin-freeze test further
+                # down. Read once here so both use the identical value.
+                oo_gtol = (
+                    float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
+                    else getattr(parameters, "oo_grad_tol", 1e-5)
+                )
                 try:
                     Ua, Ub, e_opt, grad_norm = optimize_orbitals(
                         elec_props=elec_props,
@@ -473,6 +483,9 @@ def riken_sqd_de(
                             int(os.environ["OO_MAXITER"]) if "OO_MAXITER" in os.environ
                             else getattr(parameters, "oo_maxiter", 300)
                         ),
+                        # Inner L-BFGS-B convergence tolerance (scipy pgtol), unified with the
+                        # outer freeze and the initial/SC OO via the same OO_GRAD_TOL knob.
+                        gtol=oo_gtol,
                         davidson_ref_energy=float(_rdm_e) if _rdm_e is not None else None,
                     )
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
@@ -497,10 +510,7 @@ def riken_sqd_de(
                     #     energy of the SAME state, the trial-RDM objective has decoupled from the
                     #     rotated Hamiltonian (non-variational artifact). Detect that divergence
                     #     and stop rotating rather than propagate a spurious basis.
-                    oo_gtol = (
-                        float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
-                        else getattr(parameters, "oo_grad_tol", 1e-3)
-                    )
+                    # (oo_gtol was read once above, before the optimize_orbitals call.)
                     oo_sc_tol = getattr(parameters, "oo_selfconsistency_tol", 0.05)  # 50 mHa
                     diverged = (e_solver is not None) and (e_opt < e_solver - oo_sc_tol)
                     if diverged:

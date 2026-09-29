@@ -535,9 +535,11 @@ def _apply_initial_oo(
     refreshed UCCSD energy is at or below the pre-OO UCCSD energy (safe fallback to the
     un-rotated reference).
 
-    Thresholds are shared with the DE-loop OO (see sbd/main.py): ``OO_GRAD_TOL`` (1e-3),
-    ``OO_TRUST`` (0.5), ``OO_MAXITER`` (300) -- identical env names and defaults so "all
-    criteria are aligned from the initial OO onward".
+    Thresholds are aligned with the DE-loop OO (see sbd/main.py) through one shared knob:
+    ``OO_GRAD_TOL`` (default 1e-5) drives the inner L-BFGS-B pgtol on EVERY OO path (this initial
+    OO, the DE-loop fixed-RDM OO, and the self-consistent resolve OO) AND the outer Brillouin-freeze
+    / SC-macro convergence. ``OO_TRUST`` (0.5) and ``OO_MAXITER`` (300) likewise share env names
+    and defaults with the DE-loop OO.
     """
     from qcsc_workflow_utility.orbital_opt import (
         optimize_orbitals,
@@ -551,10 +553,12 @@ def _apply_initial_oo(
     # physicist convention optimize_orbitals expects (dm1[p,q] = <q^dag p>), so no transpose.
     d2aa, d2ab, d2bb = mycc.make_rdm2()
 
-    gtol = float(os.environ.get("OO_GRAD_TOL", "1e-3"))
+    gtol = float(os.environ.get("OO_GRAD_TOL", "1e-5"))
     trust = float(os.environ.get("OO_TRUST", "0.5"))
     maxiter = int(os.environ.get("OO_MAXITER", "300"))
 
+    # Inner L-BFGS-B convergence (scipy pgtol) is driven by the shared OO_GRAD_TOL knob (default
+    # 1e-5), identical to the DE-loop and SC OO paths.
     Ua, Ub, e_oo, grad_norm = optimize_orbitals(
         props,
         np.asarray(dm_cc_a),
