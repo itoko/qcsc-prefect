@@ -184,7 +184,7 @@ job script (see Section 6).
 config-file / deployment knobs, distinct from the env vars above; each has a long
 docstring in the file):
 
-`oo_grad_tol`, `oo_trust_radius`, `oo_maxiter`, `oo_selfconsistency_tol`, `oo_de_tol`,
+`oo_grad_tol`, `oo_trust_radius`, `oo_maxiter`, `oo_de_tol`,
 `oo_resolve_rdms`, `oo_resolve_maxdim`, `oo_resolve_backend`, `oo_refire_every_trial`.
 
 Use these when you drive the flow through a Prefect deployment / config file. Use the

@@ -361,19 +361,6 @@ class FlowParameters(BaseModel):
         title="OO Max Iterations",
         ge=1,
     )
-    oo_selfconsistency_tol: float = Field(
-        default=0.05,
-        description=(
-            "Self-consistency guard (Ha) for the two-step MCSCF loop. The orbital-optimization "
-            "energy is evaluated on the PREVIOUS trial's FIXED RDMs; if it drops more than this "
-            "below the solver energy of the same state, the fixed RDMs have decoupled from the "
-            "rotated Hamiltonian (a non-variational artifact -- the energy would appear to fall "
-            "below the true ground state). The loop then stops rotating and freezes the basis. "
-            "Default 0.05 Ha (50 mHa)."
-        ),
-        title="OO Self-Consistency Tolerance",
-        gt=0.0,
-    )
     oo_de_tol: float = Field(
         default=1e-4,
         description="OO stop threshold on per-trial energy gain (solver_energy - OO_energy).",
