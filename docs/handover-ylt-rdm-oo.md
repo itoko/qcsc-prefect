@@ -174,9 +174,9 @@ job script (see Section 6).
 | `OO_SAT_STAGNATION` | 2 | Trials of stagnation before a CC refresh triggers. |
 | `OO_DE_TOL` | 1e-3 | DE-loop OO tolerance. |
 | `SEED_CCSD_MAX_CYCLE` | 200 | Max CCSD cycles for the seed refresh. |
-| `SBD_UHF_CACHE` | on | Cache converged BS-UHF MOs so every run starts from an identical reference (Fe4S4's ~400-cycle SCF is sensitive to BLAS ordering). |
-| `SBD_UHF_CACHE_DIR` | `~/.cache/qcsc_uhf` | Where that cache lives. |
-| `FE4S4_AF_GROUPS` | (unset) | Atom-localized antiferromagnetic guess (pre-existing). |
+| `SBD_UHF_CACHE` **(removed in `rhf-input`; see rhf2bsuhf)** | on | Cache converged BS-UHF MOs so every run starts from an identical reference (Fe4S4's ~400-cycle SCF is sensitive to BLAS ordering). |
+| `SBD_UHF_CACHE_DIR` **(removed in `rhf-input`; see rhf2bsuhf)** | `~/.cache/qcsc_uhf` | Where that cache lives. |
+| `FE4S4_AF_GROUPS` **(removed in `rhf-input`; see rhf2bsuhf)** | (unset) | Atom-localized antiferromagnetic guess (pre-existing). |
 
 ### B.3 Prefect `FlowParameters` fields
 

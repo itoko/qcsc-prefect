@@ -4,10 +4,6 @@ Before layering anything on top (orbital optimization, CISD injection, ...), the
 that the classical reference the whole SQD pipeline is seeded from is physically correct:
 
   * RHF vs UHF are NOT mixed (restricted stays restricted; unrestricted is genuinely unrestricted).
-  * UHF reaches the true (broken-symmetry when it exists) minimum for correlated singlets, instead
-    of collapsing to the RHF stationary point -- the bug that made "UHF" == "RHF" for the Fe-S
-    singlets and made the UCCSD seed/amplitudes restricted in disguise.
-  * The variational ordering RHF >= UHF >= FCI holds.
   * Spin: <S^2> is ~0 for a genuine closed-shell singlet, ~2 for a triplet, ~0.75 (+contamination)
     for a doublet, and the (na, nb) sector matches the requested 2Sz.
   * ElectronicProperties shapes/blocks are consistent (UHF carries the beta / ab / bb blocks and
@@ -60,44 +56,8 @@ def _fci_energy(atom, spin):
     return float(fci.FCI(mf).kernel()[0])
 
 
-# ── mean-field level: _converge_broken_symmetry_uhf ─────────────────────────────────────────
-
-class TestUHFMeanField:
-    def test_stretched_singlet_breaks_symmetry(self):
-        """Strongly-correlated H4 singlet: UHF must break spin symmetry and drop well below RHF."""
-        mol = gto.M(atom=H4_STRETCHED, basis="sto-3g", spin=0, verbose=0)
-        e_rhf = _rhf(H4_STRETCHED).e_tot
-        mf = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
-        ss, _ = mf.spin_square()
-        assert ss > 0.5, f"UHF stayed restricted (<S^2>={ss:.3f}) on a correlated singlet"
-        assert mf.e_tot < e_rhf - 1e-2, f"UHF {mf.e_tot:.6f} not below RHF {e_rhf:.6f}"
-        assert mf.e_tot >= _fci_energy(H4_STRETCHED, 0) - 1e-8, "UHF below FCI (non-variational!)"
-
-    def test_equilibrium_singlet_stays_restricted(self):
-        """Weakly-correlated H4 singlet: NO spin instability exists, so UHF must equal RHF
-        (<S^2>=0). The fix must not spuriously break symmetry where it shouldn't."""
-        mol = gto.M(atom=H4_EQUILIBRIUM, basis="sto-3g", spin=0, verbose=0)
-        e_rhf = _rhf(H4_EQUILIBRIUM).e_tot
-        mf = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
-        ss, _ = mf.spin_square()
-        assert ss < 1e-3, f"UHF spuriously broke symmetry (<S^2>={ss:.3e}) at equilibrium"
-        assert abs(mf.e_tot - e_rhf) < 1e-6, f"UHF {mf.e_tot:.8f} != RHF {e_rhf:.8f} at equilibrium"
-
-    def test_triplet_spin(self):
-        """H4 triplet (2Sz=2): <S^2> should be ~2 (S=1 -> S(S+1)=2) and energy >= FCI."""
-        mol = gto.M(atom=H4_TRIPLET, basis="sto-3g", spin=2, verbose=0)
-        mf = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
-        ss, _ = mf.spin_square()
-        assert abs(ss - 2.0) < 0.15, f"triplet <S^2>={ss:.3f} not ~2.0"
-        assert mf.e_tot >= _fci_energy(H4_TRIPLET, 2) - 1e-8, "triplet UHF below FCI"
-
-    def test_doublet_spin(self):
-        """H5 doublet (2Sz=1): <S^2> near 0.75 (+ some contamination), energy >= FCI."""
-        mol = gto.M(atom=H5_DOUBLET, basis="sto-3g", spin=1, verbose=0)
-        mf = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
-        ss, _ = mf.spin_square()
-        assert 0.7 <= ss < 1.5, f"doublet <S^2>={ss:.3f} out of expected range"
-        assert mf.e_tot >= _fci_energy(H5_DOUBLET, 1) - 1e-8, "doublet UHF below FCI"
+# The BS-UHF mean-field tests (_converge_broken_symmetry_uhf) moved to uhf_sqd_oo/rhf2bsuhf/tests
+# together with the code.
 
 
 # ── ElectronicProperties level: compute_molecular_integrals_from_geometry ───────────────────
@@ -151,20 +111,3 @@ class TestElectronicPropertiesConsistency:
         )
         na, nb = ep_d.num_electrons
         assert na - nb == 1, f"doublet (na,nb)=({na},{nb}) does not give 2Sz=1"
-
-
-# ── end-to-end invariant: RHF >= UHF (>= FCI) via the pipeline, not mixed ───────────────────
-
-class TestVariationalOrdering:
-    @pytest.mark.parametrize("atom,spin", [(H4_STRETCHED, 0), (H4_EQUILIBRIUM, 0)])
-    def test_uhf_le_rhf_le_none_via_pipeline(self, atom, spin):
-        """The pipeline's UHF mean-field energy must be <= its RHF mean-field energy and >= FCI.
-        (Uses the mean-field energies the pipeline actually converges, ensuring the reference the
-        SQD seed is built from respects the variational ordering and is not restricted-in-disguise
-        for the strongly-correlated case.)"""
-        e_rhf = _rhf(atom, spin).e_tot
-        mol = gto.M(atom=atom, basis="sto-3g", spin=spin, verbose=0)
-        mf_u = chem._converge_broken_symmetry_uhf(scf.UHF(mol))
-        e_fci = _fci_energy(atom, spin)
-        assert mf_u.e_tot <= e_rhf + 1e-9, f"UHF {mf_u.e_tot:.6f} > RHF {e_rhf:.6f}"
-        assert mf_u.e_tot >= e_fci - 1e-8, f"UHF {mf_u.e_tot:.6f} < FCI {e_fci:.6f}"

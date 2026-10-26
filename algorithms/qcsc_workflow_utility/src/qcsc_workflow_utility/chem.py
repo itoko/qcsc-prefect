@@ -17,6 +17,8 @@ from pydantic import BaseModel
 from pydantic_numpy.helper.annotation import NpArrayPydanticAnnotation
 from pyscf import ao2mo, cc, gto, scf, tools
 
+from .uhf_fcidump import check_aufbau_order, read_uhf_fcidump
+
 # Pydantic Types
 NpStrict1DArrayF64 = Annotated[
     np.ndarray[tuple[int,], np.dtype[np.float64]],
@@ -66,295 +68,6 @@ class ElectronicProperties(BaseModel):
     # UCCSD t2 mixed (t2ab) and beta-beta (t2bb) amplitudes; t2aa stays in t2.
     t2_ab: NpStrict4DArrayF64 | None = None
     t2_bb: NpStrict4DArrayF64 | None = None
-
-
-def _parse_af_groups() -> dict | None:
-    """Parse the FE4S4_AF_GROUPS env var into an atom-localized AF-guess spec, or None.
-
-    Format (JSON): {"fe1":[2,3,4,5,6], "fe2":[7,8,9,10,11], ..., "up":["fe1","fe3"],
-    "down":["fe2","fe4"]}. Fragments listed in "up"/"down" are alpha/beta spin-polarized; all other
-    fragments are treated as closed (doubly occupied). Enables the Noodleman broken-symmetry guess in
-    _converge_broken_symmetry_uhf for Fe-S cubanes (~33 mHa lower reference than energy-ordered).
-
-    Convenience: FE4S4_AF_GROUPS="fe4s4" expands to the standard [Fe4S4(SCH3)4]2- MO grouping
-    (l1=0-1, fe1=2-6, fe2=7-11, s=12-23, fe3=24-28, fe4=29-33, l2=34-35) with the Singlet-I pairing
-    (Fe1,Fe3 up / Fe2,Fe4 down), matching the reference that reaches -326.801 (<S^2>~7.6).
-
-    Two extra env knobs tune the guess toward the physical super-exchange regime (local sweep found
-    p=0.6 + free bridging S gives the deepest BS-UCCSD -327.143 and a smaller <S^2>, vs -327.102 at
-    the default p=1.0):
-      FE4S4_AF_POL   (float, default 1.0): Fe spin-polarization amplitude. p=1 -> full 1.0/0.0 split
-                     (maximally localized, large <S^2>); p<1 -> 0.5(1+/-p) split so the sublattices
-                     couple more (smaller <S^2>).
-      FE4S4_AF_FREE_S (0/1, default 0): seed the bridging S 3p fragment half-filled/unpolarized so it
-                     MEDIATES the Fe-Fe exchange (the paper's principal singlet-triplet pathway),
-                     instead of forcing it doubly-occupied.
-    These attach as extra keys ("pol", "free") on the returned dict, consumed by _af_guess_uhf.
-    """
-    import json
-
-    raw = os.environ.get("FE4S4_AF_GROUPS", "").strip()
-    if not raw:
-        return None
-    if raw.lower() == "fe4s4":
-        spec = {
-            "l1": list(range(0, 2)),
-            "fe1": list(range(2, 7)),
-            "fe2": list(range(7, 12)),
-            "s": list(range(12, 24)),
-            "fe3": list(range(24, 29)),
-            "fe4": list(range(29, 34)),
-            "l2": list(range(34, 36)),
-            # Pairing from the collaborator who built the FCIDUMP (verified 2026-07-13): up={fe1,fe2}
-            # down={fe3,fe4} reaches the deepest BS basin (-326.801) at full polarization directly,
-            # more robustly than the earlier {fe1,fe3}/{fe2,fe4} guess (which needed pol=0.6+free-S).
-            "up": ["fe1", "fe2"],
-            "down": ["fe3", "fe4"],
-        }
-    else:
-        try:
-            spec = json.loads(raw)
-        except Exception:
-            warnings.warn(f"FE4S4_AF_GROUPS could not be parsed as JSON: {raw!r}; ignoring.")
-            return None
-    # Optional fractional-polarization + free-bridging-S knobs (apply to any spec).
-    try:
-        spec["pol"] = float(os.environ.get("FE4S4_AF_POL", "1.0"))
-    except Exception:
-        spec["pol"] = 1.0
-    if os.environ.get("FE4S4_AF_FREE_S", "0") == "1" and "free" not in spec:
-        # default the bridging-S fragment name to "s" (present in the fe4s4 convenience spec)
-        if "s" in spec:
-            spec["free"] = ["s"]
-    return spec
-
-
-def _converge_broken_symmetry_uhf(mf, max_follow: int = 5, af_groups: dict | None = None):
-    """Drive a UHF calculation to the genuine (possibly spin-broken) solution.
-
-    For a closed-shell singlet, plain UHF started from the RHF density stays at the RHF solution
-    (the RHF determinant is a stationary point of the UHF equations) -- so ``mf.to_uhf().kernel()``
-    returns an *effectively restricted* reference (<S^2> = 0, identical energy). For strongly
-    correlated systems (e.g. Fe-S clusters) the true UHF is lower in energy and spin-broken; seeding
-    the LUCJ ansatz / UCCSD amplitudes from the unbroken solution is a restricted reference in
-    disguise and defeats the point of running UHF.
-
-    This runs UHF, then iteratively performs an internal STABILITY analysis: if the current solution
-    is unstable, it rebuilds the density from the lowest instability mode and re-converges (via
-    Newton), following the instability down to a stable (broken-symmetry when appropriate) minimum.
-    This is the standard PySCF recipe for reaching the true UHF solution.
-
-    IMPORTANT (Fe-S cubanes): for [4Fe-4S] the internal stability analysis from a SYMMETRIC guess
-    stays in the spin-pure (RHF) basin (<S^2>=0, -326.547) -- it does NOT find the antiferromagnetic
-    broken-symmetry minimum, because breaking the spatial symmetry to localize the Fe spins requires
-    a spin-IMBALANCED initial density, not just following an internal instability. So we FIRST try an
-    antiferromagnetic guess (promote a few beta electrons across the HOMO-LUMO gap, per the Noodleman
-    BS recipe), stability-follow that, and keep whichever solution (default vs AF-guess) is LOWER.
-    For Fe4S4 the AF guess reaches -326.767 (<S^2>~7.6), 219 mHa below the spin-pure solution.
-    """
-
-    def _follow_stability(m, n=max_follow):
-        stab = False
-        for _ in range(n):
-            new_mo = m.stability()[0]
-            cur = m.mo_coeff
-            if np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1]):
-                stab = True
-                break
-            m = m.newton().run(m.make_rdm1(new_mo, m.mo_occ))
-        return m, stab
-
-    def _follow_stability_external(m, n=10):
-        """Follow BOTH internal and EXTERNAL instabilities and keep the LOWEST iterate seen.
-
-        The Noodleman AF sublattice minima (Singlet-I/II/III) are near-degenerate and separated by
-        external (spin-symmetry-breaking) instabilities that plain internal following (_follow_
-        stability) does not cross -- it declares "stable" at the first internal minimum (~-326.769
-        for Fe4S4) and never reaches the lower external basin (~-326.801). Mirrors the collaborator
-        recipe: m.stability(return_status=True, external=True), rebuild, repeat, track the minimum."""
-        best = m
-        for _ in range(n):
-            res = m.stability(return_status=True, external=True)
-            mo = res[0]
-            stable_i, stable_e = res[-2], res[-1]
-            try:
-                # Pass the (external-)instability MO coefficients DIRECTLY to the Newton solver as
-                # the initial guess (not a density rebuilt from them): newton().run(mo_coeff) follows
-                # the external spin-symmetry-breaking mode into the lower AF basin, whereas
-                # run(make_rdm1(mo)) stalls at the higher internal minimum. This is the collaborator
-                # recipe and is what reaches -326.801 (vs -326.771 with the density rebuild).
-                m = m.newton().run(mo if isinstance(mo, tuple) else m.mo_coeff)
-            except Exception:
-                break
-            if m.e_tot < best.e_tot:
-                best = m
-            if stable_i and stable_e:
-                break
-        return best, True
-
-    def _af_guess_uhf(base, base_mol, base_hcore, base_ovlp, base_eri, base_nuc):
-        """A fresh plain scf.UHF (same integrals/mol) started from an AF spin-imbalanced density.
-        Returns the stability-followed result, or None if it fails. Tries a couple of promotion
-        widths. Built from a PLAIN scf.UHF on the mol (not base.__class__, which may be a
-        newton-wrapped SecondOrderUHF lacking a simple mol constructor)."""
-        try:
-            na, nb = base_mol.nelec
-        except Exception:
-            return None
-        n = base_mol.nao
-        best = None
-        for shift in (2, 1, 3):
-            if nb - shift < 0 or nb + shift > n:
-                continue
-            m = scf.UHF(base_mol)
-            # carry the FCIDUMP integral overrides if present
-            if base_hcore is not None:
-                m.get_hcore = lambda *a, **k: base_hcore
-            if base_ovlp is not None:
-                m.get_ovlp = lambda *a, **k: base_ovlp
-            if base_eri is not None:
-                m._eri = base_eri
-            if base_nuc is not None:
-                m.mol.energy_nuc = lambda *a: base_nuc
-            m.max_cycle = 400
-            m.conv_tol = 1e-9
-            mo = np.eye(n)
-            occ_a = list(range(na))
-            occ_b = list(range(nb - shift)) + list(range(nb, nb + shift))
-            dma = mo[:, occ_a] @ mo[:, occ_a].T
-            dmb = mo[:, occ_b] @ mo[:, occ_b].T
-            try:
-                m.kernel(dm0=(dma, dmb))
-                m, _ = _follow_stability(m)
-                if best is None or m.e_tot < best.e_tot:
-                    best = m
-            except Exception:
-                continue
-
-        # Atom-localized (Noodleman) AF guess: when an orbital->fragment map is supplied, seed the
-        # density so specific magnetic centers get spin-UP and the counter-set spin-DOWN (the true
-        # antiferromagnetic sublattices), instead of a chemistry-blind energy-ordered promotion. For
-        # Fe-S cubanes this lands in a ~33 mHa LOWER broken-symmetry basin than the energy-ordered
-        # guess (Fe4S4: -326.801 vs -326.768) -- the reference orbitals span the Fe-3d correlation
-        # far better, which is what SQD actually recovers on. `af_groups` maps fragment name ->
-        # list[orbital idx]; keys "up"/"down" list which fragments are alpha/beta-polarized, closed
-        # fragments (doubly occupied) are everything else. We stability-follow (external) and keep
-        # the lowest across all guesses.
-        if af_groups:
-            up = set(af_groups.get("up", []))
-            down = set(af_groups.get("down", []))
-            free = set(af_groups.get("free", []))  # fragments left half-filled (unpolarized)
-            # Fractional polarization amplitude p in [0,1]: p=1 -> full 1.0/0.0 spin split on the
-            # magnetic centers (maximally localized, large <S^2>); p<1 -> 0.5(1+/-p) split, letting
-            # the sublattices couple more (SMALLER <S^2>, closer to the physical super-exchange
-            # regime). The paper notes the singlet-triplet exchange runs through the bridging S 3p
-            # orbitals -- so "free" fragments (the bridging S) are seeded half-filled to MEDIATE that
-            # exchange rather than being forced doubly-occupied. Local sweep: p=0.6 + free bridging S
-            # gives the deepest BS-UCCSD (-327.143 vs -327.102 at p=1.0) and lowest <S^2>.
-            pol = af_groups.get("pol", 1.0)
-            frags = {
-                k: v for k, v in af_groups.items()
-                if k not in ("up", "down", "free", "pol")
-            }
-            dm0 = np.zeros((2, n, n))
-            for name, orbs in frags.items():
-                for x in orbs:
-                    if name in up:
-                        dm0[0, x, x] = 0.5 + 0.5 * pol
-                        dm0[1, x, x] = 0.5 - 0.5 * pol
-                    elif name in down:
-                        dm0[0, x, x] = 0.5 - 0.5 * pol
-                        dm0[1, x, x] = 0.5 + 0.5 * pol
-                    elif name in free:  # bridging exchange mediator: half-filled, unpolarized
-                        dm0[:, x, x] = 0.5
-                    else:  # closed fragment: doubly occupied
-                        dm0[:, x, x] = 1.0
-            m = scf.UHF(base_mol)
-            if base_hcore is not None:
-                m.get_hcore = lambda *a, **k: base_hcore
-            if base_ovlp is not None:
-                m.get_ovlp = lambda *a, **k: base_ovlp
-            if base_eri is not None:
-                m._eri = base_eri
-            if base_nuc is not None:
-                m.mol.energy_nuc = lambda *a: base_nuc
-            m.max_cycle = 400
-            m.conv_tol = 1e-9
-            try:
-                m.kernel(dm0=(dm0[0], dm0[1]))
-                # Follow external instabilities (10 rounds): the AF sublattice minima are
-                # near-degenerate (Singlet-I/II/III) and only EXTERNAL following reaches the lowest
-                # basin (~-326.801 for Fe4S4); internal-only following stalls at ~-326.769.
-                m, _ = _follow_stability_external(m, n=10)
-                if best is None or m.e_tot < best.e_tot:
-                    best = m
-            except Exception:
-                pass
-        return best
-
-    # Capture the mol + any FCIDUMP integral overrides from the ORIGINAL mf before newton-wrapping,
-    # so the AF-guess UHF can be rebuilt as a plain scf.UHF with the same Hamiltonian.
-    _base_mol = mf.mol
-    _base_hcore = mf.get_hcore() if callable(getattr(mf, "get_hcore", None)) else None
-    _base_ovlp = mf.get_ovlp() if callable(getattr(mf, "get_ovlp", None)) else None
-    _base_eri = getattr(mf, "_eri", None)
-    try:
-        _base_nuc = float(mf.mol.energy_nuc())
-    except Exception:
-        _base_nuc = None
-
-    mf.kernel()
-    stable = False
-    for _ in range(max_follow):
-        # stability() returns the (internal) stable MOs; if they differ from the current MOs the
-        # solution was unstable and we follow them down.
-        new_mo = mf.stability()[0]
-        # new_mo is (mo_a, mo_b); detect whether it changed (instability found).
-        cur = mf.mo_coeff
-        changed = not (
-            np.allclose(new_mo[0], cur[0]) and np.allclose(new_mo[1], cur[1])
-        )
-        if not changed:
-            stable = True
-            break  # stable -> genuine UHF minimum reached
-        dm = mf.make_rdm1(new_mo, mf.mo_occ)
-        mf = mf.newton().run(dm)
-
-    # Also try the antiferromagnetic broken-symmetry guess and keep whichever solution is LOWER.
-    # For closed-shell/RHF-basin cases the AF guess just returns to the same energy (no harm); for
-    # Fe-S cubanes it finds the genuine BS minimum the stability-only path misses.
-    af = _af_guess_uhf(mf, _base_mol, _base_hcore, _base_ovlp, _base_eri, _base_nuc)
-    if af is not None and af.converged and af.e_tot < mf.e_tot - 1e-6:
-        try:
-            ss_af, _ = af.spin_square()
-        except Exception:
-            ss_af = float("nan")
-        warnings.warn(
-            f"Broken-symmetry UHF found via AF guess: E={af.e_tot:.6f} <S^2>={ss_af:.3f} is "
-            f"{(mf.e_tot - af.e_tot) * 1000:.1f} mHa below the stability-only solution "
-            f"({mf.e_tot:.6f}). Using the broken-symmetry reference.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return af
-
-    # Robustness (audit P4): if the follow loop exhausted max_follow while still unstable, the
-    # returned reference is NOT a genuine minimum. Warn loudly and report the final <S^2> so a
-    # downstream seed built from a non-stable / spin-contaminated reference is visible, not silent.
-    if not stable:
-        try:
-            ss, _mult = mf.spin_square()
-        except Exception:
-            ss = float("nan")
-        warnings.warn(
-            f"UHF stability following did not converge to a stable solution after "
-            f"{max_follow} follows; returning the last iterate (<S^2>={ss:.4f}). The UHF "
-            f"reference may be non-stationary or spin-contaminated -- t2/occupancy seeds built "
-            f"from it should be treated with caution.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    return mf
 
 
 def _build_property(
@@ -418,84 +131,40 @@ def _build_property(
     )
 
 
-def _build_property_uhf(
-    mf: scf.UHF,
+def _build_property_from_uhf_integrals(
+    h1_a: np.ndarray,
+    h1_b: np.ndarray,
+    h2_aa: np.ndarray,
+    h2_ab: np.ndarray,
+    h2_bb: np.ndarray,
     norb: int,
+    nelec: tuple[int, int],
+    ecore: float,
     spin_sq: float,
     buf: io.StringIO,
-) -> ElectronicProperties:
-    """Build ElectronicProperties from an unrestricted (UHF) calculation.
+) -> tuple[ElectronicProperties, float, float]:
+    """Build unrestricted ElectronicProperties from MO-basis spin-block integrals alone.
 
-    Mirrors :func:`_build_property` but keeps separate alpha/beta MO coefficients, three
-    two-body integral blocks (aa, ab, bb), the UCCSD t2 tuple (t2aa, t2ab, t2bb), and per-spin
-    occupancies. The alpha blocks go into the base ElectronicProperties fields; beta / mixed
-    blocks go into the optional *_b / *_ab / *_bb fields.
+    The orbitals are taken as given (they are built OUTSIDE the workflow, e.g. by rhf2uhf /
+    rhf2bsuhf): the reference is the index-aufbau determinant (lowest ``na`` alpha / ``nb`` beta
+    orbitals), represented by a mock UHF (mo_coeff = I, see :func:`_build_mock_uhf`). UCCSD is run
+    cold on that reference to seed the LUCJ ansatz (t2) and configuration recovery (diagonal of
+    the correlated 1-RDM). The alpha blocks go into the base ElectronicProperties fields; beta /
+    mixed blocks go into the optional *_b / *_ab / *_bb fields. ``OO_INIT=1`` then applies one
+    initial orbital-optimization step (:func:`_apply_initial_oo`).
 
-    Args:
-        mf: PySCF UHF object after calculation.
-        norb: Number of (spatial) orbitals.
-        spin_sq: Target value for the total spin squared.
-        buf: StringIO buffer containing PySCF logs.
-
-    Returns:
-        ElectronicProperties object with ``unrestricted=True``.
+    Returns ``(props, E_ref, E_UCCSD, UCCSD converged)`` (total energies, including ``ecore``).
     """
-    mo_a, mo_b = mf.mo_coeff
-    hcore = mf.get_hcore()
-
-    # One-body integrals in each spin's MO basis.
-    h1_a = mo_a.T @ hcore @ mo_a
-    h1_b = mo_b.T @ hcore @ mo_b
-
-    # Two-body integrals: alpha-alpha, beta-beta, and the mixed alpha-beta block.
-    eri = mf._eri
-    h2_aa = ao2mo.full(eri, mo_a, compact=False).reshape(norb, norb, norb, norb)
-    h2_bb = ao2mo.full(eri, mo_b, compact=False).reshape(norb, norb, norb, norb)
-    h2_ab = ao2mo.general(eri, (mo_a, mo_a, mo_b, mo_b), compact=False).reshape(
-        norb, norb, norb, norb
-    )
-
-    nuclear_repulsion_energy = mf.mol.energy_nuc()
-    num_elec_a, num_elec_b = mf.mol.nelec
-
-    # Run UCCSD; t2 is the tuple (t2aa, t2ab, t2bb). Strongly-correlated Fe-S active spaces do not
-    # converge in the default 50 cycles; raise max_cycle + DIIS so the amplitude seed for the LUCJ
-    # ansatz is well-formed (override via SEED_CCSD_MAX_CYCLE).
-    mycc = cc.UCCSD(mf)
-    mycc.max_cycle = int(os.environ.get("SEED_CCSD_MAX_CYCLE", "200"))
-    mycc.diis_space = 12
-    mycc.kernel()
-    t2_aa, t2_ab, t2_bb = mycc.t2
-
-    # Per-spin natural-orbital occupancies from the *correlated* UCCSD 1-RDM (in MO basis).
-    # These must be fractional: configuration recovery downstream uses them to bias sampled
-    # bitstrings toward the physically important (near-HF) configurations. The UHF *SCF* RDM is
-    # (often) idempotent -> integer 0/1 occupancies, which give recovery no signal and collapse
-    # the SQD subspace to bare Hartree-Fock. UCCSD make_rdm1() returns (dm_a, dm_b) in MO basis.
-    # Use the DIAGONAL (per-canonical-MO occupancy) of the correlated UCCSD 1-RDM, not the sorted
-    # eigenvalues. The bitstrings are measured in the canonical MO basis (PrepareHartreeFockJW +
-    # integrals from mf.mo_coeff), so recover_configurations needs occ of MO p in THAT basis; the
-    # eigenvalues are natural-orbital occupation numbers in a rotated basis and, once sorted, would
-    # misassign the bias to the wrong orbitals (the error lands on the active, partially-occupied
-    # orbitals and grows with system size).
-    dm_cc_a, dm_cc_b = mycc.make_rdm1()
-    occ_a = np.diag(dm_cc_a)
-    occ_b = np.diag(dm_cc_b)
-
-    # Get PySCF logs dumped into in-memory buffer
-    get_run_logger().info(buf.getvalue())
-
+    num_elec_a, num_elec_b = nelec
     props = ElectronicProperties(
-        one_body_tensor=h1_a,
-        two_body_tensor=h2_aa,
-        t2=t2_aa,
-        one_body_tensor_b=h1_b,
-        two_body_tensor_ab=h2_ab,
-        two_body_tensor_bb=h2_bb,
-        t2_ab=t2_ab,
-        t2_bb=t2_bb,
-        initial_occupancy=(occ_a, occ_b),
-        nuclear_repulsion_energy=nuclear_repulsion_energy,
+        one_body_tensor=np.ascontiguousarray(h1_a, dtype=np.float64),
+        two_body_tensor=np.ascontiguousarray(h2_aa, dtype=np.float64),
+        t2=np.zeros((0, 0, 0, 0)),
+        one_body_tensor_b=np.ascontiguousarray(h1_b, dtype=np.float64),
+        two_body_tensor_ab=np.ascontiguousarray(h2_ab, dtype=np.float64),
+        two_body_tensor_bb=np.ascontiguousarray(h2_bb, dtype=np.float64),
+        initial_occupancy=(np.zeros(norb), np.zeros(norb)),
+        nuclear_repulsion_energy=float(ecore),
         num_orbitals=norb,
         num_electrons=(num_elec_a, num_elec_b),
         open_shell=num_elec_a != num_elec_b,
@@ -503,12 +172,55 @@ def _build_property_uhf(
         spin_sq=spin_sq,
     )
 
-    # Opt-in initial orbital optimization: BS-UHF -> UCCSD -> OO -> UCCSD refresh.
-    # Default off (OO_INIT unset/0) so existing runs are byte-for-byte unaffected.
+    mf, make_eris = _build_mock_uhf(props, verbose=4, stdout=buf)
+    e_ref = float(mf.e_tot)
+    for problem in check_aufbau_order(np.diag(mf.mo_energy[0]), np.diag(mf.mo_energy[1]), nelec):
+        warnings.warn(
+            f"{problem}; the index-aufbau determinant may not be the intended reference.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # Run UCCSD; t2 is the tuple (t2aa, t2ab, t2bb). Strongly-correlated Fe-S active spaces do not
+    # converge in the default 50 cycles; raise max_cycle + DIIS so the amplitude seed for the LUCJ
+    # ansatz is well-formed (override via SEED_CCSD_MAX_CYCLE).
+    mycc = cc.UCCSD(mf)
+    mycc.max_cycle = int(os.environ.get("SEED_CCSD_MAX_CYCLE", "200"))
+    mycc.diis_space = 12
+    eris = make_eris(mycc)
+    # The lambda equations (make_rdm1/make_rdm2) call mycc.ao2mo() when no eris are passed, which
+    # on the mock rebuilds ALL spin blocks from mf._eri (= h2_aa only). Pin the correct eris.
+    mycc.ao2mo = lambda *args, **kwargs: eris
+    mycc.kernel(eris=eris)
+    t2_aa, t2_ab, t2_bb = mycc.t2
+
+    # Per-spin occupancies from the *correlated* UCCSD 1-RDM (in MO basis). These must be
+    # fractional: configuration recovery downstream uses them to bias sampled bitstrings toward the
+    # physically important (near-HF) configurations; the SCF RDM is idempotent (integer 0/1) and
+    # gives recovery no signal. Use the DIAGONAL (per-MO occupancy in the basis the bitstrings are
+    # measured in), not the sorted natural-orbital eigenvalues, which live in a rotated basis.
+    dm_cc_a, dm_cc_b = mycc.make_rdm1()
+    occ_a = np.diag(dm_cc_a)
+    occ_b = np.diag(dm_cc_b)
+
+    # Get PySCF logs dumped into in-memory buffer
+    get_run_logger().info(buf.getvalue())
+
+    props = props.model_copy(
+        update={
+            "t2": t2_aa,
+            "t2_ab": t2_ab,
+            "t2_bb": t2_bb,
+            "initial_occupancy": (occ_a, occ_b),
+        }
+    )
+
+    # Opt-in initial orbital optimization: reference -> UCCSD -> OO -> UCCSD refresh.
+    # Default off (OO_INIT unset/0).
     if os.environ.get("OO_INIT", "0") == "1":
         props = _apply_initial_oo(props, mycc, dm_cc_a, dm_cc_b)
 
-    return props
+    return props, e_ref, float(mycc.e_tot), bool(mycc.converged)
 
 
 def _apply_initial_oo(
@@ -517,15 +229,15 @@ def _apply_initial_oo(
     dm_cc_a: np.ndarray,
     dm_cc_b: np.ndarray,
 ) -> ElectronicProperties:
-    """Insert one orbital-optimization step between the initial BS-UHF UCCSD and the t2 seed.
+    """Insert one orbital-optimization step between the initial UHF-reference UCCSD and the t2 seed.
 
     Opt-in via ``OO_INIT=1`` (UHF path only). Flow:
 
-        BS-UHF -> UCCSD (already run; 1-/2-RDM in hand)
+        reference (FCIDUMP orbitals) -> UCCSD (already run; 1-/2-RDM in hand)
                -> OO (rotate orbitals with the fixed UCCSD RDM, two-step MCSCF)
                -> UCCSD refresh in the rotated basis (fresh t2 / occupancy seed).
 
-    OO needs a *correlated* RDM: the BS-UHF SCF density already satisfies the generalized
+    OO needs a *correlated* RDM: a converged SCF density already satisfies the generalized
     Brillouin condition (zero orbital gradient), so an SCF-RDM-driven OO cannot move. UCCSD
     supplies that correlated RDM without needing a CI subspace.
 
@@ -590,7 +302,7 @@ def _apply_initial_oo(
 
     logger.warning(
         "OO_INIT rejected (no energy gain / NaN): E(UCCSD before OO)=%.10f  E_oo=%.10f  "
-        "|grad|=%.3e  E(UCCSD after OO)=%s  -> keeping pre-OO BS-UHF/UCCSD reference.",
+        "|grad|=%.3e  E(UCCSD after OO)=%s  -> keeping pre-OO reference/UCCSD.",
         e_cc_before, e_oo, grad_norm,
         f"{e_cc_after:.10f}" if e_cc_after is not None else "None",
     )
@@ -641,12 +353,32 @@ def compute_molecular_integrals_from_geometry(
     mol.verbose = 4
 
     if unrestricted:
-        mf = scf.UHF(mol)
-        # Follow any spin instability to the true (broken-symmetry) UHF minimum (see
-        # _converge_broken_symmetry_uhf) so the reference is genuinely unrestricted for singlets.
-        mf = _converge_broken_symmetry_uhf(mf)
-        norb = mf.mo_coeff[0].shape[1]
-        return _build_property_uhf(mf, norb, spin_sq, buf)
+        mf = scf.UHF(mol).run()
+        # Follow internal instabilities to a stable UHF minimum. Atom-localized broken-symmetry
+        # guesses are out of scope here (orbitals for production runs are built outside the
+        # workflow, e.g. by rhf2bsuhf, and fed in as a spin-orbital FCIDUMP).
+        for _ in range(5):
+            new_mo = mf.stability()[0]
+            if np.allclose(new_mo[0], mf.mo_coeff[0]) and np.allclose(new_mo[1], mf.mo_coeff[1]):
+                break
+            mf = mf.newton().run(mf.make_rdm1(new_mo, mf.mo_occ))
+        mo_a, mo_b = mf.mo_coeff
+        norb = mo_a.shape[1]
+        hcore = mf.get_hcore()
+        h2 = lambda c1, c2: ao2mo.general(mol, (c1, c1, c2, c2), compact=False).reshape((norb,) * 4)
+        props, *_ = _build_property_from_uhf_integrals(
+            mo_a.T @ hcore @ mo_a,
+            mo_b.T @ hcore @ mo_b,
+            h2(mo_a, mo_a),
+            h2(mo_a, mo_b),
+            h2(mo_b, mo_b),
+            norb,
+            mol.nelec,
+            mol.energy_nuc(),
+            spin_sq,
+            buf,
+        )
+        return props
 
     mf = scf.RHF(mol).run()
     norb = mf.mo_coeff.shape[1]
@@ -662,15 +394,16 @@ def compute_molecular_integrals_from_geometry(
 def compute_molecular_integrals_from_fcidump(
     fcidump_file: str,
     spin_sq: float = 0.0,
-    unrestricted: bool = False,
 ) -> ElectronicProperties:
     """Precompute molecular orbital property from FCIDump file with classical methods.
+
+    Restricted (RHF) only. For unrestricted runs use
+    :func:`compute_molecular_integrals_from_uhf_fcidump` with a spin-orbital FCIDUMP (convert a
+    spatial-orbital file with rhf2uhf / rhf2bsuhf).
 
     Args:
         fcidump_file: Location of FCIDump file storing 1-electron and 2-electron integrals.
         spin_sq: Target value for the total spin squared for the ground state.
-        unrestricted: Run an unrestricted (UHF) calculation instead of restricted (RHF). The
-            number of unpaired electrons is taken from the FCIDUMP ``MS2`` header.
 
     Returns:
         ElectronicProperties object containing molecular integrals and properties.
@@ -688,70 +421,6 @@ def compute_molecular_integrals_from_fcidump(
     mf.mol.verbose = 4
     mf.mol.stdout = buf
 
-    if unrestricted:
-        # pyscf 2.13 has no fcidump.to_uhf_scf; convert the RHF shell (which already carries the
-        # FCIDUMP integral overrides and mol.spin = MS2) into a UHF object and run it. UHF init
-        # guess builds two spin densities from nelec=(na, nb); no manual dm0 needed.
-        nuc = mf.mol.energy_nuc()
-        # Audit P3: tools.fcidump.to_scf sets mol.symmetry=True with a *guessed* point group when
-        # the FCIDUMP carries ORBSYM (both the Fe2S2 and Fe4S4 dumps do: ORBSYM=1). The RHF branch
-        # defeats this with mf.symmetry=False (below); the UHF branch previously did NOT, so UHF ran
-        # its kernel + stability analysis under a possibly-wrong group -> symmetry-constrained /
-        # misconverged reference, and stability following couldn't break the relevant symmetry.
-        # Disable symmetry on the mol and REBUILD it before converting, so to_uhf() produces a plain
-        # (non-symmetry-adapted) UHF whose kernel()/stability() don't require a point group. Setting
-        # .symmetry=False on an already-symmetry-adapted object is insufficient (SymAdaptedUHF.build
-        # still raises "mol.symmetry not enabled"); the rebuild is what actually clears it.
-        # to_scf builds a SymAdaptedRHF, and mf.to_uhf() preserves that symmetry-adapted class --
-        # whose build() still demands mol.symmetry even after we clear the flag. So disable symmetry
-        # on the mol, rebuild it, and construct a PLAIN scf.UHF on it (not mf.to_uhf()); carry the
-        # FCIDUMP integral overrides (get_hcore/_eri) + nuclear energy across by hand.
-        base_mol = mf.mol
-        if getattr(base_mol, "symmetry", False):
-            base_mol.symmetry = False
-            base_mol.build(dump_input=False, parse_arg=False)
-        hcore = mf.get_hcore()
-        ovlp = mf.get_ovlp()
-        eri = mf._eri
-        mf = scf.UHF(base_mol)
-        mf.get_hcore = lambda *args, **kwargs: hcore
-        mf.get_ovlp = lambda *args, **kwargs: ovlp
-        mf._eri = eri
-        mf.mol.energy_nuc = lambda *args: nuc  # preserved across the conversion
-        mf.symmetry = False
-        # Follow any spin instability to the genuine (broken-symmetry) UHF minimum -- otherwise a
-        # singlet stays at the RHF solution and the "UHF" reference/UCCSD/t2 seed is restricted.
-        # For Fe-S cubanes, an atom-localized (Noodleman) AF guess -- supplied via FE4S4_AF_GROUPS --
-        # reaches a ~33 mHa lower BS basin than the energy-ordered guess (better Fe-3d orbitals for
-        # SQD to recover on). See _parse_af_groups; unset -> plain energy-ordered AF guess (default).
-        # Deterministic broken-symmetry reference: cache converged UHF MOs so every run
-        # (do_rdm on/off, OO on/off) starts from the IDENTICAL reference. Fe4S4's 400-cycle SCF is
-        # thread/BLAS-order sensitive -> different BS local minima run-to-run otherwise.
-        # Disable with SBD_UHF_CACHE=0; relocate with SBD_UHF_CACHE_DIR.
-        import hashlib as _hl, os as _os
-        _cdir = _os.environ.get("SBD_UHF_CACHE_DIR", _os.path.expanduser("~/.cache/qcsc_uhf"))
-        _key = _hl.sha1((_os.path.abspath(fcidump_file) + "|af=" + str(_parse_af_groups())
-                         + "|nelec=" + str(tuple(mf.mol.nelec))).encode()).hexdigest()[:16]
-        _cpath = _os.path.join(_cdir, f"uhf_bs_{_key}.npz")
-        if _os.environ.get("SBD_UHF_CACHE", "1") != "0" and _os.path.exists(_cpath):
-            _c = np.load(_cpath)
-            mf.mo_coeff = (_c["mo_a"], _c["mo_b"])
-            mf.mo_occ = (_c["occ_a"], _c["occ_b"])
-            mf.mo_energy = (_c["ene_a"], _c["ene_b"])
-            mf.e_tot = float(_c["e_tot"]); mf.converged = True
-            print(f"[uhf-cache] reuse BS-UHF reference {_cpath} (E={mf.e_tot:.6f})")
-        else:
-            mf = _converge_broken_symmetry_uhf(mf, af_groups=_parse_af_groups())
-            try:
-                _os.makedirs(_cdir, exist_ok=True)
-                _moa, _mob = mf.mo_coeff; _oca, _ocb = mf.mo_occ; _ena, _enb = mf.mo_energy
-                np.savez(_cpath, mo_a=_moa, mo_b=_mob, occ_a=_oca, occ_b=_ocb,
-                         ene_a=_ena, ene_b=_enb, e_tot=float(mf.e_tot))
-                print(f"[uhf-cache] saved BS-UHF reference {_cpath} (E={mf.e_tot:.6f})")
-            except Exception as _e:
-                print(f"[uhf-cache] save failed (continuing): {_e}")
-        return _build_property_uhf(mf, norb, spin_sq, buf)
-
     # Run HF calculation with Newton method.
     # HF convergence is important, as we assume
     # the FCIdump file is created with a converged result.
@@ -763,6 +432,46 @@ def compute_molecular_integrals_from_fcidump(
     mf.kernel(dm0=dm0)
 
     return _build_property(mf, norb, spin_sq, buf)
+
+
+@task(
+    persist_result=True,
+    result_serializer="compressed/json",
+    name="compute_molecular_integrals",
+)
+def compute_molecular_integrals_from_uhf_fcidump(
+    fcidump_file: str,
+    spin_sq: float = 0.0,
+) -> ElectronicProperties:
+    """Load a spin-orbital FCIDUMP as the unrestricted reference -- no SCF, no orbital change.
+
+    The file (format: :mod:`qcsc_workflow_utility.uhf_fcidump`, as written by rhf2uhf /
+    rhf2bsuhf) already carries the MO-basis spin-block integrals of the chosen reference; the
+    reference determinant is the lowest ``na`` alpha / ``nb`` beta orbitals by index. UCCSD (t2
+    seed + initial occupancy) and the optional ``OO_INIT=1`` step are run on top of it from the
+    integrals alone (mock UHF, see :func:`_build_mock_uhf`).
+
+    Args:
+        fcidump_file: Interleaved spin-orbital FCIDUMP (header NORB = spatial orbitals).
+        spin_sq: Target value for the total spin squared for the ground state.
+
+    Returns:
+        ElectronicProperties with ``unrestricted=True``; ``nuclear_repulsion_energy`` is the
+        file's core energy.
+    """
+    buf = io.StringIO()
+    h1_a, h1_b, h2_aa, h2_ab, h2_bb, norb, nelec, ecore = read_uhf_fcidump(fcidump_file)
+    props, e_ref, e_cc, cc_conv = _build_property_from_uhf_integrals(
+        h1_a, h1_b, h2_aa, h2_ab, h2_bb, norb, nelec, ecore, spin_sq, buf
+    )
+    # Reference line parsed by the analysis tooling (check_logs.py / notebooks).
+    print(
+        f"[uhf-input] loaded spin-orbital FCIDUMP {os.path.abspath(fcidump_file)} "
+        f"(norb={norb}, nelec={tuple(int(n) for n in nelec)}, E_ref={e_ref:.10f}, "
+        f"E_UCCSD={e_cc:.10f}, UCCSD_converged={cc_conv})",
+        flush=True,
+    )
+    return props
 
 
 def refresh_cc_seed(
@@ -886,16 +595,20 @@ def _refresh_cc_seed_rhf(
     return (props, float(mycc.e_tot)) if return_energy else props
 
 
-def _refresh_cc_seed_uhf(
+def _build_mock_uhf(
     elec_props: ElectronicProperties,
-    log,
-    max_cycle: int,
-    return_energy: bool = False,
-) -> ElectronicProperties | None:
-    """CC refresh for UHF.
+    verbose: int = 4,
+    stdout=None,
+):
+    """Mock UHF SCF object for MO-basis spin-block integrals (mo_coeff = I, aufbau occupation).
 
-    Build a mock UHF SCF object whose get_jk correctly handles the separate aa/ab/bb
-    integral blocks, so PySCF UCCSD.ao2mo() works natively.
+    ``get_jk`` / ``get_veff`` handle the separate aa/ab/bb integral blocks so PySCF UCCSD works
+    natively on it; ``mo_energy`` is the Fock diagonal and ``e_tot`` the energy of the index-aufbau
+    determinant (lowest ``na`` alpha / ``nb`` beta orbitals).
+
+    Returns ``(mf, make_eris)``; ``make_eris(mycc)`` builds the UCCSD ``_ChemistsERIs`` from the
+    three blocks directly (``mf._eri`` only carries the aa block, so ``mycc.ao2mo()`` on this mock
+    would be wrong for the ab / bb blocks).
     """
     norb = elec_props.num_orbitals
     nelec_a, nelec_b = elec_props.num_electrons
@@ -909,7 +622,9 @@ def _refresh_cc_seed_uhf(
     mol = gto.M()
     mol.nelectron = nelec_a + nelec_b
     mol.spin = nelec_a - nelec_b
-    mol.verbose = 4
+    mol.verbose = verbose
+    if stdout is not None:
+        mol.stdout = stdout
     mol.incore_anyway = True
 
     mf = scf.UHF(mol)
@@ -988,6 +703,42 @@ def _refresh_cc_seed_uhf(
     mf.e_tot = e_uhf
     mf.converged = True
 
+    # Supply correct spin-block MO integrals via ao2mofn passed to _make_eris_incore.
+    # PySCF _make_eris_incore calls ao2mofn(moa), ao2mofn(mob), ao2mofn((moa,moa,mob,mob)).
+    # With mo_coeff=I the integrals are already in MO basis; return them directly.
+    def make_eris(mycc):
+        def _ao2mofn(mo_or_tuple):
+            if isinstance(mo_or_tuple, tuple):
+                return h2_ab.reshape(-1)
+            _ao2mofn._n += 1
+            return (h2_aa if _ao2mofn._n == 1 else h2_bb).reshape(-1)
+        _ao2mofn._n = 0
+
+        from pyscf.cc.uccsd import _make_eris_incore
+        return _make_eris_incore(mycc, mycc.mo_coeff, ao2mofn=_ao2mofn)
+
+    return mf, make_eris
+
+
+def _refresh_cc_seed_uhf(
+    elec_props: ElectronicProperties,
+    log,
+    max_cycle: int,
+    return_energy: bool = False,
+) -> ElectronicProperties | None:
+    """CC refresh for UHF.
+
+    Runs UCCSD on the mock UHF of :func:`_build_mock_uhf`, warm-started from the previous t2.
+    """
+    norb = elec_props.num_orbitals
+    nelec_a, nelec_b = elec_props.num_electrons
+    h2_aa = np.asarray(elec_props.two_body_tensor)
+    h2_ab = np.asarray(elec_props.two_body_tensor_ab)
+    h2_bb = np.asarray(elec_props.two_body_tensor_bb)
+
+    mf, make_eris = _build_mock_uhf(elec_props, verbose=4)
+    e_uhf = mf.e_tot
+
     mycc = cc.UCCSD(mf)
     mycc.max_cycle = max_cycle
     mycc.diis_space = 12
@@ -1000,18 +751,7 @@ def _refresh_cc_seed_uhf(
         np.linalg.norm(h2_aa), np.linalg.norm(h2_ab), np.linalg.norm(h2_bb),
     )
 
-    # Supply correct spin-block MO integrals via ao2mofn passed to _make_eris_incore.
-    # PySCF _make_eris_incore calls ao2mofn(moa), ao2mofn(mob), ao2mofn((moa,moa,mob,mob)).
-    # With mo_coeff=I the integrals are already in MO basis; return them directly.
-    def _ao2mofn(mo_or_tuple):
-        if isinstance(mo_or_tuple, tuple):
-            return h2_ab.reshape(-1)
-        _ao2mofn._n += 1
-        return (h2_aa if _ao2mofn._n == 1 else h2_bb).reshape(-1)
-    _ao2mofn._n = 0
-
-    from pyscf.cc.uccsd import _make_eris_incore
-    eris = _make_eris_incore(mycc, mycc.mo_coeff, ao2mofn=_ao2mofn)
+    eris = make_eris(mycc)
 
     # Warm-start: use old t1/t2 as initial guess for faster convergence.
     t2_aa_old = np.asarray(elec_props.t2)

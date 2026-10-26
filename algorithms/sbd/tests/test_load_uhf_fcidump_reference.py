@@ -23,7 +23,7 @@ sys.path.insert(0, str(EXAMPLES_DIR))
 from pyscf import cc, gto, scf  # noqa: E402
 
 import load_uhf_fcidump_reference as loader  # noqa: E402
-from sbd.solver_job import _write_uhf_fcidump  # noqa: E402
+from qcsc_workflow_utility.uhf_fcidump import write_uhf_fcidump as _write_uhf_fcidump  # noqa: E402
 
 
 def _converged_uhf_tensors(atom: str, basis: str, spin: int):

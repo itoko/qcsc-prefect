@@ -17,6 +17,7 @@ from qcsc_workflow_utility.chem import (
     NpStrict1DArrayF64,
     NpStrict2DArrayF64,
     compute_molecular_integrals_from_fcidump,
+    compute_molecular_integrals_from_uhf_fcidump,
     refresh_cc_seed,
 )
 from qcsc_workflow_utility.orbital_opt import optimize_orbitals, rotate_electronic_properties
@@ -196,10 +197,16 @@ def riken_sqd_de(
         getattr(solver, "do_rdm", 0), parameters.de_params.iterations,
     )
 
-    elec_props = compute_molecular_integrals_from_fcidump(
-        fcidump_file=parameters.fcidump,
-        unrestricted=unrestricted,
-    )
+    # UHF input is a spin-orbital FCIDUMP whose orbitals were built outside the workflow
+    # (rhf2uhf / rhf2bsuhf); it is loaded as-is (no SCF). RHF keeps the spatial-orbital path.
+    if unrestricted:
+        elec_props = compute_molecular_integrals_from_uhf_fcidump(
+            fcidump_file=parameters.fcidump,
+        )
+    else:
+        elec_props = compute_molecular_integrals_from_fcidump(
+            fcidump_file=parameters.fcidump,
+        )
 
     # We assume heavy-hex topology
     # Orbitals for different spins have connections between every 4th orbital.

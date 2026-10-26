@@ -15,6 +15,7 @@ from prefect.blocks.core import Block
 from pydantic import Field
 from pyscf.tools import fcidump
 from qcsc_prefect_executor.from_blocks import run_job_from_blocks
+from qcsc_workflow_utility.uhf_fcidump import write_uhf_fcidump
 
 
 @dataclass(frozen=True)
@@ -133,84 +134,23 @@ def _write_uhf_fcidump(
     nelec: tuple[int, int],
     ecore: float = 0.0,
 ) -> None:
-    """Write an interleaved-spin-orbital FCIDUMP for the SBD ``-D_UHF`` build.
+    """Write the interleaved-spin-orbital FCIDUMP for the SBD ``-D_UHF`` build.
 
-    The ``_UHF`` ``SetupIntegrals`` parser does NOT use PySCF's four-block MOLPRO UHF format.
-    It indexes integrals by spin-orbital with alpha = even 0-based index (``2*p``) and beta =
-    odd (``2*p + 1``); the FCIDUMP records are 1-based over ``1..2*norb``. The spin block of a
-    two-body record ``(i,j,k,l)`` is determined by ``S = (i-1)%2 + 2*((k-1)%2)`` and requires
-    ``(i-1)%2 == (j-1)%2`` and ``(k-1)%2 == (l-1)%2`` (mixed-spin pair terms are zero):
-
-        S=0  (alpha,alpha | alpha,alpha)  -> h2_aa
-        S=1  (beta ,beta  | alpha,alpha)  -> h2_ab transposed (chem. (kl|ij) symmetry)
-        S=2  (alpha,alpha | beta ,beta )  -> h2_ab
-        S=3  (beta ,beta  | beta ,beta )  -> h2_bb
-
-    Tensors are chemist-notation ``(ij|kl)`` as returned by PySCF ``ao2mo``. The reader applies
-    its own 8-fold symmetrization, so we emit each unique (i<=j, k<=l, ij<=kl) record once.
+    Thin wrapper over :func:`qcsc_workflow_utility.uhf_fcidump.write_uhf_fcidump`, the single
+    definition of the format (also used by the rhf2uhf / rhf2bsuhf converters). The solver input
+    is written with ``ecore=0``; the nuclear repulsion is added back on the Python side.
     """
-    nelec_a, nelec_b = nelec
-
-    lines: list[str] = []
-    lines.append(
-        f" &FCI NORB={norb},NELEC={nelec_a + nelec_b},MS2={nelec_a - nelec_b},"
+    write_uhf_fcidump(
+        path,
+        h1_a=h1_a,
+        h1_b=h1_b,
+        h2_aa=h2_aa,
+        h2_ab=h2_ab,
+        h2_bb=h2_bb,
+        norb=norb,
+        nelec=nelec,
+        ecore=ecore,
     )
-    lines.append("  ORBSYM=" + ",".join(["1"] * norb) + ",")
-    lines.append("  ISYM=1,")
-    lines.append(" &END")
-
-    def spinorb(spatial: int, spin_is_beta: bool) -> int:
-        # 1-based spin-orbital index: alpha -> 2*p+1, beta -> 2*p+2 (p 0-based spatial).
-        return 2 * spatial + (2 if spin_is_beta else 1)
-
-    def emit_two_body(tensor: np.ndarray, bra_beta: bool, ket_beta: bool) -> None:
-        # Chemist (ij|kl). Same-spin blocks (aa|aa, bb|bb) have full 8-fold symmetry, so emit only
-        # i>=j, k>=l, (i,j)>=(k,l). The mixed block (aa|bb) only has the 4-fold permutation
-        # symmetry i<->j and k<->l (the bra<->ket swap maps it to the distinct bb|aa block, which
-        # the reader reconstructs by its own symmetrization), so for it we must NOT apply the
-        # (i,j)>=(k,l) cut or we drop valid records like (00|11).
-        same_spin = bra_beta == ket_beta
-        for i in range(norb):
-            for j in range(i + 1):
-                ij = i * (i + 1) // 2 + j
-                for k in range(norb):
-                    for m in range(k + 1):
-                        kl = k * (k + 1) // 2 + m
-                        if same_spin and ij < kl:
-                            continue
-                        val = float(tensor[i, j, k, m])
-                        if val == 0.0:
-                            continue
-                        si = spinorb(i, bra_beta)
-                        sj = spinorb(j, bra_beta)
-                        sk = spinorb(k, ket_beta)
-                        sl = spinorb(m, ket_beta)
-                        lines.append(f"{val:>28.16e} {si:4d} {sj:4d} {sk:4d} {sl:4d}")
-
-    # Two-body blocks: S=0 aa|aa, S=2 aa|bb, S=3 bb|bb. The S=1 bb|aa block is the (kl|ij)
-    # transpose of aa|bb and is recovered by the reader's symmetrization, so we emit aa|bb only.
-    emit_two_body(h2_aa, bra_beta=False, ket_beta=False)
-    emit_two_body(h2_ab, bra_beta=False, ket_beta=True)
-    emit_two_body(h2_bb, bra_beta=True, ket_beta=True)
-
-    # One-body: alpha block at even spin-orbitals, beta at odd. k=l=0 marks a one-body record.
-    def emit_one_body(h1: np.ndarray, beta: bool) -> None:
-        for i in range(norb):
-            for j in range(i + 1):
-                val = float(h1[i, j])
-                if val == 0.0:
-                    continue
-                si = spinorb(i, beta)
-                sj = spinorb(j, beta)
-                lines.append(f"{val:>28.16e} {si:4d} {sj:4d} {0:4d} {0:4d}")
-
-    emit_one_body(h1_a, beta=False)
-    emit_one_body(h1_b, beta=True)
-
-    # Core energy record (i=j=k=l=0).
-    lines.append(f"{float(ecore):>28.16e} {0:4d} {0:4d} {0:4d} {0:4d}")
-
-    path.write_text("\n".join(lines) + "\n")
 
 
 def _build_solver_args(solver: "SBDSolverJob") -> list[str]:

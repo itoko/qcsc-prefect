@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""Generic RHF/UHF/BS-UHF multi-step SQD recovery for any molecule, any HPC target.
+"""NOTE (branch rhf-input): FE4S4_AF_* are no longer read by the workflow; with --method uhf the
+--fcidump must be a spin-orbital FCIDUMP (rhf2uhf / rhf2bsuhf output). The --af-* options are ignored.
+
+Generic RHF/UHF/BS-UHF multi-step SQD recovery for any molecule, any HPC target.
 
 Molecule-agnostic version of the pattern proven on Fe2S2/Fe4S4: sample once, persist the pool,
 then re-diagonalize offline (``quantum_source="saved"``) for many recovery steps with

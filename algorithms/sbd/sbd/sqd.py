@@ -300,7 +300,7 @@ def walker_sqd(
 
     # Opt-in same-spin recombination candidate booster (see _recombine_same_spin_candidates).
     # Env-var override lets existing env-var-driven launcher scripts opt in without new CLI/flow
-    # parameter plumbing, matching the FE4S4_CKPT_DIR / FE4S4_AF_GROUPS convention.
+    # parameter plumbing, matching the FE4S4_CKPT_DIR convention.
     recomb_boost = recomb_boost or os.environ.get("FE4S4_RECOMB_BOOST", "0") == "1"
     recomb_max_parents = int(os.environ.get("FE4S4_RECOMB_MAX_PARENTS", str(recomb_max_parents)))
     seed_budget_frac = float(os.environ.get("FE4S4_SEED_BUDGET_FRAC", str(seed_budget_frac)))

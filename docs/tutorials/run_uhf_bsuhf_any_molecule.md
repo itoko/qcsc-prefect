@@ -1,5 +1,12 @@
 # Run UHF / Broken-Symmetry-UHF SQD for Any Molecule (Fugaku + ROQUO)
 
+> **Note (branch `rhf-input`)**: the workflow no longer builds orbitals. The in-workflow BS-UHF
+> (`_parse_af_groups` / `_converge_broken_symmetry_uhf`, `FE4S4_AF_*`, `SBD_UHF_CACHE*`) has been removed.
+> UHF runs take a spin-orbital FCIDUMP (`qcsc_workflow_utility.uhf_fcidump` format) and load it through
+> `compute_molecular_integrals_from_uhf_fcidump`. Build the orbitals outside the workflow: `rhf2uhf` for RHF
+> orbitals as they are, `rhf2bsuhf` for BS-UHF (both are plain folders next to qcsc-prefect). The env-var steps
+> below describe the old behaviour.
+
 The SBD closed-loop pipeline in this repo — `riken_sqd_de`, `FlowParameters`, the broken-symmetry
 UHF guess in `qcsc_workflow_utility.chem` — is molecule-agnostic. Everything you've seen in this
 repo's Fe2S2/Fe4S4 material is one *instance* of that generic pipeline, not a special code path.
