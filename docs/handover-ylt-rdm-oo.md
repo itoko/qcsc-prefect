@@ -263,6 +263,9 @@ export SBD_TASK_RUNNER=concurrent
 and IBM Quantum backend:
 
 ```bash
+# Recorded settings of this study (branch oo-reproduce). On branch rhf-input the first line is
+# gone: build the BS-UHF orbitals with rhf2bsuhf.py --af-groups fe4s4 --af-pol 1.0 and pass the
+# resulting spin-orbital FCIDUMP instead.
 export FE4S4_AF_GROUPS=fe4s4  FE4S4_AF_POL=1.0
 export SQD_DIM=200000000  N_RECOVERY=240  ITERS=1  NUM_WALKERS=1  SEED=42
 export QSOURCE=real-device  IBM_BACKEND=ibm_kobe  SHOTS=5000000

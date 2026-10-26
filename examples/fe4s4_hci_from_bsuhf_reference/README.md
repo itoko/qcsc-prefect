@@ -1,11 +1,15 @@
 # Running HCI (or any other solver) from the same [4Fe-4S] BS-UHF reference as our LUCJ/SQD work
 
-> **Note (branch `rhf-input`)**: the workflow no longer builds orbitals. The in-workflow BS-UHF
-> (`_parse_af_groups` / `_converge_broken_symmetry_uhf`, `FE4S4_AF_*`, `SBD_UHF_CACHE*`) has been removed.
-> UHF runs take a spin-orbital FCIDUMP (`qcsc_workflow_utility.uhf_fcidump` format) and load it through
-> `compute_molecular_integrals_from_uhf_fcidump`. Build the orbitals outside the workflow: `rhf2uhf` for RHF
-> orbitals as they are, `rhf2bsuhf` for BS-UHF (both are plain folders next to qcsc-prefect). The env-var steps
-> below describe the old behaviour.
+> **Shortcut (branch `rhf-input`)**: `uhf_sqd_oo/rhf2bsuhf/rhf2bsuhf.py` (a plain folder next to
+> qcsc-prefect) does steps 1–2 below in one command and writes the interleaved spin-orbital
+> FCIDUMP directly:
+>
+> ```bash
+> python rhf2bsuhf.py fe4s4_zhendongli.txt fe4s4_bsuhf.uhf.fcidump --af-groups fe4s4 --af-pol 1.0
+> ```
+>
+> The workflow loads that file as-is (`compute_molecular_integrals_from_uhf_fcidump`); it no longer
+> runs any BS-UHF of its own. The standalone scripts in this directory still work unchanged.
 
 ## Do you need to regenerate the FCIDUMP?
 
@@ -40,9 +44,9 @@ correlation the LUCJ ansatz/SQD recovery is built on top of.
 Standalone script (only depends on `pyscf`/`numpy`, no `qcsc-prefect` import) that:
 
 1. Loads `fe4s4_zhendongli.txt` and reproduces the exact BS-UHF reference (same atom-localized
-   AF guess + stability-following recipe as
-   `algorithms/qcsc_workflow_utility/src/qcsc_workflow_utility/chem.py`'s
-   `_parse_af_groups`/`_converge_broken_symmetry_uhf`).
+   AF guess + stability-following recipe as `uhf_sqd_oo/rhf2bsuhf/bsuhf.py`
+   (`af_groups_spec`/`converge_broken_symmetry_uhf`), which was moved there out of the workflow's
+   `chem.py`).
 2. Rotates the two-electron integrals into the converged BS-UHF molecular-orbital basis.
 3. Writes that out as three files anyone can load into their own solver:
    - `<prefix>.alpha.fcidump` -- alpha-spin block (h1_a, (aa|aa)), standard FCIDUMP format
@@ -137,17 +141,15 @@ SQD trajectory at a matched subspace dimension.
 
 ## Loading a BS-UHF reference back and checking its UHF/UCCSD energy directly (no reconvergence)
 
-**The bug this closes:** feeding the interleaved `.uhf.fcidump` file (from
-`merge_bsuhf_to_uhf_fcidump.py` above) into `qcsc-prefect`'s own
-`compute_molecular_integrals_from_fcidump(unrestricted=True)` does **not** load the BS-UHF
-reference — that function always reruns `tools.fcidump.to_scf()` (which expects a plain
-restricted-format FCIDUMP, not the interleaved spin-orbital format) and then reconverges a *fresh*
-UHF from a generic guess on top of the misparsed result. Depending on `FE4S4_AF_GROUPS` (unset by
-default) this can land back on the spin-pure RHF solution — this is exactly the failure a
-collaborator hits when they report "`compute_molecular_integrals_from_fcidump` re-runs UHF SCF
-from scratch ... falls back to RHF" after feeding it a BS-UHF-rotated interleaved FCIDUMP.
+**Background:** before branch `rhf-input`, feeding this interleaved `.uhf.fcidump` file into the
+workflow's `compute_molecular_integrals_from_fcidump(unrestricted=True)` did **not** load the
+BS-UHF reference: that function ran `tools.fcidump.to_scf()` (which misparses the interleaved
+format as a restricted FCIDUMP) and reconverged a fresh UHF on top. That path has been removed;
+the workflow now reads this format directly with
+`qcsc_workflow_utility.uhf_fcidump.read_uhf_fcidump` (via
+`compute_molecular_integrals_from_uhf_fcidump`, no SCF) and refuses a spatial FCIDUMP for UHF.
 
-`load_uhf_fcidump_reference.py` is the fix: it parses the interleaved FCIDUMP directly (pure text
+`load_uhf_fcidump_reference.py` is the standalone (no qcsc-prefect) equivalent: it parses the interleaved FCIDUMP directly (pure text
 parsing, the same indexing convention as `sbd`'s `_UHF SetupIntegrals` C++ reader — no
 `to_scf()`, no SCF guess, no stability-following) and evaluates the UHF energy expression by
 direct tensor contraction on the file's own orbitals. There is nothing to reconverge because
@@ -169,7 +171,8 @@ Prints `E(UHF)` [+ `E(UCCSD)` with `--uccsd`] and `<S^2>`, and writes
 compare against the manuscript's reported BS-UHF/BS-UCCSD energies.
 
 **Verified correctness (2026-09-02)**, against real PySCF calculations, not just synthetic
-round-trips: wrote real converged-UHF integrals (via `sbd`'s own `_write_uhf_fcidump`, the exact
+round-trips: wrote real converged-UHF integrals (via `sbd`'s own `_write_uhf_fcidump`, now a thin
+wrapper over `qcsc_workflow_utility.uhf_fcidump.write_uhf_fcidump`, the exact
 function `merge_bsuhf_to_uhf_fcidump.py` calls) for two real molecules — a closed-shell N2/sto-3g
 case and an open-shell OH/sto-3g (spin=1) case — then loaded each FCIDUMP back through this script
 and compared against PySCF's own direct `mf.e_tot` / `mf.spin_square()` / `cc.UCCSD(mf).e_tot`:
@@ -193,6 +196,9 @@ UHF **and** UCCSD energy (`load_uhf_fcidump_reference.py --uccsd`) — all three
 scripts with zero `qcsc-prefect`/Prefect dependency beyond one direct, non-Prefect function reuse
 (`_write_uhf_fcidump`).
 
+The same format and checks are covered for the workflow's own reader in
+`algorithms/qcsc_workflow_utility/tests/test_uhf_fcidump.py`.
+
 Regression tests: `algorithms/sbd/tests/test_load_uhf_fcidump_reference.py` (run with
 `cd algorithms/sbd && python -m pytest tests/test_load_uhf_fcidump_reference.py -v`) — covers the
 FCIDUMP round-trip, the UHF energy formula, `<S^2>`, the UCCSD path, and the CLI end-to-end, each
@@ -203,4 +209,5 @@ against a real PySCF calculation on real molecules (not synthetic data).
 `--af-groups fe4s4` is a convenience keyword for the pairing-(1,2) reference used throughout this
 work (`up={fe1,fe2}`, `down={fe3,fe4}`, full polarization). To try a different pairing or a
 different molecule entirely, pass your own JSON (or `@path/to/file.json`) -- see
-`docs/tutorials/run_uhf_bsuhf_any_molecule.md` Step 1 for the fragment-spec schema.
+`docs/tutorials/run_uhf_bsuhf_any_molecule.md` Step 1 for the fragment-spec schema (the same
+spec is accepted by `rhf2bsuhf.py --af-groups`).

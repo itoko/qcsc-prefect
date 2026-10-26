@@ -3,27 +3,18 @@
 format `merge_bsuhf_to_uhf_fcidump.py` writes) and report its UHF/UCCSD energy directly --
 WITHOUT reconverging a new SCF from an initial guess.
 
-Background / the bug this closes
----------------------------------
-`qcsc_workflow_utility.chem.compute_molecular_integrals_from_fcidump(unrestricted=True)` -- the
-function this repo's SBD/SQD pipeline calls to turn a FCIDUMP into `ElectronicProperties` -- has
-no "trust this file's orbitals, they are already the reference" mode. Passing it a genuinely
-restricted-format FCIDUMP is the right input for that function: it runs `tools.fcidump.to_scf()`,
-then (if `unrestricted=True`) seeds an atom-localized antiferromagnetic guess and stability-follows
-to a broken-symmetry minimum (`_converge_broken_symmetry_uhf`, chem.py lines ~592-629).
+Background
+----------
+Before branch `rhf-input`, `qcsc_workflow_utility.chem.compute_molecular_integrals_from_fcidump(
+unrestricted=True)` had no "trust this file's orbitals" mode: it ran `tools.fcidump.to_scf()`,
+which misparses this interleaved spin-orbital format as a restricted FCIDUMP, and then reconverged
+a fresh (broken-symmetry) UHF on top. That path has been removed. The workflow now reads this
+format directly with `qcsc_workflow_utility.uhf_fcidump.read_uhf_fcidump` (through
+`compute_molecular_integrals_from_uhf_fcidump`, no SCF), and builds BS-UHF orbitals only outside
+the workflow (`uhf_sqd_oo/rhf2bsuhf`). This script remains the standalone, qcsc-prefect-free way
+to do the same check.
 
-But `merge_bsuhf_to_uhf_fcidump.py`'s output is a DIFFERENT file format: one FCIDUMP with
-interleaved 1-based SPIN-orbital indices (alpha spatial orbital p -> spin-orbital 2p+1, beta ->
-2p+2), written for `sbd`'s `-D_UHF` C++ reader, not for PySCF's `tools.fcidump.to_scf()`. Feeding
-that file to `compute_molecular_integrals_from_fcidump` does not "load the BS-UHF reference" --
-`to_scf()` misparses the interleaved records as if they were a plain restricted FCIDUMP's spatial
-orbitals, then `unrestricted=True` reconverges a FRESH UHF from a generic guess on top of that
-misparsed Hamiltonian. Depending on `FE4S4_AF_GROUPS` (unset by default), the fresh reconvergence
-can land back on the spin-pure RHF solution -- this is the concrete failure a collaborator hits
-when they report "compute_molecular_integrals_from_fcidump re-runs UHF SCF from scratch ... falls
-back to RHF" after feeding it a BS-UHF-rotated interleaved FCIDUMP.
-
-This script is the missing piece: it parses the interleaved format directly (same indexing as the
+This script: it parses the interleaved format directly (same indexing as the
 `_UHF SetupIntegrals` C++ reader -- verified against `algorithms/sbd/tests/test_gdb_uhf_fcidump_merge.py`'s
 independent reconstruction), rebuilds `h1_a, h1_b, h2_aa, h2_ab, h2_bb`, and computes the UHF energy
 by direct tensor contraction -- no PySCF `scf.UHF.kernel()`/`to_scf()` call, so there is no guess,
@@ -166,7 +157,7 @@ def uhf_energy_from_integrals(
     """Build the UHF density from the occupied canonical MOs implied by the FCIDUMP's own MO
     ordering (the file's orbitals ARE the converged MO basis -- occupying the lowest na/nb of
     them by index is exactly what a converged UHF's mo_occ looks like when written by
-    `_build_property_uhf`/`_write_uhf_fcidump`, which always emit MOs in the SCF's own canonical
+    `rhf2bsuhf`/`_write_uhf_fcidump`, which always emit MOs in the SCF's own canonical
     order) and evaluates the UHF energy expression directly by tensor contraction -- no
     diagonalization, no SCF loop, nothing to reconverge.
 

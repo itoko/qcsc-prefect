@@ -17,9 +17,10 @@ it just falls back onto the spin-pure RHF solution (a closed-shell singlet's RHF
 stationary point of the UHF equations, so unrestricted SCF started from it doesn't move). The
 actual reference used for the paper's LUCJ sampling is a broken-symmetry UHF (BS-UHF) solution
 reached via an atom-localized antiferromagnetic initial guess plus internal-AND-external
-stability-following (the Noodleman recipe) -- described in the paper and implemented in
-``algorithms/qcsc_workflow_utility/src/qcsc_workflow_utility/chem.py``
-(``_parse_af_groups`` / ``_converge_broken_symmetry_uhf``).
+stability-following (the Noodleman recipe) -- described in the paper and implemented in ``uhf_sqd_oo/rhf2bsuhf/bsuhf.py``
+(``af_groups_spec`` / ``converge_broken_symmetry_uhf``; moved there out of the workflow's
+``chem.py`` on branch ``rhf-input``). ``rhf2bsuhf.py`` writes the interleaved spin-orbital FCIDUMP
+the workflow reads in one step.
 
 This script reproduces exactly that reference standalone (no Prefect, no qcsc-prefect import),
 and writes out the two-electron integrals rotated into the converged BS-UHF MO basis as a new
@@ -59,7 +60,7 @@ from pyscf import ao2mo, gto, scf, tools
 
 
 def parse_af_groups(raw: str) -> dict:
-    """Same convenience keyword + schema as chem.py's _parse_af_groups(), standalone (no env var,
+    """Same convenience keyword + schema as rhf2bsuhf's af_groups_spec(), standalone (no env var,
     no Prefect import) so this script has zero qcsc-prefect dependency."""
     if raw.strip().lower() == "fe4s4":
         return {

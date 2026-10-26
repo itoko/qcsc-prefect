@@ -1,25 +1,33 @@
 # Generic RHF/UHF/BS-UHF SQD Recovery
 
-> **Note (branch `rhf-input`)**: the workflow no longer builds orbitals. The in-workflow BS-UHF
-> (`_parse_af_groups` / `_converge_broken_symmetry_uhf`, `FE4S4_AF_*`, `SBD_UHF_CACHE*`) has been removed.
-> UHF runs take a spin-orbital FCIDUMP (`qcsc_workflow_utility.uhf_fcidump` format) and load it through
-> `compute_molecular_integrals_from_uhf_fcidump`. Build the orbitals outside the workflow: `rhf2uhf` for RHF
-> orbitals as they are, `rhf2bsuhf` for BS-UHF (both are plain folders next to qcsc-prefect). The env-var steps
-> below describe the old behaviour.
-
 `run_recover.py` is a molecule-agnostic template for the "sample once, then re-diagonalize
 offline for many recovery steps" pattern used throughout this repo's Fe2S2/Fe4S4 work — with no
-Fe-specific defaults. Point it at any FCIDUMP (and, for broken-symmetry UHF, your own AF-groups
-JSON) and a persisted sample pool, and it runs a checkpointed, multi-step SQD recovery on Fugaku,
-Slurm (e.g. ROQUO), or locally.
+Fe-specific defaults. Point it at an FCIDUMP and a persisted sample pool, and it runs a
+checkpointed, multi-step SQD recovery on Fugaku, Slurm (e.g. ROQUO), or locally.
+
+**The workflow does not build orbitals.** For `--method uhf` the FCIDUMP must be a *spin-orbital*
+FCIDUMP (`qcsc_workflow_utility.uhf_fcidump` format) produced beforehand by one of the orbital
+converters that live next to this repository (`uhf_sqd_oo/rhf2uhf`, `uhf_sqd_oo/rhf2bsuhf`; plain
+folders, not part of qcsc-prefect):
+
+```bash
+# RHF orbitals as they are (h_alpha = h_beta):
+python rhf2uhf/rhf2uhf.py your.fcidump your_uhf.fcidump
+# broken-symmetry UHF (atom-localized AF guess; the fragment spec goes to the converter):
+python rhf2bsuhf/rhf2bsuhf.py your.fcidump your_bsuhf_uhf.fcidump --af-groups @af_groups.json
+```
+
+`run_recover.py` checks the format before building any blocks and stops with a pointer to the
+converters if `--method uhf` is given a spatial FCIDUMP (or `--method rhf` a spin-orbital one).
 
 See [`docs/tutorials/run_uhf_bsuhf_any_molecule.md`](../../docs/tutorials/run_uhf_bsuhf_any_molecule.md)
-for the full walkthrough (getting an FCIDUMP, building the AF-groups spec, building the solver
+for the full walkthrough (getting an FCIDUMP, choosing the orbitals, building the solver
 binaries) and [`docs/reference/hpc_resource_sizing.md`](../../docs/reference/hpc_resource_sizing.md)
 for how to choose `--nodes/--ranks-per-node/--omp-threads/--adet/--bdet`.
 
-[`walkthrough.ipynb`](walkthrough.ipynb) demonstrates the same pipeline end-to-end on a small
-molecule with no HPC required, before you scale up with this script.
+[`walkthrough.ipynb`](walkthrough.ipynb) demonstrates the same pipeline end-to-end on Fe2S2 with
+no HPC required (RHF and BS-UHF orbitals through both converters, then LUCJ and one local
+recovery step), before you scale up with this script.
 
 ## Prerequisites
 
@@ -31,7 +39,7 @@ cd algorithms/sbd && uv sync          # installs the `sbd` package into the acti
 
 Then build the native solver for your platform/method — see
 [`algorithms/sbd/native/README.md`](../../algorithms/sbd/native/README.md). You need the `_uhf`
-binary variant for both plain UHF and BS-UHF FCIDUMPs.
+binary variant for every spin-orbital FCIDUMP (RHF-derived or BS-UHF).
 
 You also need a persisted sample pool (a `raw_samples_*.npz`) from a prior `quantum_source=
 "real-device"` (or `"random"`, for a dry run) sampling run — this script only re-diagonalizes,
@@ -41,7 +49,7 @@ it does not sample.
 
 ```bash
 python run_recover.py \
-  --fcidump /path/to/your.fcidump --method uhf \
+  --fcidump /path/to/your_uhf.fcidump --method uhf \
   --pool /path/to/any_pool.npz --quantum-source random \
   --sqd-dim 2000 --recovery-steps 1 --n-batches 1 \
   --run-dir /tmp/sbd_recover_test \
@@ -51,7 +59,7 @@ python run_recover.py \
 ```
 
 `--quantum-source random` ignores `--pool`'s contents (deterministic random bitstrings instead) —
-useful to confirm the FCIDUMP, AF-groups spec, and block/flow plumbing all work before you touch a
+useful to confirm the FCIDUMP and block/flow plumbing all work before you touch a
 real pool or a multi-node allocation. `--pool` is still required by the CLI even though its
 contents aren't read in this mode.
 
@@ -59,8 +67,7 @@ contents aren't read in this mode.
 
 ```bash
 python run_recover.py \
-  --fcidump /path/to/your.fcidump --method uhf \
-  --af-groups '{"metal_a":[2,3,4,5,6],"metal_b":[7,8,9,10,11],"up":["metal_a"],"down":["metal_b"]}' \
+  --fcidump /path/to/your_bsuhf_uhf.fcidump --method uhf \
   --pool file:///path/to/raw_samples.npz \
   --sqd-dim 1000000000 --recovery-steps 50 --n-batches 1 \
   --ckpt-dir /path/to/ckpt --run-dir /path/to/run \
@@ -76,7 +83,7 @@ from the last completed step — look for `[ckpt] RESUME from ... completed N st
 
 ```bash
 python run_recover.py \
-  --fcidump /path/to/your.fcidump --method uhf --af-groups @af_groups.json \
+  --fcidump /path/to/your_uhf.fcidump --method uhf \
   --pool file:///path/to/raw_samples.npz \
   --sqd-dim 300000000 --recovery-steps 10 --n-batches 4 \
   --ckpt-dir /path/to/ckpt --run-dir /path/to/run \
@@ -93,7 +100,7 @@ runs every Davidson solve in-allocation (no nested `sbatch`), which is the fast 
 
 ```bash
 python run_recover.py \
-  --fcidump /path/to/your.fcidump --method uhf --af-groups @af_groups.json \
+  --fcidump /path/to/your_uhf.fcidump --method uhf \
   --pool /path/to/raw_samples.npz \
   --sqd-dim 8000000000 --recovery-steps 60 --n-batches 1 \
   --ckpt-dir /path/to/ckpt --run-dir /path/to/run \
@@ -160,10 +167,8 @@ silent or confusing failure before being fixed:
 
 | Group | Flag | Notes |
 | --- | --- | --- |
-| molecule | `--fcidump` | required |
+| molecule | `--fcidump` | required. `uhf`: spin-orbital FCIDUMP (rhf2uhf / rhf2bsuhf output); `rhf`: spatial FCIDUMP |
 | | `--method {rhf,uhf}` | default `uhf` |
-| | `--af-groups` | raw JSON, `@path/to/file.json`, or the `fe4s4` convenience keyword. Omit for plain UHF/RHF |
-| | `--af-pol`, `--af-free-s` | fractional-polarization / free-bridging-fragment knobs, see the tutorial |
 | SQD | `--pool` | one or more sample-pool paths/URIs, required |
 | | `--sqd-dim`, `--recovery-steps`, `--n-batches` | subspace size, recovery passes, K-batches |
 | | `--quantum-source {saved,random}` | `saved` is the production path |

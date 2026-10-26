@@ -1,14 +1,7 @@
 # Run UHF / Broken-Symmetry-UHF SQD for Any Molecule (Fugaku + ROQUO)
 
-> **Note (branch `rhf-input`)**: the workflow no longer builds orbitals. The in-workflow BS-UHF
-> (`_parse_af_groups` / `_converge_broken_symmetry_uhf`, `FE4S4_AF_*`, `SBD_UHF_CACHE*`) has been removed.
-> UHF runs take a spin-orbital FCIDUMP (`qcsc_workflow_utility.uhf_fcidump` format) and load it through
-> `compute_molecular_integrals_from_uhf_fcidump`. Build the orbitals outside the workflow: `rhf2uhf` for RHF
-> orbitals as they are, `rhf2bsuhf` for BS-UHF (both are plain folders next to qcsc-prefect). The env-var steps
-> below describe the old behaviour.
-
-The SBD closed-loop pipeline in this repo — `riken_sqd_de`, `FlowParameters`, the broken-symmetry
-UHF guess in `qcsc_workflow_utility.chem` — is molecule-agnostic. Everything you've seen in this
+The SBD closed-loop pipeline in this repo — `riken_sqd_de`, `FlowParameters`, and the orbital
+converters `rhf2uhf` / `rhf2bsuhf` that prepare its UHF input — is molecule-agnostic. Everything you've seen in this
 repo's Fe2S2/Fe4S4 material is one *instance* of that generic pipeline, not a special code path.
 This tutorial shows how to point the same pipeline at **your own** open-shell system, and how to
 scale that up to a genuine multi-node, multi-step recovery run on Fugaku or ROQUO.
@@ -27,13 +20,29 @@ It complements, rather than replaces, the existing tutorials:
   [How Determinants Are Built](../2026-07-08/HOW_DETERMINANTS_ARE_BUILT.md) — the recovery/
   occupancy/carryover mechanics this tutorial doesn't re-derive.
 
-## A naming quirk, up front
+## How the orbitals reach the workflow
 
-Several of the generic knobs below are named `FE4S4_*` (`FE4S4_AF_GROUPS`, `FE4S4_CKPT_DIR`,
-`FE4S4_AF_POL`, `FE4S4_AF_FREE_S`) because they were first added for the Fe4S4 study. **The
-mechanism behind each is fully generic** — the code only ever consumes the JSON/path you give it,
-with zero Fe-specific logic — only the env var *name* is Fe4S4-branded. You'll use these same
-variable names for any molecule.
+The workflow does not build orbitals. For a UHF run its input is a **spin-orbital FCIDUMP**
+(`qcsc_workflow_utility.uhf_fcidump` format: header `NORB` = spatial orbitals, records over
+`1..2*NORB` with alpha p -> `2p+1`, beta p -> `2p+2`; the same file the SBD `-D_UHF` build reads).
+`compute_molecular_integrals_from_uhf_fcidump` loads it as-is — no SCF — and takes the lowest
+`na`/`nb` orbitals by index as the reference. UCCSD (the LUCJ `t2` seed and the initial
+occupancies) and the optional `OO_INIT=1` step then run on top of those integrals.
+
+The orbitals are chosen beforehand by one of two converters that live next to this repository
+(`uhf_sqd_oo/rhf2uhf`, `uhf_sqd_oo/rhf2bsuhf`; plain folders, not part of qcsc-prefect). Both run in
+the sbd venv:
+
+| converter | input -> output | orbitals |
+| --- | --- | --- |
+| `rhf2uhf.py IN OUT` | spatial FCIDUMP -> spin-orbital FCIDUMP | unchanged (h_alpha = h_beta) |
+| `rhf2bsuhf.py IN OUT --af-groups ...` | spatial FCIDUMP -> BS-UHF -> spin-orbital FCIDUMP | broken-symmetry UHF MOs |
+
+Passing a spatial FCIDUMP to a UHF run stops with an error that points at `rhf2uhf`, so the two
+formats cannot be mixed up silently.
+
+The checkpoint knob `FE4S4_CKPT_DIR` (Step 5) is named `FE4S4_*` because it was first added for
+the Fe4S4 study; the mechanism is generic.
 
 ## Step 0 — Get an FCIDUMP for your molecule
 
@@ -49,19 +58,33 @@ generate one. Any of the following produce a valid FCIDUMP:
 Whatever tool you use, confirm the header parses to the electron/orbital counts you expect before
 moving on — a wrong `MS2` or orbital count silently produces a physically different active space.
 
-## Step 1 — Decide RHF vs UHF vs BS-UHF
+## Step 1 — Decide RHF vs UHF vs BS-UHF, and convert the FCIDUMP
 
-- **RHF**: closed-shell singlet, no broken symmetry needed. Use `create_blocks.py --method rhf`.
-- **UHF (energy-ordered)**: open-shell (non-zero `MS2`), or you want the unrestricted solution but
-  don't need a specific spin-localized guess. `--method uhf` with no extra env vars.
+- **RHF**: closed-shell singlet, restricted solver. Use `create_blocks.py --method rhf` with the
+  spatial FCIDUMP from Step 0 as is.
+- **UHF on the given orbitals**: open-shell (non-zero `MS2`), or you want the unrestricted solver
+  on the orbitals the FCIDUMP already has (e.g. canonical RHF MOs). Convert with `rhf2uhf`:
+
+  ```bash
+  python uhf_sqd_oo/rhf2uhf/rhf2uhf.py your.fcidump your_uhf.fcidump
+  ```
+
+  It checks that the orbitals are energy ordered around the gap (the workflow occupies the
+  lowest `na`/`nb` by index) and that the reference energy equals PySCF's energy of the input
+  orbitals, and exits non-zero otherwise.
 - **BS-UHF (broken-symmetry)**: a formally closed-shell system (`MS2=0`) with strongly-correlated,
   spatially-separated open-shell character (Fe-S clusters are the case this repo was built around,
   but the mechanism is general — any multi-center system with localizable, oppositely-polarizable
   fragments qualifies). Plain UHF started from the RHF density stays *at* the RHF solution here
   (RHF is a stationary point of the UHF equations) unless you seed it with a spin-localized guess.
+  Convert with `rhf2bsuhf`, giving it an `AF_GROUPS` fragment spec:
 
-For BS-UHF, build an `AF_GROUPS` JSON spec and set it as `FE4S4_AF_GROUPS` (see the naming note
-above):
+  ```bash
+  python uhf_sqd_oo/rhf2bsuhf/rhf2bsuhf.py your.fcidump your_bsuhf_uhf.fcidump \
+      --af-groups @af_groups.json --af-pol 1.0
+  ```
+
+The fragment spec (a JSON string, or `@file.json`):
 
 ```json
 {
@@ -73,21 +96,24 @@ above):
 }
 ```
 
-This is the same schema the Fe4S4 convenience shortcut (`FE4S4_AF_GROUPS=fe4s4`) expands to
-internally — see `_parse_af_groups()` in
-[`chem.py`](https://github.com/qiskit-community/qcsc-prefect/blob/main/algorithms/qcsc_workflow_utility/src/qcsc_workflow_utility/chem.py):
-any orbital-index fragment names work, not just `fe1`/`fe2`/`s`. Rules:
+`--af-groups fe4s4` is a preset for the ZDL [4Fe-4S] localized-orbital FCIDUMP only (its index
+ranges refer to that file's orbital order). Any fragment names work. Rules:
 
 - Every fragment not listed in `up`/`down`/`free` is treated as **closed** (doubly occupied).
 - `up` fragments get `0.5 + 0.5·pol` alpha / `0.5 − 0.5·pol` beta occupancy on their orbitals;
-  `down` fragments get the reverse. `pol` (env `FE4S4_AF_POL`, default `1.0`) controls how sharply
+  `down` fragments get the reverse. `pol` (`--af-pol`, default `1.0`) controls how sharply
   localized the guess is — `1.0` is a full 1/0 split, lower values couple the two sides more.
   If your BS-UHF converges to a highly spin-contaminated state, try a lower `pol` first.
-  `free` fragments (env `FE4S4_AF_FREE_S=1`, if you name one `"s"`) are seeded half-filled/
-  unpolarized instead of closed — useful for a bridging ligand that should mediate exchange rather
-  than sit doubly-occupied.
+  `--af-free` seeds a fragment named `"s"` half-filled/unpolarized instead of closed — useful for
+  a bridging ligand that should mediate exchange rather than sit doubly-occupied.
 - Orbital indices must cover every orbital in your FCIDUMP exactly once — mismatches will silently
   under- or over-count electrons in the guess.
+
+`rhf2bsuhf` also writes `OUT.meta.json` (E_UHF, `<S^2>`, settings, input sha1) and `OUT.mo.npz`
+(the converged MOs). It caches the converged MOs (`--cache-dir`, default `~/.cache/qcsc_uhf`;
+`--no-cache` to disable) so every conversion starts from the identical reference — large BS-UHF
+SCFs are BLAS-order sensitive and can land in different local minima run-to-run otherwise. The
+cache key includes the absolute input path, the fragment spec and `(na, nb)`.
 
 ## Step 2 — Build the SBD solver binaries
 
@@ -95,12 +121,12 @@ Covered in full in
 [`algorithms/sbd/native/README.md`](https://github.com/qiskit-community/qcsc-prefect/blob/main/algorithms/sbd/native/README.md)
 — not duplicated here. Short version: build both the restricted (`diag` / `diag-gpu`) and
 unrestricted (`diag_uhf` / `diag-gpu_uhf`, `UHF=1`) binaries for your platform; you need the UHF
-one for both plain-UHF and BS-UHF runs (the FCIDUMP layout differs from RHF's).
+one for every spin-orbital FCIDUMP, RHF-derived or BS-UHF (the FCIDUMP layout differs from RHF's).
 
 ## Step 3 — A quick, no-HPC correctness check
 
-Before spending node-hours, sanity-check your FCIDUMP and (if applicable) `AF_GROUPS` locally —
-no Prefect server, no HPC, no IBM Quantum call:
+Before spending node-hours, sanity-check your FCIDUMP locally — no Prefect server, no HPC, no IBM
+Quantum call. The converters already print and check the reference energy (Step 1). Then:
 
 ```bash
 cd algorithms/sbd
@@ -114,9 +140,11 @@ python run_local_uhf.py --mol OH --iters 3 --sqd_dim 5000
 
 `run_local_uhf.py` builds its molecule from a PySCF geometry string (its own small `MOLECULES`
 dict), not from an arbitrary FCIDUMP — it's meant for fast local UHF/orbital-rotation validation
-on a handful of atoms, not for driving your production system. For a BS-UHF FCIDUMP from Step 0/1,
-the next real correctness check is a small single-flow run (Step 4) with `quantum_source="random"`
-and a small `sqd_dim`, which exercises the real FCIDUMP + `AF_GROUPS` path end-to-end.
+on a handful of atoms, not for driving your production system.
+[`examples/sbd_uhf_recover_any_molecule/walkthrough.ipynb`](../../examples/sbd_uhf_recover_any_molecule/walkthrough.ipynb)
+runs both converters, the workflow's loader, LUCJ and one local recovery step on Fe2S2 in under a
+minute. For your own spin-orbital FCIDUMP the next real correctness check is a small single-flow
+run (Step 4) with `quantum_source="random"` and a small `sqd_dim`.
 
 ## Step 4 — A single-flow run (small scale, either HPC target)
 
@@ -132,8 +160,8 @@ python algorithms/sbd/create_blocks.py \
   --sbd-executable-uhf /path/to/diag_uhf
 ```
 
-and, if using BS-UHF, exporting `FE4S4_AF_GROUPS` (Step 1) in the environment the flow runs in —
-the flow reads it from the process environment, not from a block field.
+with `FlowParameters.fcidump` pointing at the spin-orbital FCIDUMP from Step 1. Nothing else
+changes between RHF-derived and BS-UHF orbitals — the choice is entirely in which file you pass.
 
 **Fugaku vs. ROQUO delta at this step:**
 
@@ -152,7 +180,9 @@ with `n_recovery_steps`/`n_batches` set high, plus two things a single UI run do
 
 - **A persisted sample pool** — sample once (`quantum_source="real-device"` or `"random"`), then
   point every subsequent recovery run at the saved `.npz` pool(s) with `quantum_source="saved"` so
-  you never re-sample the device.
+  you never re-sample the device. The pool's bits are occupations in the orbital basis of the
+  FCIDUMP the circuit was built from: a pool sampled with BS-UHF orbitals cannot be reused with an
+  RHF-orbital FCIDUMP (or vice versa), even for the same molecule.
 - **A checkpoint directory** — set `FE4S4_CKPT_DIR` (again: generic mechanism, Fe4S4-branded name)
   to a real path. After every completed recovery step, `sqd.py` writes
   `ckpt_t<trial>_w<walker>.npz` with `next_step`/`best`; on the next run with the *same*
@@ -164,9 +194,8 @@ wraps all of this into one CLI, molecule-agnostic (no Fe4S4 defaults):
 
 ```bash
 python examples/sbd_uhf_recover_any_molecule/run_recover.py \
-  --fcidump /path/to/your.fcidump \
+  --fcidump /path/to/your_bsuhf_uhf.fcidump \
   --pool file:///path/to/raw_samples.npz \
-  --af-groups '{"metal_a":[2,3,4,5,6],"bridge":[7,8,9,10],"metal_b":[11,12,13,14,15],"up":["metal_a"],"down":["metal_b"]}' \
   --method uhf --sqd-dim 4000000000 --recovery-steps 100 --n-batches 1 \
   --ckpt-dir /path/to/ckpt --hpc-target fugaku \
   --nodes 2304 --ranks-per-node 4 --omp-threads 12 --adet 96 --bdet 96 --queue large
@@ -204,10 +233,18 @@ ADET/BDET math, a worked table, and ROQUO GPU sizing — this is what decides th
 
 ## Troubleshooting
 
-**BS-UHF converges but `<S^2>` is very large / result looks wrong.** Your `AF_GROUPS` fragments
+**BS-UHF converges but `<S^2>` is very large / result looks wrong.** Your `--af-groups` fragments
 probably don't partition the orbital space correctly (overlap or gap), or `pol=1.0` is over-
-localizing for this system — try a fractional `FE4S4_AF_POL` (e.g. `0.6`) or mark a bridging
-fragment `free`.
+localizing for this system — try a fractional `--af-pol` (e.g. `0.6`) or mark a bridging
+fragment free (`--af-free`). Check `OUT.meta.json` (`E_UHF`, `spin_square`) before using the file.
+
+**`... looks like a spatial-orbital (restricted) FCIDUMP ... Convert it with rhf2uhf` at flow start.**
+The solver block is `method="uhf"` but `FlowParameters.fcidump` points at a spatial FCIDUMP. Convert
+it (Step 1) and pass the converted file.
+
+**`RuntimeWarning: ... not energy ordered around the gap`.** The workflow takes the lowest
+`na`/`nb` orbitals by index as the reference, and your orbitals are not ordered that way. Reorder
+them before writing the FCIDUMP (both converters emit canonical, energy-ordered MOs).
 
 **`NameError` or missing-module error deep in the checkpoint code path.** Make sure you're on a
 version of `sqd.py` that imports `os` at module level — this was a real bug (checkpoint code used

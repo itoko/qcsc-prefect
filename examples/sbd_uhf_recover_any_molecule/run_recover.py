@@ -1,8 +1,11 @@
 #!/usr/bin/env python
-"""NOTE (branch rhf-input): FE4S4_AF_* are no longer read by the workflow; with --method uhf the
---fcidump must be a spin-orbital FCIDUMP (rhf2uhf / rhf2bsuhf output). The --af-* options are ignored.
+"""Generic RHF/UHF/BS-UHF multi-step SQD recovery for any molecule, any HPC target.
 
-Generic RHF/UHF/BS-UHF multi-step SQD recovery for any molecule, any HPC target.
+The workflow does not build orbitals. With ``--method uhf`` the ``--fcidump`` must be a
+spin-orbital FCIDUMP (``qcsc_workflow_utility.uhf_fcidump`` format) whose orbitals were chosen
+beforehand: ``rhf2uhf`` (RHF orbitals as they are) or ``rhf2bsuhf`` (broken-symmetry UHF; the
+AF fragment spec is given to that converter, not here). ``--method rhf`` takes a plain spatial
+FCIDUMP. The script checks the format before building any blocks.
 
 Molecule-agnostic version of the pattern proven on Fe2S2/Fe4S4: sample once, persist the pool,
 then re-diagonalize offline (``quantum_source="saved"``) for many recovery steps with
@@ -16,10 +19,11 @@ Prerequisites (same as any other qcsc-prefect flow):
 
 Run with the same Python environment `algorithms/sbd` was installed into.
 
-Example (Fugaku, deep UHF recovery from a saved pool):
+Example (Fugaku, deep BS-UHF recovery from a saved pool):
+    python ../../../rhf2bsuhf/rhf2bsuhf.py your.fcidump your_bsuhf_uhf.fcidump \\
+        --af-groups '{"metal_a":[2,3,4,5,6],"metal_b":[7,8,9,10,11],"up":["metal_a"],"down":["metal_b"]}'
     python run_recover.py \\
-        --fcidump /path/to/your.fcidump --method uhf \\
-        --af-groups '{"metal_a":[2,3,4,5,6],"metal_b":[7,8,9,10,11],"up":["metal_a"],"down":["metal_b"]}' \\
+        --fcidump your_bsuhf_uhf.fcidump --method uhf \\
         --pool file:///path/to/raw_samples.npz \\
         --sqd-dim 1000000000 --recovery-steps 50 --n-batches 1 \\
         --ckpt-dir /path/to/ckpt --run-dir /path/to/run \\
@@ -28,7 +32,7 @@ Example (Fugaku, deep UHF recovery from a saved pool):
 
 Example (ROQUO, in-allocation GPU, single node / 4 GPUs):
     python run_recover.py \\
-        --fcidump /path/to/your.fcidump --method uhf --af-groups @af_groups.json \\
+        --fcidump /path/to/your_uhf.fcidump --method uhf \\
         --pool file:///path/to/raw_samples.npz \\
         --sqd-dim 300000000 --recovery-steps 10 --n-batches 4 \\
         --ckpt-dir /path/to/ckpt --run-dir /path/to/run \\
@@ -53,20 +57,37 @@ REPO_ROOT = HERE.parent.parent
 DEFAULT_SBD_DIR = REPO_ROOT / "algorithms" / "sbd"
 
 
-def _read_af_groups(raw: str | None) -> str | None:
-    """Accept a raw JSON string, an ``@path/to/file.json`` reference, or a convenience keyword
-    (e.g. "fe4s4") that ``_parse_af_groups()`` in ``chem.py`` expands internally. Returns the
-    exact string to put in ``FE4S4_AF_GROUPS`` (validated as JSON only if it isn't a keyword)."""
-    if not raw:
-        return None
-    if raw.startswith("@"):
-        raw = Path(raw[1:]).read_text()
-    if raw.strip().lower() not in {"fe4s4"}:
-        try:
-            json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"--af-groups is neither a known keyword nor valid JSON: {exc}")
-    return raw
+def _check_fcidump_format(path: str, method: str) -> None:
+    """Fail fast if the FCIDUMP format does not match --method (before any block is built).
+
+    UHF needs the interleaved spin-orbital format (max record index > NORB); RHF needs a plain
+    spatial FCIDUMP. Same rule as ``qcsc_workflow_utility.uhf_fcidump.read_uhf_fcidump``.
+    """
+    import re
+
+    norb, maxidx, in_records = None, 0, False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not in_records:
+                m = re.search(r"NORB\s*=\s*(\d+)", line, re.IGNORECASE)
+                if m:
+                    norb = int(m.group(1))
+                in_records = line.strip().upper() in ("&END", "/")
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                maxidx = max(maxidx, *(int(x) for x in parts[1:5]))
+    if norb is None:
+        raise SystemExit(f"{path}: no NORB in the FCIDUMP header.")
+    spin_orbital = norb < maxidx <= 2 * norb
+    if method == "uhf" and not spin_orbital:
+        raise SystemExit(
+            f"{path}: --method uhf needs a spin-orbital FCIDUMP (max index {maxidx} <= NORB={norb} "
+            "means a spatial one). Convert it first with rhf2uhf (orbitals unchanged) or "
+            "rhf2bsuhf (broken-symmetry UHF)."
+        )
+    if method == "rhf" and spin_orbital:
+        raise SystemExit(f"{path}: --method rhf needs a spatial FCIDUMP, got a spin-orbital one.")
 
 
 def _pool_uris(pools: list[str]) -> list[str]:
@@ -165,15 +186,9 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mol = p.add_argument_group("molecule")
-    mol.add_argument("--fcidump", required=True, help="Path to your molecule's FCIDUMP.")
+    mol.add_argument("--fcidump", required=True,
+                     help="uhf: spin-orbital FCIDUMP (rhf2uhf / rhf2bsuhf output); rhf: spatial FCIDUMP.")
     mol.add_argument("--method", choices=["rhf", "uhf"], default="uhf")
-    mol.add_argument(
-        "--af-groups", default=None,
-        help='Broken-symmetry-UHF fragment spec: raw JSON, "@path/to/file.json", or the "fe4s4" '
-             "convenience keyword. Omit for plain UHF/RHF (no localized guess).",
-    )
-    mol.add_argument("--af-pol", type=float, default=None, help="FE4S4_AF_POL override (0-1].")
-    mol.add_argument("--af-free-s", action="store_true", help="Sets FE4S4_AF_FREE_S=1.")
 
     sqd = p.add_argument_group("SQD / recovery")
     sqd.add_argument("--pool", nargs="+", required=True,
@@ -249,6 +264,7 @@ def main() -> None:
     if args.solver_mode is None:
         args.solver_mode = "fugaku" if args.hpc_target == "fugaku" else "cpu"
     _check_sizing(args)
+    _check_fcidump_format(args.fcidump, args.method)
 
     sbd_dir = Path(args.sbd_dir)
     run_dir = Path(args.run_dir)
@@ -263,13 +279,6 @@ def main() -> None:
     os.environ["PREFECT_HOME"] = str(prefect_home)
     os.environ["PREFECT_LOCAL_STORAGE_PATH"] = str(prefect_home / "storage")
 
-    af_groups = _read_af_groups(args.af_groups)
-    if af_groups is not None:
-        os.environ["FE4S4_AF_GROUPS"] = af_groups
-        if args.af_pol is not None:
-            os.environ["FE4S4_AF_POL"] = str(args.af_pol)
-        if args.af_free_s:
-            os.environ["FE4S4_AF_FREE_S"] = "1"
     if args.ckpt_dir:
         Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
         os.environ["FE4S4_CKPT_DIR"] = args.ckpt_dir
