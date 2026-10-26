@@ -1648,6 +1648,10 @@ def _subsample_one_spin(
     if rng is None:
         rng = MODULE_RNG
 
+    # _stack_spin_carryover zero-pads the shorter spin when the alpha and beta carryover sets differ
+    # in length; those padding rows come back here as all-zero bitstrings. Keep only rows with this
+    # spin's electron count, otherwise a 0-electron "determinant" enters the subspace.
+    carryover = carryover[carryover.sum(axis=1) == num_elec]
     num_carryover = carryover.shape[0]
 
     # Hartree-Fock string for this spin, e.g. '0000011111' for num_elec=5.

@@ -171,6 +171,42 @@ def test_subsample_open_shell_independent_spins():
     assert not np.array_equal(ci_a, ci_b)
 
 
+def test_subsample_open_shell_unequal_carryover_has_no_padding_dets():
+    """Regression: alpha/beta carryover sets of different length are zero-padded by
+    _stack_spin_carryover; the padding rows must not come back as 0-electron determinants
+    (seen on ROQUO job 236110: alpha dets n=13478 unique=13477, Davidson E jumped by ~28 Ha)."""
+    from sbd import sqd
+
+    norb, na, nb = 6, 3, 3
+    rng = np.random.default_rng(0)
+
+    def strings(n, k):
+        out = np.zeros((n, norb), dtype=bool)
+        for row in out:
+            row[rng.choice(norb, k, replace=False)] = True
+        return np.unique(out, axis=0)
+
+    co_a, co_b = strings(8, na)[:4], strings(12, nb)[:6]
+    stacked = sqd._stack_spin_carryover(co_a, co_b, norb)
+    bm = np.hstack([strings(400, nb)[:50], strings(400, na)[:50]])
+    probs = np.full(len(bm), 1.0 / len(bm))
+
+    ci_a, ci_b = sqd.subsample_open_shell.fn(
+        bitstring_matrix=bm,
+        probabilities=probs,
+        carryover_a=stacked[:, norb:],
+        carryover_b=stacked[:, :norb],
+        subspace_dim=400,
+        norb=norb,
+        num_elec_a=na,
+        num_elec_b=nb,
+        rng=np.random.default_rng(1),
+    )
+    for ci, n in ((ci_a, na), (ci_b, nb)):
+        assert len(set(ci.tolist())) == len(ci)
+        assert all(bin(int(c)).count("1") == n for c in ci)
+
+
 def _draw_open_shell(seed, *, rng=None):
     """Draw an alpha subspace large enough to exercise the rng.choice (random-pick) path.
 
