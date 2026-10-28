@@ -661,7 +661,60 @@ def rotate_electronic_properties(
         two_body_tensor_bb=h2_bb_new,
         t2_ab=elec_props.t2_ab,
         t2_bb=elec_props.t2_bb,
+        # <phi^alpha_new | phi^beta_new> = Ua^T <phi^alpha | phi^beta> Ub (identity if unset)
+        ab_overlap=(
+            Ua.T @ (np.eye(Ua.shape[0]) if elec_props.ab_overlap is None
+                    else np.asarray(elec_props.ab_overlap)) @ Ub
+            if elec_props.unrestricted else None
+        ),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API — spin_square_from_rdms
+# ─────────────────────────────────────────────────────────────────────────────
+
+def spin_square_from_rdms(
+    rdm1_a: np.ndarray,
+    rdm1_b: np.ndarray,
+    rdm2_aa: np.ndarray,
+    rdm2_ab: np.ndarray,
+    rdm2_bb: np.ndarray,
+    ab_overlap: np.ndarray | None = None,
+) -> float:
+    """<S^2> of the state whose RDMs the native SBD solver wrote (``do_rdm != 0``).
+
+    Inputs are in the solver's file layout as read by ``sbd.solver_job._read_rdm_file``: rdm1[p, q]
+    = <q^dag p> and every 2-RDM block (aa, ab, bb) in "prqs" storage, rdm2[p, r, q, s] =
+    <p^dag r^dag s q> (alpha index first in the ab block), the same storage ``optimize_orbitals``
+    consumes with ``rdm2_notation="prqs"``. One transpose (0,2,1,3) maps each block to PySCF's
+    ``make_rdm12s`` layout, which goes to PySCF's ``spin_square_general``. (``main.cc`` writes the
+    native flat r[io + L jo + L^2 ia + L^3 ja] in row-major (io, jo, ia, ja) order, so the file
+    element [i, j, k, l] is that native value; the test pins this against PySCF through a replica
+    of the patched native kernel.) ``ab_overlap`` = <phi_p^alpha | phi_q^beta> of the orbitals the RDMs
+    are expressed in (ElectronicProperties.ab_overlap); None = identity (alpha and beta orbitals
+    coincide). For a UHF orbital basis the identity is WRONG, because S_+ S_- couples alpha and
+    beta orbitals through their overlap.
+    """
+    from pyscf.fci.spin_op import spin_square_general
+
+    n = np.asarray(rdm1_a).shape[0]
+    s_ab = np.eye(n) if ab_overlap is None else np.asarray(ab_overlap, dtype=np.float64)
+    # spin_square_general builds every overlap block from (mo_a, mo_b) and an AO overlap. Use an
+    # orthonormal "AO" basis = the alpha orbitals, so mo_a = I and mo_b = S_ab. The beta-beta block
+    # mo_b^T mo_b must then be the identity, i.e. S_ab must be orthogonal (true for a rotation of
+    # orthonormal alpha/beta sets spanning the same space).
+    dev = float(np.max(np.abs(s_ab.T @ s_ab - np.eye(n))))
+    if dev > 1e-6:
+        raise ValueError(f"ab_overlap is not orthogonal (max |S^T S - 1| = {dev:.2e})")
+    ss, _ = spin_square_general(
+        np.asarray(rdm1_a), np.asarray(rdm1_b),
+        np.asarray(rdm2_aa).transpose(0, 2, 1, 3),
+        np.asarray(rdm2_ab).transpose(0, 2, 1, 3),
+        np.asarray(rdm2_bb).transpose(0, 2, 1, 3),
+        (np.eye(n), s_ab), 1,
+    )
+    return float(ss)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

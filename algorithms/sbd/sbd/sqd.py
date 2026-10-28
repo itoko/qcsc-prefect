@@ -948,6 +948,28 @@ def walker_sqd(
             np.array2string(spin_density, precision=3, max_line_width=200),
         )
 
+        # [diag] <S^2> of the best batch's state from its RDMs (only when the solver wrote them,
+        # do_rdm != 0). UHF orbitals: alpha/beta overlap from elec_props.ab_overlap (identity if
+        # unset). Parsed by the analysis tooling; a failure here must never stop the run.
+        if elec_props.unrestricted and step_sbd_result is not None and step_sbd_result.rdm2_ab is not None:
+            try:
+                from qcsc_workflow_utility.orbital_opt import spin_square_from_rdms
+
+                _s2 = spin_square_from_rdms(
+                    step_sbd_result.rdm1, step_sbd_result.rdm1_b,
+                    step_sbd_result.rdm2, step_sbd_result.rdm2_ab, step_sbd_result.rdm2_bb,
+                    ab_overlap=elec_props.ab_overlap,
+                )
+                logger.info(
+                    "[diag] recovery %d/%d <S^2> = %.6f (S = %.4f; ab_overlap=%s)",
+                    recovery_step + 1, n_recovery_steps, _s2,
+                    float(np.sqrt(max(_s2, 0.0) + 0.25) - 0.5),
+                    "identity" if elec_props.ab_overlap is None else "file/rotated",
+                )
+            except Exception as _s2_exc:
+                logger.warning("[diag] recovery %d/%d <S^2> skipped (%s)",
+                               recovery_step + 1, n_recovery_steps, _s2_exc)
+
         logger.info(
             "Recovery step %d/%d: best energy = %.6f over %d batch(es) (net subspace dim = %d)",
             recovery_step + 1,

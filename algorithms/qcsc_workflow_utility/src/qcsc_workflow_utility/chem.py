@@ -68,6 +68,11 @@ class ElectronicProperties(BaseModel):
     # UCCSD t2 mixed (t2ab) and beta-beta (t2bb) amplitudes; t2aa stays in t2.
     t2_ab: NpStrict4DArrayF64 | None = None
     t2_bb: NpStrict4DArrayF64 | None = None
+    # Overlap between the current alpha and beta orbitals, S_ab[p, q] = <phi_p^alpha | phi_q^beta>,
+    # needed for <S^2> (spin_square_from_rdms). UHF only. None means the alpha and beta orbitals
+    # coincide at load time (identity; e.g. rhf2uhf input); orbital rotations update it as
+    # Ua^T S_ab Ub (rotate_electronic_properties).
+    ab_overlap: NpStrict2DArrayF64 | None = None
 
 
 def _build_property(
@@ -442,6 +447,7 @@ def compute_molecular_integrals_from_fcidump(
 def compute_molecular_integrals_from_uhf_fcidump(
     fcidump_file: str,
     spin_sq: float = 0.0,
+    ab_overlap_file: str | None = None,
 ) -> ElectronicProperties:
     """Load a spin-orbital FCIDUMP as the unrestricted reference -- no SCF, no orbital change.
 
@@ -454,6 +460,10 @@ def compute_molecular_integrals_from_uhf_fcidump(
     Args:
         fcidump_file: Interleaved spin-orbital FCIDUMP (header NORB = spatial orbitals).
         spin_sq: Target value for the total spin squared for the ground state.
+        ab_overlap_file: ``.npz`` with key ``ab_overlap`` (norb x norb), the overlap between the
+            file's alpha and beta orbitals (rhf2bsuhf writes ``OUT.ab_overlap.npz``). Default: the
+            sidecar ``<fcidump_file>.ab_overlap.npz`` if it exists, else identity (alpha and beta
+            orbitals coincide, as for rhf2uhf output). Only used for <S^2>.
 
     Returns:
         ElectronicProperties with ``unrestricted=True``; ``nuclear_repulsion_energy`` is the
@@ -464,6 +474,14 @@ def compute_molecular_integrals_from_uhf_fcidump(
     props, e_ref, e_cc, cc_conv = _build_property_from_uhf_integrals(
         h1_a, h1_b, h2_aa, h2_ab, h2_bb, norb, nelec, ecore, spin_sq, buf
     )
+    if ab_overlap_file is None and os.path.exists(f"{fcidump_file}.ab_overlap.npz"):
+        ab_overlap_file = f"{fcidump_file}.ab_overlap.npz"
+    if ab_overlap_file is not None:
+        s_ab = np.asarray(np.load(ab_overlap_file)["ab_overlap"], dtype=np.float64)
+        if s_ab.shape != (norb, norb):
+            raise ValueError(f"{ab_overlap_file}: ab_overlap shape {s_ab.shape} != ({norb}, {norb})")
+        props = props.model_copy(update={"ab_overlap": s_ab})
+        print(f"[uhf-input] alpha/beta orbital overlap from {os.path.abspath(ab_overlap_file)}", flush=True)
     # Reference line parsed by the analysis tooling (check_logs.py / notebooks).
     print(
         f"[uhf-input] loaded spin-orbital FCIDUMP {os.path.abspath(fcidump_file)} "
@@ -809,6 +827,7 @@ def _refresh_cc_seed_uhf(
         open_shell=elec_props.open_shell,
         unrestricted=True,
         spin_sq=elec_props.spin_sq,
+        ab_overlap=elec_props.ab_overlap,
     )
     return (props, float(mycc.e_tot)) if return_energy else props
 
