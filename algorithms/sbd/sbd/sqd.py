@@ -31,6 +31,7 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
+from .staircase_probe import freeze_subspace
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
@@ -765,6 +766,11 @@ def walker_sqd(
                     seed_budget_frac=seed_budget_frac,
                     recomb_boost=recomb_boost,
                     recomb_max_parents=recomb_max_parents,
+                )
+                # Staircase study D4 (SBD_FREEZE_SUBSPACE_AT; off by default): from that trial on,
+                # diagonalize the determinant lists drawn at that trial instead of the new draw.
+                ci_a, ci_b = freeze_subspace(
+                    trial_index, f"r{recovery_step}_b{batch}", ci_a, ci_b, logger=logger
                 )
                 if batch == 0:
                     # [diag] excitation profile of batch 0 (make-or-break: a subspace dominated by
