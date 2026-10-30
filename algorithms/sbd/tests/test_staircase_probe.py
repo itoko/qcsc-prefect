@@ -16,7 +16,8 @@ import scipy.linalg
 from sbd import staircase_probe as sp
 
 ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD_BRANCH_SAVE_AT",
-       "SBD_BRANCH_DIR", "SBD_BRANCH_FROM",
+       "SBD_BRANCH_DIR", "SBD_BRANCH_FROM", "SBD_EARLY_OO_TRIALS", "SBD_EARLY_OO_TRUST",
+       "SBD_EARLY_OO_MAXITER", "SBD_EARLY_OO_GTOL",
        "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR")
 
 
@@ -167,3 +168,14 @@ def test_branch_save_trials(monkeypatch):
     assert sp.branch_save_trials() == {25, 30, 31}
     monkeypatch.setenv("SBD_BRANCH_SAVE_AT", "all")   # refused: would write every trial
     assert sp.branch_save_trials() == set()
+
+
+def test_early_oo_overrides(monkeypatch):
+    assert sp.early_oo_overrides(0) == {}                       # off by default
+    monkeypatch.setenv("SBD_EARLY_OO_TRIALS", "3")
+    assert sp.early_oo_overrides(0) == {}                       # window set but nothing to override
+    monkeypatch.setenv("SBD_EARLY_OO_TRUST", "0.2")
+    monkeypatch.setenv("SBD_EARLY_OO_MAXITER", "2000")
+    monkeypatch.setenv("SBD_EARLY_OO_GTOL", "1e-6")
+    assert sp.early_oo_overrides(2) == {"trust_radius": 0.2, "maxiter": 2000, "gtol": 1e-6}
+    assert sp.early_oo_overrides(3) == {}                       # past the window

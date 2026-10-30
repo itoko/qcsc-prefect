@@ -256,3 +256,32 @@ def load_branch(path: str, elec_props_template, state_cls, norb: int):
     tracker = RotationTracker(norb)
     tracker.c_a, tracker.c_b = d["c_a"], d["c_b"]
     return int(d["trial"]), elec_props, state, tracker
+
+
+# ── D6: different OO settings for the first trials ───────────────────────────
+#
+# The first fixed-RDM OO (trial 0 from RHF orbitals) does not converge with the production
+# settings (trust 0.5, maxiter 300): it stops at the iteration cap with ~40 parameters on the box,
+# and two runs whose RDMs differ by 1e-13 end 0.25 apart (|x| ~ 8 rad). Which spin-coupling basin
+# a run lands in appears to be decided there. These env vars override the OO settings for trials
+# 0..N-1 only; later trials use the normal OO_TRUST / OO_MAXITER / OO_GRAD_TOL.
+#
+#   SBD_EARLY_OO_TRIALS=N        number of early trials (unset/0 = off)
+#   SBD_EARLY_OO_TRUST=<float>   trust radius (box bound) for those trials
+#   SBD_EARLY_OO_MAXITER=<int>   L-BFGS-B maxiter for those trials
+#   SBD_EARLY_OO_GTOL=<float>    L-BFGS-B pgtol for those trials
+
+
+def early_oo_overrides(trial: int) -> dict:
+    """Overrides for optimize_orbitals at ``trial`` ({} when off or past the early window)."""
+    n = _env_int("SBD_EARLY_OO_TRIALS") or 0
+    if trial >= n:
+        return {}
+    out: dict = {}
+    for env, key, cast in (("SBD_EARLY_OO_TRUST", "trust_radius", float),
+                           ("SBD_EARLY_OO_MAXITER", "maxiter", int),
+                           ("SBD_EARLY_OO_GTOL", "gtol", float)):
+        raw = os.environ.get(env, "").strip()
+        if raw:
+            out[key] = cast(raw)
+    return out

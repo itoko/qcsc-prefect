@@ -514,7 +514,23 @@ def riken_sqd_de(
                     float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
                     else getattr(parameters, "oo_grad_tol", 1e-5)
                 )
+                # D6 (SBD_EARLY_OO_*; off by default): other OO settings for the first trials.
+                _early_oo = staircase_probe.early_oo_overrides(i)
+                if _early_oo:
+                    logger.info("Trial %d: [early-oo] OO settings overridden: %s", i, _early_oo)
                 try:
+                    _oo_kwargs = dict(
+                        trust_radius=(
+                            float(os.environ["OO_TRUST"]) if "OO_TRUST" in os.environ
+                            else getattr(parameters, "oo_trust_radius", 0.5)
+                        ),
+                        maxiter=(
+                            int(os.environ["OO_MAXITER"]) if "OO_MAXITER" in os.environ
+                            else getattr(parameters, "oo_maxiter", 300)
+                        ),
+                        gtol=oo_gtol,
+                    )
+                    _oo_kwargs.update(_early_oo)
                     Ua, Ub, e_opt, grad_norm = optimize_orbitals(
                         elec_props=elec_props,
                         rdm1_aa=rdm1_aa,
@@ -527,20 +543,11 @@ def riken_sqd_de(
                         # to "pqrs"; passing "pqrs"-stored data as prqs (or vice versa) applies a
                         # wrong transpose -> unphysical energy (~-159 Ha for OH). Must be "prqs".
                         rdm2_notation="prqs",
-                        # Shared OO thresholds: OO_TRUST / OO_MAXITER env override the flow
-                        # params so the initial OO (chem._apply_initial_oo) and this DE-loop OO
-                        # use identical criteria. Env absent -> unchanged (backward compatible).
-                        trust_radius=(
-                            float(os.environ["OO_TRUST"]) if "OO_TRUST" in os.environ
-                            else getattr(parameters, "oo_trust_radius", 0.5)
-                        ),
-                        maxiter=(
-                            int(os.environ["OO_MAXITER"]) if "OO_MAXITER" in os.environ
-                            else getattr(parameters, "oo_maxiter", 300)
-                        ),
-                        # Inner L-BFGS-B convergence tolerance (scipy pgtol), unified with the
-                        # outer freeze and the initial/SC OO via the same OO_GRAD_TOL knob.
-                        gtol=oo_gtol,
+                        # Shared OO thresholds (in _oo_kwargs above): OO_TRUST / OO_MAXITER env
+                        # override the flow params so the initial OO (chem._apply_initial_oo) and
+                        # this DE-loop OO use identical criteria; the inner L-BFGS-B pgtol is the
+                        # same OO_GRAD_TOL knob as the outer freeze. Env absent -> unchanged.
+                        **_oo_kwargs,
                         davidson_ref_energy=float(_rdm_e) if _rdm_e is not None else None,
                     )
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
@@ -654,7 +661,8 @@ def riken_sqd_de(
                         f"{objective_gap:+.3e}" if objective_gap is not None else "n/a",
                         grad_norm, oo_gtol,
                     )
-                    if grad_norm < oo_gtol and not getattr(parameters, "oo_refire_every_trial", False):
+                    if (grad_norm < oo_gtol and not _early_oo
+                            and not getattr(parameters, "oo_refire_every_trial", False)):
                         logger.info(
                             "Trial %d: |grad|=%.3e < oo_gtol=%.1e -> orbitals stationary "
                             "(generalized Brillouin condition). Freezing basis.",
