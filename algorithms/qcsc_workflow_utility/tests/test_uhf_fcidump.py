@@ -160,3 +160,69 @@ def test_non_aufbau_order_warns(tmp_path):
         mp.setattr(chem.cc, "UCCSD", _stop)
         with pytest.warns(RuntimeWarning, match="energy ordered"), pytest.raises(_Stop):
             chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+
+
+# ── SEED_CC_FILE: pin the UCCSD seed across runs ─────────────────────────────
+
+
+def test_seed_cc_file_roundtrip(reference, tmp_path, monkeypatch):
+    """First run writes the seed; a later run loads it without running UCCSD and gets the
+    identical t2 / occupancies / E_UCCSD."""
+    path, _, _ = reference
+    seed = tmp_path / "seed" / "cc.npz"
+    monkeypatch.setenv("SEED_CC_FILE", str(seed))
+    ep1 = chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+    assert seed.exists()
+    with mock.patch.object(chem.cc, "UCCSD", side_effect=AssertionError("UCCSD must not run")):
+        ep2 = chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+    for a, b in [(ep1.t2, ep2.t2), (ep1.t2_ab, ep2.t2_ab), (ep1.t2_bb, ep2.t2_bb),
+                 (ep1.initial_occupancy[0], ep2.initial_occupancy[0]),
+                 (ep1.initial_occupancy[1], ep2.initial_occupancy[1])]:
+        np.testing.assert_array_equal(a, b)
+
+
+def test_seed_cc_file_existing_wins(reference, tmp_path, monkeypatch):
+    """If the file appears while this run is in UCCSD (another array element wrote it first),
+    this run uses the file's seed, not its own."""
+    path, _, _ = reference
+    seed = tmp_path / "cc.npz"
+    monkeypatch.setenv("SEED_CC_FILE", str(seed))
+    ep_ref = chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+    # tamper with the stored seed to make it distinguishable, keep its fingerprint
+    with np.load(seed) as z:
+        d = {k: z[k] for k in z.files}
+    d["t2_aa"] = d["t2_aa"] + 1.0
+    np.savez(seed, **d)
+    real_exists = chem.os.path.exists
+    calls = {"n": 0}
+
+    def exists_late(p):  # pretend the file is absent at the start of this run only
+        if str(p) == str(seed) and calls["n"] == 0:
+            calls["n"] += 1
+            return False
+        return real_exists(p)
+
+    monkeypatch.setattr(chem.os.path, "exists", exists_late)
+    ep = chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+    np.testing.assert_allclose(ep.t2, ep_ref.t2 + 1.0)
+
+
+def test_seed_cc_file_fingerprint_mismatch(reference, tmp_path, monkeypatch):
+    path, _, tensors = reference
+    seed = tmp_path / "cc.npz"
+    monkeypatch.setenv("SEED_CC_FILE", str(seed))
+    chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
+    other = tmp_path / "other.txt"
+    t = dict(tensors)
+    t["h1_a"] = t["h1_a"] + 1e-6 * np.eye(t["norb"])
+    write_uhf_fcidump(other, **t)
+    with pytest.raises(ValueError, match="different integrals"):
+        chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(other))
+
+
+def test_seed_cc_file_rejects_oo_init(reference, tmp_path, monkeypatch):
+    path, _, _ = reference
+    monkeypatch.setenv("SEED_CC_FILE", str(tmp_path / "cc.npz"))
+    monkeypatch.setenv("OO_INIT", "1")
+    with pytest.raises(ValueError, match="OO_INIT"):
+        chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))

@@ -186,6 +186,31 @@ def _build_property_from_uhf_integrals(
             stacklevel=2,
         )
 
+    # SEED_CC_FILE (opt-in): reuse a saved UCCSD seed instead of re-running UCCSD. The UCCSD here
+    # often stops at max_cycle unconverged, and from there its iterates depend on the BLAS thread
+    # reduction order, so the t2 seed (hence the LUCJ ansatz and the trial-0 subspace) differs
+    # run to run even for the same input and seed. One file shared by all runs pins it.
+    seed_cc_file = os.environ.get("SEED_CC_FILE", "").strip()
+    fingerprint = _integral_fingerprint(h1_a, h1_b, h2_aa, h2_ab, h2_bb, nelec)
+    if seed_cc_file and os.path.exists(seed_cc_file):
+        if os.environ.get("OO_INIT", "0") == "1":
+            raise ValueError("SEED_CC_FILE cannot be combined with OO_INIT=1 (needs the live UCCSD).")
+        seed = load_cc_seed(seed_cc_file, fingerprint)
+        buf.write(
+            f"[seed-cc] loaded UCCSD seed from {os.path.abspath(seed_cc_file)} "
+            f"(E_UCCSD={seed['e_cc']:.10f}, converged={seed['converged']}, sha1={seed['sha1']})\n"
+        )
+        get_run_logger().info(buf.getvalue())
+        props = props.model_copy(
+            update={
+                "t2": seed["t2_aa"],
+                "t2_ab": seed["t2_ab"],
+                "t2_bb": seed["t2_bb"],
+                "initial_occupancy": (seed["occ_a"], seed["occ_b"]),
+            }
+        )
+        return props, e_ref, seed["e_cc"], seed["converged"]
+
     # Run UCCSD; t2 is the tuple (t2aa, t2ab, t2bb). Strongly-correlated Fe-S active spaces do not
     # converge in the default 50 cycles; raise max_cycle + DIIS so the amplitude seed for the LUCJ
     # ansatz is well-formed (override via SEED_CCSD_MAX_CYCLE).
@@ -208,6 +233,23 @@ def _build_property_from_uhf_integrals(
     occ_a = np.diag(dm_cc_a)
     occ_b = np.diag(dm_cc_b)
 
+    e_cc, cc_conv = float(mycc.e_tot), bool(mycc.converged)
+    if seed_cc_file:
+        # First writer wins; every run then uses the FILE's seed, so array elements that started
+        # together (each running its own UCCSD) still end up on one identical seed.
+        written = save_cc_seed(
+            seed_cc_file, fingerprint, t2_aa, t2_ab, t2_bb, occ_a, occ_b, e_cc, cc_conv
+        )
+        seed = load_cc_seed(seed_cc_file, fingerprint)
+        t2_aa, t2_ab, t2_bb = seed["t2_aa"], seed["t2_ab"], seed["t2_bb"]
+        occ_a, occ_b = seed["occ_a"], seed["occ_b"]
+        buf.write(
+            f"[seed-cc] {'wrote' if written else 'another run wrote'} UCCSD seed "
+            f"{os.path.abspath(seed_cc_file)}; using it (E_UCCSD={seed['e_cc']:.10f} vs this run "
+            f"{e_cc:.10f}, sha1={seed['sha1']})\n"
+        )
+        e_cc, cc_conv = seed["e_cc"], seed["converged"]
+
     # Get PySCF logs dumped into in-memory buffer
     get_run_logger().info(buf.getvalue())
 
@@ -223,9 +265,64 @@ def _build_property_from_uhf_integrals(
     # Opt-in initial orbital optimization: reference -> UCCSD -> OO -> UCCSD refresh.
     # Default off (OO_INIT unset/0).
     if os.environ.get("OO_INIT", "0") == "1":
+        if seed_cc_file:
+            raise ValueError("SEED_CC_FILE cannot be combined with OO_INIT=1 (needs the live UCCSD).")
         props = _apply_initial_oo(props, mycc, dm_cc_a, dm_cc_b)
 
-    return props, e_ref, float(mycc.e_tot), bool(mycc.converged)
+    return props, e_ref, e_cc, cc_conv
+
+
+def _integral_fingerprint(h1_a, h1_b, h2_aa, h2_ab, h2_bb, nelec) -> str:
+    """sha1 of the integrals and electron counts a saved UCCSD seed belongs to."""
+    import hashlib
+
+    h = hashlib.sha1()
+    for a in (h1_a, h1_b, h2_aa, h2_ab, h2_bb):
+        h.update(np.ascontiguousarray(a, dtype=np.float64).tobytes())
+    h.update(np.asarray(nelec, dtype=np.int64).tobytes())
+    return h.hexdigest()
+
+
+def save_cc_seed(path, fingerprint, t2_aa, t2_ab, t2_bb, occ_a, occ_b, e_cc, converged) -> bool:
+    """Write a UCCSD seed file unless one already exists. Returns True if this call wrote it.
+
+    Written to a temp file and linked into place, so concurrent writers never leave a partial
+    file and the first writer wins (later ones keep the existing file)."""
+    if os.path.exists(path):
+        return False
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as fh:
+        np.savez(
+            fh, fingerprint=np.asarray(fingerprint), t2_aa=t2_aa, t2_ab=t2_ab, t2_bb=t2_bb,
+            occ_a=occ_a, occ_b=occ_b, e_cc=np.float64(e_cc), converged=np.bool_(converged),
+        )
+    try:
+        os.link(tmp, path)  # fails if path exists -> first writer wins
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        os.unlink(tmp)
+
+
+def load_cc_seed(path, fingerprint: str) -> dict:
+    """Read a UCCSD seed file and check it was made for these integrals."""
+    import hashlib
+
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    with np.load(io.BytesIO(raw)) as z:
+        if str(z["fingerprint"]) != fingerprint:
+            raise ValueError(
+                f"SEED_CC_FILE {path} was made for different integrals/electron counts "
+                f"(fingerprint {str(z['fingerprint'])[:12]} != {fingerprint[:12]})."
+            )
+        out = {k: np.asarray(z[k], dtype=np.float64) for k in ("t2_aa", "t2_ab", "t2_bb", "occ_a", "occ_b")}
+        out["e_cc"] = float(z["e_cc"])
+        out["converged"] = bool(z["converged"])
+    out["sha1"] = hashlib.sha1(raw).hexdigest()[:12]
+    return out
 
 
 def _apply_initial_oo(
