@@ -244,8 +244,26 @@ def riken_sqd_de(
     # for the opt-in RDM dump (SBD_DUMP_RDM_DIR). Bookkeeping only; does not change the run.
     _rot_tracker = staircase_probe.RotationTracker(elec_props.num_orbitals)
 
+    # Opt-in branch restart (SBD_BRANCH_FROM): continue from the state saved before trial T by an
+    # earlier run (SBD_BRANCH_SAVE_AT). The integrals and t2 seed in the file replace the ones
+    # just built, so the restarted run sees exactly the original run's state at T.
+    _start_trial = 0
+    _branch_from = os.environ.get("SBD_BRANCH_FROM", "").strip()
+    if _branch_from:
+        _start_trial, elec_props, state, _rot_tracker = staircase_probe.load_branch(
+            _branch_from, elec_props, OptimizerState, elec_props.num_orbitals
+        )
+        logger.info("[branch] restored state before trial %d from %s (best=%s)",
+                    _start_trial, _branch_from, state.best_energy())
+    _branch_save = staircase_probe.branch_save_trials()
+
     # Start differential evoluation
-    for i in range(parameters.de_params.iterations):
+    for i in range(_start_trial, parameters.de_params.iterations):
+        if i in _branch_save:
+            try:
+                staircase_probe.save_branch(i, elec_props, state, _rot_tracker, logger=logger)
+            except Exception:
+                logger.exception("Trial %d: branch save failed (continuing).", i)
         logger.info(f"Running differential evolution trial {i}")
 
         state, best_sbd_result = differential_evolution_trial(

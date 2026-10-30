@@ -15,7 +15,8 @@ import scipy.linalg
 
 from sbd import staircase_probe as sp
 
-ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT",
+ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD_BRANCH_SAVE_AT",
+       "SBD_BRANCH_DIR", "SBD_BRANCH_FROM",
        "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR")
 
 
@@ -121,3 +122,48 @@ def test_freeze_orbitals(monkeypatch):
     monkeypatch.setenv("SBD_FREEZE_ORBITALS_AT", "30")
     assert not sp.orbitals_frozen(29)
     assert sp.orbitals_frozen(30) and sp.orbitals_frozen(80)
+
+
+def _ep(n=4, seed=3):
+    from qcsc_workflow_utility.chem import ElectronicProperties
+    rng = np.random.default_rng(seed)
+    h1 = rng.normal(size=(n, n)); h1 = h1 + h1.T
+    g = rng.normal(size=(n,) * 4)
+    return ElectronicProperties(
+        one_body_tensor=h1, two_body_tensor=g, t2=rng.normal(size=(2, 2, n, n)),
+        initial_occupancy=(rng.random(n), rng.random(n)), nuclear_repulsion_energy=1.5,
+        num_orbitals=n, num_electrons=(2, 2), open_shell=False, spin_sq=0.0, unrestricted=True,
+        one_body_tensor_b=h1 + 0.1, two_body_tensor_ab=g + 0.2, two_body_tensor_bb=g + 0.3,
+        t2_ab=rng.normal(size=(2, 2, n, n)), t2_bb=rng.normal(size=(2, 2, n, n)),
+        ab_overlap=_rand_orth(n, 9),
+    )
+
+
+def test_branch_roundtrip(tmp_path, monkeypatch):
+    from sbd.main import OptimizerState
+    monkeypatch.setenv("SBD_BRANCH_DIR", str(tmp_path))
+    ep = _ep()
+    st = OptimizerState(energies=np.array([-1.25]), populations=np.arange(6.0).reshape(1, 6),
+                        carryover=np.array([[True, False, True, False]] * 3), best_index=0)
+    tr = sp.RotationTracker(4)
+    tr.apply(_rand_orth(4, 1), _rand_orth(4, 2))
+    path = sp.save_branch(30, ep, st, tr)
+    t, ep2, st2, tr2 = sp.load_branch(path, _ep(seed=99), OptimizerState, 4)  # template is different
+    assert t == 30
+    for k in ("one_body_tensor", "two_body_tensor", "t2", "one_body_tensor_b", "two_body_tensor_ab",
+              "two_body_tensor_bb", "t2_ab", "t2_bb", "ab_overlap"):
+        np.testing.assert_array_equal(getattr(ep2, k), getattr(ep, k))
+    np.testing.assert_array_equal(ep2.initial_occupancy[0], ep.initial_occupancy[0])
+    assert ep2.nuclear_repulsion_energy == 1.5 and ep2.num_electrons == (2, 2)
+    np.testing.assert_array_equal(st2.populations, st.populations)
+    np.testing.assert_array_equal(st2.carryover, st.carryover)
+    assert st2.best_index == 0 and st2.best_energy() == -1.25
+    np.testing.assert_array_equal(tr2.c_a, tr.c_a)
+
+
+def test_branch_save_trials(monkeypatch):
+    assert sp.branch_save_trials() == set()
+    monkeypatch.setenv("SBD_BRANCH_SAVE_AT", "25,30-31")
+    assert sp.branch_save_trials() == {25, 30, 31}
+    monkeypatch.setenv("SBD_BRANCH_SAVE_AT", "all")   # refused: would write every trial
+    assert sp.branch_save_trials() == set()

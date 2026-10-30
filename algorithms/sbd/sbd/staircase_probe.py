@@ -1,6 +1,6 @@
 """Opt-in probes for the RHF-input "staircase" study (PLAN_staircase_mechanism.md, C/D).
 
-All three are controlled by environment variables and are OFF unless set:
+(The branch save/restore at the end of this file is documented there.) The first three are controlled by environment variables and are OFF unless set:
 
 * ``SBD_DUMP_RDM_DIR`` -- per-trial dump of the best walker's RDMs, determinant lists,
   occupancies, this trial's OO rotation (Ua, Ub) and the CUMULATIVE rotation from the input
@@ -168,3 +168,91 @@ def freeze_subspace(trial: int, key: str, ci_a: np.ndarray, ci_b: np.ndarray, lo
 def orbitals_frozen(trial: int) -> bool:
     t_freeze = _env_int("SBD_FREEZE_ORBITALS_AT")
     return t_freeze is not None and trial >= t_freeze
+
+
+# ── branch: save the full between-trial state and restart from it ────────────
+#
+# Between two DE trials the loop carries only: the (rotated) integrals ``elec_props``, the
+# optimizer ``state`` (energies, LUCJ populations, carryover, best index) and the cumulative
+# rotation. Recovery occupancies are NOT carried (each trial starts from
+# ``elec_props.initial_occupancy``), and the subsampling RNG is seeded per (random_seed, trial),
+# so a run restored at trial T with the same seed continues exactly like the original except
+# for solver-level numerical noise. That makes "branch at T, then intervene" experiments possible.
+#
+#   SBD_BRANCH_SAVE_AT="25,30"  write branch_t<T>.npz (state BEFORE trial T runs) in
+#                                SBD_BRANCH_DIR (default $FE4S4_CKPT_DIR)
+#   SBD_BRANCH_FROM=<file>      restore that state and start the loop at its trial T
+
+
+def branch_save_trials() -> set[int]:
+    raw = os.environ.get("SBD_BRANCH_SAVE_AT", "").strip()
+    return (parse_trials(raw) or set()) if raw and raw.lower() != "all" else set()
+
+
+def _branch_dir() -> str:
+    return (os.environ.get("SBD_BRANCH_DIR", "").strip()
+            or os.environ.get("FE4S4_CKPT_DIR", "").strip() or ".")
+
+
+_EP_ARRAYS = ("one_body_tensor", "two_body_tensor", "t2", "one_body_tensor_b", "two_body_tensor_ab",
+              "two_body_tensor_bb", "t2_ab", "t2_bb", "ab_overlap")
+
+
+def save_branch(trial: int, elec_props, state, tracker: RotationTracker, logger=None) -> str:
+    """Write the state the loop holds just BEFORE running ``trial``."""
+    out = {f"ep_{k}": np.asarray(getattr(elec_props, k)) for k in _EP_ARRAYS
+           if getattr(elec_props, k) is not None}
+    out.update(
+        trial=np.int64(trial),
+        ep_initial_occupancy_a=np.asarray(elec_props.initial_occupancy[0]),
+        ep_initial_occupancy_b=np.asarray(elec_props.initial_occupancy[1]),
+        ep_nuclear_repulsion_energy=np.float64(elec_props.nuclear_repulsion_energy),
+        ep_num_orbitals=np.int64(elec_props.num_orbitals),
+        ep_num_electrons=np.asarray(elec_props.num_electrons, dtype=np.int64),
+        ep_open_shell=np.bool_(elec_props.open_shell),
+        ep_spin_sq=np.float64(elec_props.spin_sq),
+        ep_unrestricted=np.bool_(elec_props.unrestricted),
+        st_energies=np.asarray(state.energies),
+        st_populations=np.asarray(state.populations),
+        st_carryover=np.asarray(state.carryover, dtype=bool),
+        st_best_index=np.int64(-1 if state.best_index is None else state.best_index),
+        c_a=tracker.c_a, c_b=tracker.c_b,
+    )
+    d = _branch_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"branch_t{trial:03d}.npz")
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.savez(fh, **out)
+    os.replace(tmp, path)
+    if logger is not None:
+        logger.info("[branch] saved state before trial %d -> %s (%.1f MB)",
+                    trial, path, os.path.getsize(path) / 1e6)
+    return path
+
+
+def load_branch(path: str, elec_props_template, state_cls, norb: int):
+    """Return (start_trial, elec_props, state, tracker) restored from ``save_branch`` output."""
+    with np.load(path) as z:
+        d = {k: z[k] for k in z.files}
+    upd = {k: d[f"ep_{k}"] for k in _EP_ARRAYS if f"ep_{k}" in d}
+    upd.update(
+        initial_occupancy=(d["ep_initial_occupancy_a"], d["ep_initial_occupancy_b"]),
+        nuclear_repulsion_energy=float(d["ep_nuclear_repulsion_energy"]),
+        num_orbitals=int(d["ep_num_orbitals"]),
+        num_electrons=tuple(int(x) for x in d["ep_num_electrons"]),
+        open_shell=bool(d["ep_open_shell"]),
+        spin_sq=float(d["ep_spin_sq"]),
+        unrestricted=bool(d["ep_unrestricted"]),
+    )
+    if upd["num_orbitals"] != norb:
+        raise ValueError(f"branch file {path}: norb {upd['num_orbitals']} != {norb}")
+    elec_props = elec_props_template.model_copy(update=upd)
+    bi = int(d["st_best_index"])
+    state = state_cls(
+        energies=d["st_energies"], populations=d["st_populations"],
+        carryover=d["st_carryover"].astype(bool), best_index=None if bi < 0 else bi,
+    )
+    tracker = RotationTracker(norb)
+    tracker.c_a, tracker.c_b = d["c_a"], d["c_b"]
+    return int(d["trial"]), elec_props, state, tracker
