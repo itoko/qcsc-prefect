@@ -256,6 +256,7 @@ def riken_sqd_de(
         logger.info("[branch] restored state before trial %d from %s (best=%s)",
                     _start_trial, _branch_from, state.best_energy())
     _branch_save = staircase_probe.branch_save_trials()
+    _h2_prev = None  # (alphadets, betadets, E) of the previous trial, for SBD_H2_PROBE
 
     # Start differential evoluation
     for i in range(_start_trial, parameters.de_params.iterations):
@@ -276,6 +277,44 @@ def riken_sqd_de(
         )
 
         logger.info(f"Current best energy = {state.best_energy()} (walker {state.best_index})")
+
+        # H2 probe (SBD_H2_PROBE=1; off by default): diagonalize the PREVIOUS trial's determinant
+        # lists with THIS trial's integrals, so the energy change splits exactly into an orbital
+        # part (S_{t-1}: h_{t-1} -> h_t) and a subspace part (h_t: S_{t-1} -> S_t). Diagnostic
+        # only: the result never feeds back into the run.
+        if staircase_probe.h2_probe_enabled() and best_sbd_result is not None:
+            if _h2_prev is not None:
+                try:
+                    import asyncio as _asyncio
+                    _pa, _pb, _pe_prev = _h2_prev
+                    _probe = _asyncio.run(solver.run(
+                        ci_strings=(_pa, _pb),
+                        one_body_tensor=elec_props.one_body_tensor,
+                        two_body_tensor=elec_props.two_body_tensor,
+                        norb=elec_props.num_orbitals,
+                        nelec=elec_props.num_electrons,
+                        one_body_tensor_b=elec_props.one_body_tensor_b,
+                        two_body_tensor_ab=elec_props.two_body_tensor_ab,
+                        two_body_tensor_bb=elec_props.two_body_tensor_bb,
+                    ))
+                    _nuc_p = float(elec_props.nuclear_repulsion_energy)
+                    _e_ss = float(_probe.energy)               # E(S_{t-1}, h_t)
+                    _e_now = float(best_sbd_result.energy)     # E(S_t, h_t)
+                    logger.info(
+                        "Trial %d: [h2-probe] E(S_t-1,h_t-1)=%.10f E(S_t-1,h_t)=%.10f E(S_t,h_t)=%.10f "
+                        "(total)  orbital part=%+.4f mHa  subspace part=%+.4f mHa  total dE=%+.4f mHa",
+                        i, _pe_prev + _nuc_p, _e_ss + _nuc_p, _e_now + _nuc_p,
+                        (_e_ss - _pe_prev) * 1e3, (_e_now - _e_ss) * 1e3, (_e_now - _pe_prev) * 1e3,
+                    )
+                    staircase_probe.dump_prev_subspace(i, _probe, logger=logger)
+                except Exception:
+                    logger.exception("Trial %d: H2 probe failed (continuing).", i)
+            _h2_prev = (
+                np.asarray(best_sbd_result.alphadets),
+                np.asarray(best_sbd_result.betadets if best_sbd_result.betadets is not None
+                           else best_sbd_result.alphadets),
+                float(best_sbd_result.energy),
+            ) if getattr(best_sbd_result, "alphadets", None) is not None else None
 
         # ── OO effect tracking: compare previous OO prediction with this trial's actual energy ──
         # Also detect OO saturation: when Davidson improvement is small but the prediction gap

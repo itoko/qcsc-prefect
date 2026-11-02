@@ -17,7 +17,7 @@ from sbd import staircase_probe as sp
 
 ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD_BRANCH_SAVE_AT",
        "SBD_BRANCH_DIR", "SBD_BRANCH_FROM", "SBD_EARLY_OO_TRIALS", "SBD_EARLY_OO_TRUST",
-       "SBD_EARLY_OO_MAXITER", "SBD_EARLY_OO_GTOL",
+       "SBD_EARLY_OO_MAXITER", "SBD_EARLY_OO_GTOL", "SBD_H2_PROBE",
        "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR")
 
 
@@ -40,6 +40,8 @@ def _fake_result(norb=4):
         rdm2=rng.normal(size=(norb,) * 4), rdm2_ab=rng.normal(size=(norb,) * 4),
         rdm2_bb=rng.normal(size=(norb,) * 4),
         alphadets=np.array([3, 5, 6]), betadets=np.array([3, 9]),
+        carryover_bitstrings=np.array([[True, False], [False, True]]),
+        carryover_bitstrings_b=np.array([[True, True]]),
         orbital_occupancies=(np.full(norb, 0.5), np.full(norb, 0.5)),
     )
 
@@ -100,6 +102,7 @@ def test_dump_roundtrip_and_trial_filter(tmp_path, monkeypatch):
     assert int(z["trial"]) == 2 and float(z["e_davidson_total"]) == -1.25
     np.testing.assert_array_equal(z["rdm2_ab"], res.rdm2_ab)
     np.testing.assert_array_equal(z["betadets"], res.betadets)
+    np.testing.assert_array_equal(z["carryover_b"], res.carryover_bitstrings_b)
     np.testing.assert_allclose(z["c_a"], tr.c_a)
     np.testing.assert_allclose(z["ua"], ua)
     assert str(z["rdm2_notation"]) == "prqs"
@@ -179,3 +182,16 @@ def test_early_oo_overrides(monkeypatch):
     monkeypatch.setenv("SBD_EARLY_OO_GTOL", "1e-6")
     assert sp.early_oo_overrides(2) == {"trust_radius": 0.2, "maxiter": 2000, "gtol": 1e-6}
     assert sp.early_oo_overrides(3) == {}                       # past the window
+
+
+def test_h2_probe_switch_and_prev_dump(tmp_path, monkeypatch):
+    assert not sp.h2_probe_enabled()
+    monkeypatch.setenv("SBD_H2_PROBE", "1")
+    assert sp.h2_probe_enabled()
+    res = _fake_result()
+    assert sp.dump_prev_subspace(3, res) is None            # dump dir not set -> nothing written
+    monkeypatch.setenv("SBD_DUMP_RDM_DIR", str(tmp_path))
+    path = sp.dump_prev_subspace(3, res)
+    z = np.load(path)
+    assert path.endswith("rdmdump_t003_prev.npz") and float(z["e_davidson_total"]) == -1.25
+    np.testing.assert_array_equal(z["rdm2_ab"], res.rdm2_ab)

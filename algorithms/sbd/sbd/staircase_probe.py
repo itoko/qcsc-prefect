@@ -110,6 +110,10 @@ def dump_trial(
         rdm2_notation=np.asarray("prqs"),
         alphadets=arr(getattr(sbd_result, "alphadets", None)),
         betadets=arr(getattr(sbd_result, "betadets", None)),
+        # carryover = the solver's highest-weight determinants (per spin); their turnover between
+        # trials is the H2 signal "the important determinants changed"
+        carryover_a=arr(getattr(sbd_result, "carryover_bitstrings", None)),
+        carryover_b=arr(getattr(sbd_result, "carryover_bitstrings_b", None)),
         occ_a=arr(occ[0] if occ is not None else None),
         occ_b=arr(occ[1] if occ is not None else None),
         c_a=tracker.c_a,
@@ -285,3 +289,43 @@ def early_oo_overrides(trial: int) -> dict:
         if raw:
             out[key] = cast(raw)
     return out
+
+
+# ── H2 attribution: re-diagonalize the PREVIOUS subspace in the NEW orbitals ──
+#
+# Each trial's energy change splits exactly into an orbital part and a subspace part:
+#   E(S_t, h_t) - E(S_{t-1}, h_{t-1})
+#     = [E(S_{t-1}, h_t) - E(S_{t-1}, h_{t-1})]      orbital part (OO_CHECK's "true OO effect")
+#     + [E(S_t,     h_t) - E(S_{t-1}, h_t)]          subspace part (new determinants, same orbitals)
+# SBD_H2_PROBE=1 runs one extra Davidson per trial on the previous trial's determinant lists with
+# this trial's (rotated) integrals and logs both parts. The probe solve's RDMs are written to the
+# dump (prefix "prev_") when the RDM dump is on, so offline OO on S_{t-1} vs S_t at the same
+# orbitals measures how much room for OO the new determinants create. The probe never feeds
+# back into the run (the trajectory is the same as without it, up to solver noise).
+
+
+def h2_probe_enabled() -> bool:
+    return os.environ.get("SBD_H2_PROBE", "").strip() == "1"
+
+
+def dump_prev_subspace(trial: int, probe_result, logger=None) -> str | None:
+    """Write ``rdmdump_t<trial>_prev.npz``: RDMs of S_{t-1} diagonalized with h_t."""
+    if not dump_enabled(trial) or probe_result is None:
+        return None
+    out_dir = os.environ["SBD_DUMP_RDM_DIR"].strip()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"rdmdump_t{trial:03d}_prev.npz")
+
+    def arr(x):
+        return np.asarray(x) if x is not None else np.empty(0)
+
+    np.savez_compressed(
+        path, trial=np.asarray(trial), e_davidson_total=np.asarray(float(probe_result.energy)),
+        rdm1_a=arr(probe_result.rdm1), rdm1_b=arr(probe_result.rdm1_b), rdm2_aa=arr(probe_result.rdm2),
+        rdm2_ab=arr(probe_result.rdm2_ab), rdm2_bb=arr(probe_result.rdm2_bb),
+        alphadets=arr(getattr(probe_result, "alphadets", None)),
+        betadets=arr(getattr(probe_result, "betadets", None)),
+    )
+    if logger is not None:
+        logger.info("[h2-probe] trial %d: wrote %s", trial, path)
+    return path
