@@ -18,7 +18,8 @@ from sbd import staircase_probe as sp
 ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD_BRANCH_SAVE_AT",
        "SBD_BRANCH_DIR", "SBD_BRANCH_FROM", "SBD_EARLY_OO_TRIALS", "SBD_EARLY_OO_TRUST",
        "SBD_EARLY_OO_MAXITER", "SBD_EARLY_OO_GTOL", "SBD_H2_PROBE",
-       "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR")
+       "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR",
+       "SBD_DUMP_RECOVERY_STEPS")
 
 
 @pytest.fixture(autouse=True)
@@ -195,3 +196,26 @@ def test_h2_probe_switch_and_prev_dump(tmp_path, monkeypatch):
     z = np.load(path)
     assert path.endswith("rdmdump_t003_prev.npz") and float(z["e_davidson_total"]) == -1.25
     np.testing.assert_array_equal(z["rdm2_ab"], res.rdm2_ab)
+
+
+def test_recovery_step_dump(tmp_path, monkeypatch):
+    res = _fake_result()
+    occ = (np.full(4, 0.25), np.full(4, 0.75))
+    # off without either env var
+    assert not sp.recovery_dump_enabled(1)
+    monkeypatch.setenv("SBD_DUMP_RECOVERY_STEPS", "1,10")
+    assert not sp.recovery_dump_enabled(1)  # needs SBD_DUMP_RDM_DIR too
+    monkeypatch.setenv("SBD_DUMP_RDM_DIR", str(tmp_path))
+    monkeypatch.delenv("SBD_DUMP_RECOVERY_STEPS")
+    assert not sp.recovery_dump_enabled(1)  # the per-trial dump alone does not turn it on
+    monkeypatch.setenv("SBD_DUMP_RECOVERY_STEPS", "1,10")
+    assert sp.dump_recovery_step(0, 2, res, energy_total=-1.0, occ_a=occ[0], occ_b=occ[1]) is None
+    path = sp.dump_recovery_step(0, 10, res, energy_total=-1.5, occ_a=occ[0], occ_b=occ[1])
+    assert path.endswith("rdmdump_t000_r010.npz")
+    z = np.load(path)
+    assert int(z["recovery_step"]) == 10 and float(z["e_davidson_total"]) == -1.5
+    np.testing.assert_array_equal(z["rdm2_bb"], res.rdm2_bb)
+    np.testing.assert_array_equal(z["alphadets"], res.alphadets)
+    np.testing.assert_array_equal(z["carryover_a"], res.carryover_bitstrings)
+    np.testing.assert_array_equal(z["occ_b"], occ[1])
+    assert "c_a" not in z.files

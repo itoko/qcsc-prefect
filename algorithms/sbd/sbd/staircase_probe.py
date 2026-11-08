@@ -7,6 +7,11 @@
   FCIDUMP orbitals (``C_a``, ``C_b``; h_t = C^T h_0 C). ``SBD_DUMP_RDM_TRIALS`` limits which
   trials are written ("all", "30", "25-60", "10,20,30-40"; default "all"). One trial is
   ~40 MB uncompressed for norb=36.
+* ``SBD_DUMP_RECOVERY_STEPS`` -- (needs ``SBD_DUMP_RDM_DIR``) per-RECOVERY-STEP dump inside one
+  trial, for MODE=cronly where the whole run is trial 0 with many recovery steps. 1-based step
+  numbers in the same spec syntax ("1,10,50-60"); writes ``rdmdump_t<trial>_r<step>.npz`` with
+  that step's best-batch RDMs, determinant lists, carryover and the occupancies that steer the
+  next step. No rotation fields (the orbitals do not change within a trial). Unset = off.
 * ``SBD_FREEZE_SUBSPACE_AT=T`` (D4) -- from trial T on, every Davidson solve reuses the alpha/beta
   determinant lists drawn at trial T; only the orbitals (via OO) change. The lists are kept in
   ``SBD_FREEZE_SUBSPACE_FILE`` (default ``$FE4S4_CKPT_DIR/frozen_subspace.npz``).
@@ -124,6 +129,68 @@ def dump_trial(
     )
     if logger is not None:
         logger.info("[dump] trial %d: wrote %s (%.1f MB)", trial, path, os.path.getsize(path) / 1e6)
+    return path
+
+
+# ── per-recovery-step dump (Plan D, PD5: CR-only) ────────────────────────────
+
+
+def recovery_dump_enabled(step: int) -> bool:
+    """``step`` is 1-based (the number printed in ``[diag] recovery <step>/<n>``)."""
+    if not os.environ.get("SBD_DUMP_RDM_DIR", "").strip():
+        return False
+    raw = os.environ.get("SBD_DUMP_RECOVERY_STEPS", "").strip()
+    if not raw:
+        return False
+    steps = parse_trials(raw)
+    return steps is None or step in steps
+
+
+def dump_recovery_step(
+    trial: int,
+    step: int,
+    sbd_result,
+    *,
+    energy_total: float | None,
+    occ_a: np.ndarray,
+    occ_b: np.ndarray,
+    ab_overlap: np.ndarray | None = None,
+    logger=None,
+) -> str | None:
+    """Write ``rdmdump_t<trial>_r<step>.npz`` (``step`` 1-based). ``occ_a/b`` are this step's
+    batch-averaged occupancies (the ``avg_occ`` of the next step). Returns the path, or None
+    when off."""
+    if not recovery_dump_enabled(step) or sbd_result is None:
+        return None
+    out_dir = os.environ["SBD_DUMP_RDM_DIR"].strip()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"rdmdump_t{trial:03d}_r{step:03d}.npz")
+
+    def arr(x):
+        return np.asarray(x) if x is not None else np.empty(0)
+
+    np.savez_compressed(
+        path,
+        trial=np.asarray(trial),
+        recovery_step=np.asarray(step),
+        e_davidson_total=np.asarray(np.nan if energy_total is None else energy_total),
+        rdm1_a=arr(sbd_result.rdm1),
+        rdm1_b=arr(sbd_result.rdm1_b),
+        rdm2_aa=arr(sbd_result.rdm2),
+        rdm2_ab=arr(sbd_result.rdm2_ab),
+        rdm2_bb=arr(sbd_result.rdm2_bb),
+        rdm2_notation=np.asarray("prqs"),
+        alphadets=arr(getattr(sbd_result, "alphadets", None)),
+        betadets=arr(getattr(sbd_result, "betadets", None)),
+        carryover_a=arr(getattr(sbd_result, "carryover_bitstrings", None)),
+        carryover_b=arr(getattr(sbd_result, "carryover_bitstrings_b", None)),
+        occ_a=np.asarray(occ_a),
+        occ_b=np.asarray(occ_b),
+        ab_overlap=arr(ab_overlap),
+    )
+    if logger is not None:
+        logger.info("[dump] trial %d recovery %d: wrote %s (%.1f MB)",
+                    trial, step, path, os.path.getsize(path) / 1e6)
     return path
 
 

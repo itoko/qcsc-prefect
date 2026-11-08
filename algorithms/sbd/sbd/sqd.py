@@ -31,7 +31,7 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
-from .staircase_probe import freeze_subspace
+from .staircase_probe import dump_recovery_step, freeze_subspace
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
@@ -1060,6 +1060,16 @@ def walker_sqd(
 
         # Feed the batch-averaged occupancies into the next recovery pass (self-consistency).
         avg_occ = (step_occ_a, step_occ_b)
+
+        # Plan D PD5 (SBD_DUMP_RECOVERY_STEPS; off by default): dump this step's RDMs / subspace.
+        try:
+            dump_recovery_step(
+                trial_index, recovery_step + 1, step_sbd_result, energy_total=energy,
+                occ_a=step_occ_a, occ_b=step_occ_b, ab_overlap=elec_props.ab_overlap,
+                logger=logger,
+            )
+        except Exception:  # a diagnostic dump must never stop the run
+            logger.exception("[dump] recovery %d: dump failed (continuing)", recovery_step + 1)
 
         # Persist checkpoint AFTER updating avg_occ so a resume re-enters at the NEXT step with the
         # occupancies this step produced. Atomic (tmp + replace) so a kill mid-write can't corrupt
