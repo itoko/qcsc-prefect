@@ -219,3 +219,12 @@ def test_recovery_step_dump(tmp_path, monkeypatch):
     np.testing.assert_array_equal(z["carryover_a"], res.carryover_bitstrings)
     np.testing.assert_array_equal(z["occ_b"], occ[1])
     assert "c_a" not in z.files
+
+
+def test_trial0_seed_override(monkeypatch):
+    monkeypatch.delenv("SBD_TRIAL0_SEED", raising=False)
+    # unchanged formula without the override
+    assert [sp.walker_seed(47, t, 0) for t in range(4)] == [47, 48, 50, 53]
+    monkeypatch.setenv("SBD_TRIAL0_SEED", "1001")
+    assert sp.walker_seed(47, 0, 0) == 1001                   # trial 0 uses the override
+    assert [sp.walker_seed(47, t, 0) for t in (1, 2, 3)] == [48, 50, 53]   # later trials unchanged

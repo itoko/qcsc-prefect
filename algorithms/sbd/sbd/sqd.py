@@ -32,6 +32,7 @@ from .np_type_extension import (
 )
 from .solver_job import SBDResult, SBDSolverJob
 from .staircase_probe import dump_recovery_step, freeze_subspace
+from .staircase_probe import walker_seed as staircase_walker_seed
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
@@ -602,10 +603,11 @@ def walker_sqd(
     # under the threaded (concurrent) task runner. Derive a deterministic, per-(trial, walker)
     # seed -- reusing the same Cantor-pairing offset as the random-source path above -- so runs stay
     # reproducible while every walker is independent.
-    walker_seed = int(
-        random_seed
-        + ((trial_index + walker_index) * (trial_index + walker_index + 1) // 2 + walker_index)
-    )
+    # (staircase study: SBD_TRIAL0_SEED, off by default, swaps the seed of trial 0 only)
+    walker_seed = staircase_walker_seed(random_seed, trial_index, walker_index)
+    if trial_index == 0 and os.environ.get("SBD_TRIAL0_SEED", "").strip():
+        logger.info("[trial0-seed] trial 0 subsampling seed from SBD_TRIAL0_SEED=%s (run seed %d)",
+                    os.environ["SBD_TRIAL0_SEED"], random_seed)
     walker_rng = np.random.default_rng(seed=walker_seed)
 
     best_energy: float | None = None

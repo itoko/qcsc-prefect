@@ -396,3 +396,22 @@ def dump_prev_subspace(trial: int, probe_result, logger=None) -> str | None:
     if logger is not None:
         logger.info("[h2-probe] trial %d: wrote %s", trial, path)
     return path
+
+
+# ── trial-0 sample only: draw trial 0 with a different seed ──────────────────
+#
+# The saved pool is fixed, so trial 0's determinants are set by the initial occupancies (t2) and
+# the subsampling RNG seed. SBD_TRIAL0_SEED=<int> replaces random_seed for trial 0 only; every
+# later trial keeps the run's random_seed, so two runs differ only in which determinants trial 0
+# drew. Off by default.
+
+
+def walker_seed(random_seed: int, trial_index: int, walker_index: int) -> int:
+    """Per-(trial, walker) subsampling seed (Cantor pairing, as before), with the trial-0 override."""
+    base = random_seed
+    if trial_index == 0:
+        override = _env_int("SBD_TRIAL0_SEED")
+        if override is not None:
+            base = override
+    k = trial_index + walker_index
+    return int(base + (k * (k + 1) // 2 + walker_index))
