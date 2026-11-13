@@ -620,6 +620,14 @@ def riken_sqd_de(
                             grad_norm,
                         )
                         continue
+                    try:  # Plan E (SBD_DUMP_ROT_DIR; off by default): per-trial rotation, no RDMs
+                        staircase_probe.dump_rotation(
+                            i, Ua, Ub, _rot_tracker,
+                            e_davidson_total=float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
+                            e_oo=e_opt, logger=logger,
+                        )
+                    except Exception:
+                        logger.exception("Trial %d: rotation dump failed (continuing).", i)
                     _elec_props_before_oo = elec_props
                     _rot_before_oo = (_rot_tracker.c_a.copy(), _rot_tracker.c_b.copy())
                     elec_props = rotate_electronic_properties(elec_props, Ua, Ub)

@@ -415,3 +415,94 @@ def walker_seed(random_seed: int, trial_index: int, walker_index: int) -> int:
             base = override
     k = trial_index + walker_index
     return int(base + (k * (k + 1) // 2 + walker_index))
+
+
+# ── Plan E: change the determinant subspace (PE2 injection, PE3 exclusion) ───
+#
+# Both act on the per-spin lists [HF, carryover, seed, sampled] right after subsampling (UHF path).
+#   SBD_INJECT_FILE=<npz with int arrays "alpha", "beta", in priority order>; "{SEED}" in the path is
+#     replaced by $SEED. SBD_INJECT_TRIALS (required, same syntax as SBD_DUMP_RDM_TRIALS) and
+#     SBD_INJECT_N (default: all, capped at half the list). The first N file strings not already in
+#     the list replace the same number of strings at the END of the list (the sampled part), so the
+#     dimension is unchanged and HF / carryover are kept.
+#   SBD_EXCLUDE_EXC=1 drops every string that is a single excitation of the current reference
+#     (orbitals 0..n-1 of the current basis), for both spins and every trial. HF stays.
+# SBD_DUMP_ROT_DIR: per-trial rotation dump rot_tNNN.npz (ua, ub, the cumulative rotation before
+#   this trial's OO, Davidson and OO energies), ~20 KB, for the rotation trajectory without RDMs.
+
+
+def resolve_seed_path(path: str) -> str:
+    return path.replace("{SEED}", os.environ.get("SEED", "").strip())
+
+
+def _single_of_ref(strings: np.ndarray, n_elec: int) -> np.ndarray:
+    ref = (1 << n_elec) - 1
+    inside = np.array([bin(int(s) & ref).count("1") for s in strings], dtype=np.int64)
+    return inside == n_elec - 1
+
+
+_INJECT_CACHE: dict = {}
+
+
+def _inject_strings(path: str):
+    if path not in _INJECT_CACHE:
+        with np.load(path) as z:
+            _INJECT_CACHE[path] = (np.asarray(z["alpha"], dtype=np.int64), np.asarray(z["beta"], dtype=np.int64))
+    return _INJECT_CACHE[path]
+
+
+def modify_subspace(trial: int, ci_a, ci_b, num_elec_a: int, num_elec_b: int, logger=None):
+    """Return the (alpha, beta) lists after the opt-in exclusion / injection (unchanged when off)."""
+    excl = os.environ.get("SBD_EXCLUDE_EXC", "").strip() == "1"
+    inj_path = os.environ.get("SBD_INJECT_FILE", "").strip()
+    inj_trials = parse_trials(os.environ.get("SBD_INJECT_TRIALS")) if inj_path else set()
+    if inj_path and inj_trials is None:
+        raise ValueError("SBD_INJECT_FILE needs an explicit SBD_INJECT_TRIALS (not 'all')")
+    inj_on = bool(inj_path) and trial in inj_trials
+    if not excl and not inj_on:
+        return ci_a, ci_b
+    lists = [np.asarray(ci_a, dtype=np.int64), np.asarray(ci_b, dtype=np.int64)]
+    nel = (num_elec_a, num_elec_b)
+    if excl:
+        for k in range(2):
+            drop = _single_of_ref(lists[k], nel[k])
+            lists[k] = lists[k][~drop]
+            if logger is not None:
+                logger.info("[exclude] trial %d spin %s: dropped %d single excitations of the reference "
+                            "(%d strings left)", trial, "ab"[k], int(drop.sum()), len(lists[k]))
+    if inj_on:
+        path = resolve_seed_path(inj_path)
+        files = _inject_strings(path)
+        n_req = _env_int("SBD_INJECT_N")
+        for k in range(2):
+            cur = lists[k]
+            present = set(cur.tolist())
+            pop_ok = [int(s) for s in files[k].tolist() if bin(int(s)).count("1") == nel[k]]
+            add = [s for s in pop_ok if s not in present]
+            n_add = len(add) if n_req is None else min(n_req, len(add))
+            n_add = min(n_add, len(cur) // 2 - 1)
+            if n_add > 0:
+                lists[k] = np.concatenate([cur[:len(cur) - n_add], np.asarray(add[:n_add], dtype=np.int64)])
+            if logger is not None:
+                logger.info("[inject] trial %d spin %s: +%d strings from %s (requested %s, %d already present, "
+                            "%d with wrong electron count; dimension %d)", trial, "ab"[k], n_add, path,
+                            "all" if n_req is None else n_req, len(pop_ok) - len(add),
+                            len(files[k]) - len(pop_ok), len(lists[k]))
+    return lists[0].astype(np.longlong), lists[1].astype(np.longlong)
+
+
+def dump_rotation(trial: int, ua, ub, tracker: RotationTracker, *, e_davidson_total=None, e_oo=None,
+                  logger=None) -> str | None:
+    """Write rot_tNNN.npz when SBD_DUMP_ROT_DIR is set. ``tracker`` = rotation BEFORE this OO."""
+    out_dir = os.environ.get("SBD_DUMP_ROT_DIR", "").strip()
+    if not out_dir:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"rot_t{trial:03d}.npz")
+    np.savez(path, trial=np.int64(trial), ua=np.asarray(ua), ub=np.asarray(ub if ub is not None else ua),
+             c_a=tracker.c_a, c_b=tracker.c_b,
+             e_davidson_total=np.float64(np.nan if e_davidson_total is None else e_davidson_total),
+             e_oo_total=np.float64(np.nan if e_oo is None else e_oo))
+    if logger is not None:
+        logger.info("[dump-rot] trial %d: wrote %s", trial, path)
+    return path
