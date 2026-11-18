@@ -122,8 +122,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--do-rdm", type=int,
         help="Solver --rdm value. 0 (default) = occupancy only. Nonzero makes the solver compute "
-             "and write the full per-spin-block 1- and 2-RDMs (rdm1_a/b.txt, rdm2_aa/ab/bb.txt) "
-             "for orbital optimization. Requires a solver binary built with the RDM writers.",
+             "and write the 1- and 2-RDMs for orbital optimization: rdm1_a/b.txt plus, for the "
+             "UHF binary, the per-spin blocks rdm2_aa/ab/bb.txt or, for the RHF binary, the "
+             "spin-summed rdm2.txt. Requires a solver binary built with the RDM writers.",
     )
     parser.add_argument("--solver-timeout-seconds", type=float)
     parser.add_argument("--solver-mode", choices=["cpu", "gpu", "fugaku"])
