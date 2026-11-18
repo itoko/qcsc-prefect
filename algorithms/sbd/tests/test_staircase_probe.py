@@ -2,7 +2,8 @@
 
 Covers: everything is off without the env vars; trial-spec parsing; the cumulative rotation
 matches successive ``rotate_electronic_properties`` calls (h_t = C^T h_0 C); the dump round-trips;
-the frozen subspace is stored at T and reused after; the frozen-orbital switch.
+the frozen subspace is stored at T and reused after; the frozen-orbital switch; the Plan F
+Fock / HCI injection (scores = exact Slater-Condon elements, count rules, cap, decoy, filters).
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD
        "SBD_EARLY_OO_MAXITER", "SBD_EARLY_OO_GTOL", "SBD_H2_PROBE",
        "SBD_FREEZE_SUBSPACE_FILE", "SBD_FREEZE_ORBITALS_AT", "FE4S4_CKPT_DIR",
        "SBD_DUMP_RECOVERY_STEPS", "SBD_INJECT_FILE", "SBD_INJECT_TRIALS", "SBD_INJECT_N", "SBD_EXCLUDE_EXC",
-       "SBD_DUMP_ROT_DIR", "SEED")
+       "SBD_DUMP_ROT_DIR", "SEED", "SBD_FOCK_INJECT_EPS", "SBD_FOCK_INJECT_N", "SBD_FOCK_INJECT_FRAC",
+       "SBD_FOCK_INJECT_FMAX", "SBD_FOCK_INJECT_SCORE", "SBD_FOCK_INJECT_MODE", "SBD_FOCK_INJECT_NCORE",
+       "SBD_FOCK_INJECT_NCORE_D", "SBD_FOCK_INJECT_TRIALS", "SBD_FOCK_INJECT_STEPS")
 
 
 @pytest.fixture(autouse=True)
@@ -312,3 +315,160 @@ def test_dump_rotation(tmp_path, monkeypatch):
     assert p.endswith("rot_t007.npz") and int(z["trial"]) == 7
     np.testing.assert_allclose(z["ua"], ua); np.testing.assert_allclose(z["c_b"], tr.c_b)
     assert float(z["e_oo_total"]) == -1.1
+
+
+# ── Plan F: Fock / HCI injection ─────────────────────────────────────────────
+
+NORB_F, NA_F, NB_F = 8, 4, 3
+
+
+def _sym_eri(n, rng, same_spin=True):
+    g = rng.standard_normal((n, n, n, n)) * 0.1
+    g = g + g.transpose(1, 0, 2, 3)
+    g = g + g.transpose(0, 1, 3, 2)
+    if same_spin:
+        g = g + g.transpose(2, 3, 0, 1)
+    return g
+
+
+@pytest.fixture
+def ham():
+    rng = np.random.default_rng(7)
+    n = NORB_F
+    h1a = rng.standard_normal((n, n)); h1a = h1a + h1a.T
+    h1b = rng.standard_normal((n, n)); h1b = h1b + h1b.T
+    return SimpleNamespace(one_body_tensor=h1a, one_body_tensor_b=h1b, two_body_tensor=_sym_eri(n, rng),
+                           two_body_tensor_ab=_sym_eri(n, rng, same_spin=False),
+                           two_body_tensor_bb=_sym_eri(n, rng), num_orbitals=n)
+
+
+def _exact_h(ham, det_a, det_b, ket_a, ket_b):
+    """<det|H|ket> from PySCF's UHF FCI contraction (bit i = orbital i, chemist integrals)."""
+    from pyscf.fci import cistring, direct_uhf
+    n, ne = NORB_F, (NA_F, NB_F)
+    na, nb = cistring.num_strings(n, NA_F), cistring.num_strings(n, NB_F)
+    c = np.zeros((na, nb))
+    c[cistring.str2addr(n, NA_F, ket_a), cistring.str2addr(n, NB_F, ket_b)] = 1.0
+    h2 = direct_uhf.absorb_h1e((ham.one_body_tensor, ham.one_body_tensor_b),
+                               (ham.two_body_tensor, ham.two_body_tensor_ab, ham.two_body_tensor_bb), n, ne, 0.5)
+    hc = direct_uhf.contract_2e(h2, c, n, ne)
+    return hc[cistring.str2addr(n, NA_F, det_a), cistring.str2addr(n, NB_F, det_b)]
+
+
+def _bool_rows(strings, norb):
+    return np.array([[(int(s) >> (norb - 1 - j)) & 1 for j in range(norb)] for s in strings], dtype=bool)
+
+
+def test_fock_scores_are_exact_single_elements(ham):
+    """|F_ai(I, J_ref)| = |<a^+_a a_i I, J_ref|H|I, J_ref>| for both spins (integral orientation check)."""
+    par_a, par_b = 0b01101001, 0b00010101          # 4 alpha / 3 beta electrons, not the reference
+    ref_a, ref_b = (1 << NA_F) - 1, (1 << NB_F) - 1
+    for k, par, ref_other in ((0, par_a, ref_b), (1, par_b, ref_a)):
+        h1, g, oj = sp._spin_integrals(ham, k, (NB_F, NA_F)[k])
+        ch, s, w = sp.score_candidates(np.array([par]), sp.make_fock_of(h1, g, oj), NORB_F)
+        assert np.all(w == 1.0)
+        for x, sx in zip(ch.tolist(), s.tolist()):
+            e = _exact_h(ham, x, ref_other, par, ref_other) if k == 0 else _exact_h(ham, ref_other, x, ref_other, par)
+            assert abs(e) == pytest.approx(sx, abs=1e-10)
+        assert len(ch) == bin(par).count("1") * (NORB_F - bin(par).count("1"))
+
+
+def test_hci_double_scores_are_exact(ham):
+    par = 0b01101001
+    ref_b = (1 << NB_F) - 1
+    ch, s, w = sp.score_doubles(np.array([par, 0b00001111]), ham.two_body_tensor, NORB_F, 4)
+    assert len(ch) == 2 * 6 * 6 and np.all(np.isin(w, [1.0, 0.75]))
+    for x, sx, wx in list(zip(ch.tolist(), s.tolist(), w.tolist()))[:36]:
+        assert bin(x).count("1") == NA_F and bin(x ^ par).count("1") == 4
+        assert abs(_exact_h(ham, x, ref_b, par, ref_b)) == pytest.approx(sx / wx, abs=1e-10)
+
+
+def test_carry_ints_matches_subsample_layout():
+    s = [0b00001111, 0b10010011]
+    rows = np.vstack([_bool_rows(s, 8), np.zeros((1, 8), bool)])   # + one zero-padding row
+    np.testing.assert_array_equal(sp.carry_ints(rows, 8, 4), s)
+
+
+def _inject_case(ham, rng):
+    """A list [HF, carryover (12), sampled (40)] per spin and the carryover rows (weight order)."""
+    from itertools import combinations
+
+    def all_str(ne):
+        return [sum(1 << i for i in c) for c in combinations(range(NORB_F), ne)]
+    out = []
+    for ne in (NA_F, NB_F):
+        hf = (1 << ne) - 1
+        pool = [x for x in all_str(ne) if x != hf]
+        rng.shuffle(pool)
+        co, samp = pool[:12], pool[12:12 + 20 if ne == NB_F else 12 + 40]
+        out.append((np.array([hf] + co + samp, dtype=np.int64), _bool_rows(co, NORB_F)))
+    return out
+
+
+def test_fock_inject_off_and_filters(ham, monkeypatch):
+    (la, ca), (lb, cb) = _inject_case(ham, np.random.default_rng(3))
+    fa, fb = sp.fock_inject(3, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    assert fa is la and fb is lb
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.1"); monkeypatch.setenv("SBD_FOCK_INJECT_N", "5")
+    with pytest.raises(ValueError):
+        sp.fock_inject(3, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    monkeypatch.delenv("SBD_FOCK_INJECT_N")
+    monkeypatch.setenv("SBD_FOCK_INJECT_TRIALS", "0-2")
+    assert sp.fock_inject(3, 0, la, lb, ca, cb, ham, NA_F, NB_F)[0] is la
+    monkeypatch.setenv("SBD_FOCK_INJECT_TRIALS", "3"); monkeypatch.setenv("SBD_FOCK_INJECT_STEPS", "2")
+    assert sp.fock_inject(3, 0, la, lb, ca, cb, ham, NA_F, NB_F)[0] is la       # recovery step 1
+    assert sp.fock_inject(3, 1, la, lb, ca, cb, ham, NA_F, NB_F)[0] is not la   # recovery step 2
+    empty = np.zeros((0, NORB_F), bool)                                           # trial 0: no carryover
+    fa, fb = sp.fock_inject(3, 1, la, lb, empty, empty, ham, NA_F, NB_F)
+    np.testing.assert_array_equal(fa, la); np.testing.assert_array_equal(fb, lb)
+
+
+def test_fock_inject_eps_rule_tail_and_cap(ham, monkeypatch):
+    (la, ca), (lb, cb) = _inject_case(ham, np.random.default_rng(4))
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.3")
+    fa, fb = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    for k, (cur, co, new, ne) in enumerate(((la, ca, fa, NA_F), (lb, cb, fb, NB_F))):
+        core = sp.carry_ints(co, NORB_F, ne)
+        h1, g, oj = sp._spin_integrals(ham, k, (NB_F, NA_F)[k])
+        ch, s, _ = sp.score_candidates(core, sp.make_fock_of(h1, g, oj), NORB_F)
+        absent = ~np.isin(ch, cur)
+        want = set(ch[absent & (s >= 0.3 * s[absent].max())].tolist())
+        cap = min(int(0.5 * (len(cur) - 13)), len(cur) // 2 - 1)
+        n_add = min(len(want), cap)
+        assert n_add > 0 and len(new) == len(cur) and len(set(new.tolist())) == len(new)
+        np.testing.assert_array_equal(new[:len(cur) - n_add], cur[:len(cur) - n_add])   # HF + carryover kept
+        added = new[len(cur) - n_add:]
+        assert set(added.tolist()) <= want and not np.isin(added, cur).any()
+        if len(want) <= cap:
+            assert set(added.tolist()) == want
+    monkeypatch.setenv("SBD_FOCK_INJECT_FMAX", "0.1")                                # cap = 0.1 * 40 = 4
+    fa, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    assert len(set(fa.tolist()) - set(la.tolist())) == 4
+
+
+def test_fock_inject_n_frac_decoy_hci(ham, monkeypatch):
+    (la, ca), (lb, cb) = _inject_case(ham, np.random.default_rng(5))
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "6")
+    sel_a, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    added_sel = sel_a[-6:]
+    assert len(set(sel_a.tolist()) - set(la.tolist())) == 6
+    monkeypatch.setenv("SBD_FOCK_INJECT_MODE", "decoy"); monkeypatch.setenv("SEED", "42")
+    dec_a, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    added_dec = np.array(sorted(set(dec_a.tolist()) - set(la.tolist())))
+    assert 0 < len(added_dec) <= 6 and not set(added_dec.tolist()) & set(added_sel.tolist())
+    core = sp.carry_ints(ca, NORB_F, NA_F)
+    ch, s, _ = sp.score_candidates(core, sp.make_fock_of(*sp._spin_integrals(ham, 0, NB_F)), NORB_F)
+    sc = dict(zip(ch.tolist(), s.tolist()))
+    assert max(sc[x] for x in added_dec.tolist()) < min(sc[x] for x in added_sel.tolist())
+    np.testing.assert_array_equal(dec_a, sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)[0])  # reproducible
+    monkeypatch.delenv("SBD_FOCK_INJECT_MODE"); monkeypatch.delenv("SBD_FOCK_INJECT_N")
+    monkeypatch.setenv("SBD_FOCK_INJECT_FRAC", "0.1")                                # round(0.1 * 53) = 5
+    fa, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    assert len(set(fa.tolist()) - set(la.tolist())) == 5
+    monkeypatch.delenv("SBD_FOCK_INJECT_FRAC")
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "15"); monkeypatch.setenv("SBD_FOCK_INJECT_SCORE", "hci")
+    fa, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    added = set(fa.tolist()) - set(la.tolist())
+    singles = {par & ~(1 << i) | (1 << a) for par in core.tolist() for i in range(NORB_F) for a in range(NORB_F)
+               if (par >> i) & 1 and not (par >> a) & 1}
+    assert len(added) == 15 and added - singles                                     # some same-spin doubles

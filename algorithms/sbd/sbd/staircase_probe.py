@@ -506,3 +506,248 @@ def dump_rotation(trial: int, ua, ub, tracker: RotationTracker, *, e_davidson_to
     if logger is not None:
         logger.info("[dump-rot] trial %d: wrote %s", trial, path)
     return path
+
+
+# ── Plan F: in-run Fock / HCI injection (PLAN_F_fock_inject.md §4) ───────────
+#
+# Every selected trial / recovery step, strings coupled to the incoming carryover by H are scored
+# in the CURRENT (rotated) basis and replace the tail (sampled part) of each spin's list, as in
+# modify_subspace; the dimension is unchanged. Core = the top SBD_FOCK_INJECT_NCORE carryover
+# strings entering this step (weight order, w_r = (n - r)/n). Candidates = single excitations
+# a^+_a a_i I_r, score s_F = max_r w_r |F_ai(I_r, J_ref)| with J_ref the opposite-spin reference
+# (Slater-Condon single-excitation element); SBD_FOCK_INJECT_SCORE=hci adds same-spin doubles of
+# the top SBD_FOCK_INJECT_NCORE_D core strings, s_D = max_r w_r |(ai|bj) - (aj|bi)| (same units).
+# How many (per spin; exactly one of):
+#   SBD_FOCK_INJECT_EPS=e    candidates not in the list with s >= e * max s (max over those absent)
+#   SBD_FOCK_INJECT_N=n      the top n absent candidates
+#   SBD_FOCK_INJECT_FRAC=f   the top f * len(list) absent candidates
+# capped at min(SBD_FOCK_INJECT_FMAX (0.5) * n_sampled, len(list) // 2 - 1), n_sampled = len(list)
+# - 1 (HF) - carryover strings in the list. SBD_FOCK_INJECT_MODE=decoy injects the same number of
+# control strings instead: matched to the selection by excitation level vs the reference and parent
+# weight, with a score below the median of their level (as Plan E pe2_make_inject.pick_decoy).
+# SBD_FOCK_INJECT_TRIALS / SBD_FOCK_INJECT_STEPS (1-based recovery steps) limit where (default all).
+# No carryover (trial 0 of cr1, step 1 of cronly) -> nothing injected.
+
+_FOCK_RULES = ("SBD_FOCK_INJECT_EPS", "SBD_FOCK_INJECT_N", "SBD_FOCK_INJECT_FRAC")
+
+
+def fock_inject_config() -> dict | None:
+    """Parsed SBD_FOCK_INJECT_* settings, or None when off."""
+    given = [k for k in _FOCK_RULES if os.environ.get(k, "").strip()]
+    if not given:
+        return None
+    if len(given) > 1:
+        raise ValueError(f"set only one of {', '.join(_FOCK_RULES)} (got {', '.join(given)})")
+    rule = given[0].rsplit("_", 1)[1].lower()
+    raw = os.environ[given[0]].strip()
+    value = int(raw) if rule == "n" else float(raw)
+    score = os.environ.get("SBD_FOCK_INJECT_SCORE", "fock").strip().lower() or "fock"
+    mode = os.environ.get("SBD_FOCK_INJECT_MODE", "select").strip().lower() or "select"
+    if score not in ("fock", "hci"):
+        raise ValueError(f"SBD_FOCK_INJECT_SCORE must be fock or hci (got {score})")
+    if mode not in ("select", "decoy"):
+        raise ValueError(f"SBD_FOCK_INJECT_MODE must be select or decoy (got {mode})")
+    fmax = float(os.environ.get("SBD_FOCK_INJECT_FMAX", "").strip() or 0.5)
+    return dict(rule=rule, value=value, score=score, mode=mode, fmax=min(max(fmax, 0.0), 1.0),
+                ncore=_env_int("SBD_FOCK_INJECT_NCORE") or 707,
+                ncore_d=_env_int("SBD_FOCK_INJECT_NCORE_D") or 71,
+                trials=parse_trials(os.environ.get("SBD_FOCK_INJECT_TRIALS")),
+                steps=parse_trials(os.environ.get("SBD_FOCK_INJECT_STEPS")))
+
+
+def carry_ints(co: np.ndarray, norb: int, n_elec: int) -> np.ndarray:
+    """Carryover bool rows (column j = orbital norb-1-j, weight order) -> int strings (bit i =
+    orbital i), keeping only rows with ``n_elec`` electrons (drops the zero padding)."""
+    co = np.asarray(co, dtype=bool)
+    if co.size == 0:
+        return np.empty(0, dtype=np.int64)
+    co = co[co.sum(axis=1) == n_elec]
+    w = (1 << np.arange(norb, dtype=np.int64))
+    return (co[:, ::-1].astype(np.int64) * w).sum(axis=1)
+
+
+def make_fock_of(h1, g_same, other_j):
+    """F(occ)[p,q] = h_pq + sum_{j in occ} [(pq|jj) - (pj|jq)] + other_j[p,q] (chemist (pq|rs))."""
+    jt = np.einsum("pqjj->pqj", g_same)
+    kt = np.einsum("pjjq->pqj", g_same)
+    base = h1 + other_j
+
+    def fock_of(occ):
+        return base + jt[:, :, occ].sum(axis=2) - kt[:, :, occ].sum(axis=2)
+    return fock_of
+
+
+def score_candidates(core, fock_of, norb):
+    """Single excitations of the core strings: (strings, max w|F_ai|, max w) over parents
+    (Plan E pe2_make_inject.score_candidates without the kappa score / subspace filter)."""
+    n = len(core)
+    best = {}
+    for rank, par in enumerate(core.tolist()):
+        w = (n - rank) / n
+        occ = [p for p in range(norb) if (par >> p) & 1]
+        vir = [p for p in range(norb) if not (par >> p) & 1]
+        F = np.abs(fock_of(occ))
+        for i in occ:
+            base = par & ~(1 << i)
+            for a in vir:
+                ch = base | (1 << a)
+                v = (w * F[a, i], w)
+                o = best.get(ch)
+                if o is None:
+                    best[ch] = list(v)
+                else:
+                    for j in range(2):
+                        if v[j] > o[j]:
+                            o[j] = v[j]
+    if not best:
+        return np.empty(0, dtype=np.int64), np.empty(0), np.empty(0)
+    ch = np.fromiter(best.keys(), dtype=np.int64, count=len(best))
+    sc = np.array(list(best.values()))
+    return ch, sc[:, 0], sc[:, 1]
+
+
+def score_doubles(core, g_same, norb, n_rank):
+    """Same-spin double excitations a^+_a a^+_b a_j a_i of the core strings: (strings, w|(ai|bj) -
+    (aj|bi)|, w) per parent, not deduplicated. w_r = (n_rank - r)/n_rank (same weights as the singles)."""
+    out_ch, out_s, out_w = [], [], []
+    for rank, par in enumerate(core.tolist()):
+        w = (n_rank - rank) / n_rank
+        occ = np.array([p for p in range(norb) if (par >> p) & 1])
+        vir = np.array([p for p in range(norb) if not (par >> p) & 1])
+        if len(occ) < 2 or len(vir) < 2:
+            continue
+        g = g_same[np.ix_(vir, occ, vir, occ)]                     # (ai|bj)
+        d = np.abs(g - g.transpose(0, 3, 2, 1))                    # |(ai|bj) - (aj|bi)|
+        ia, ja = np.triu_indices(len(occ), k=1)
+        aa, ba = np.triu_indices(len(vir), k=1)
+        s = d[aa[:, None], ia[None, :], ba[:, None], ja[None, :]]  # (vir pairs, occ pairs)
+        bit = np.int64(1) << np.arange(norb, dtype=np.int64)
+        removed = bit[occ[ia]] + bit[occ[ja]]
+        added = bit[vir[aa]] + bit[vir[ba]]
+        out_ch.append((np.int64(par) - removed[None, :] + added[:, None]).ravel())
+        out_s.append(w * s.ravel())
+        out_w.append(np.full(s.size, w))
+    if not out_ch:
+        return np.empty(0, dtype=np.int64), np.empty(0), np.empty(0)
+    return np.concatenate(out_ch), np.concatenate(out_s), np.concatenate(out_w)
+
+
+def _merge_max(ch, s, w):
+    """Deduplicate strings, keeping the max score and the max parent weight of each."""
+    u, inv = np.unique(ch, return_inverse=True)
+    ms = np.full(len(u), -np.inf)
+    mw = np.full(len(u), -np.inf)
+    np.maximum.at(ms, inv, s)
+    np.maximum.at(mw, inv, w)
+    return u, ms, mw
+
+
+def exc_level(x, n_elec):
+    ref = (1 << n_elec) - 1
+    return np.array([n_elec - bin(int(v) & ref).count("1") for v in x], dtype=np.int64)
+
+
+def pick_decoy(score, sw, exc, chosen_idx, pool_idx, rng):
+    """For each chosen string, an unchosen pool candidate with the same excitation level, the
+    nearest parent weight, and a score below the median of that level in the pool (Plan E
+    pe2_make_inject.pick_decoy, scored by ``score`` instead of kappa)."""
+    pool_all = np.setdiff1d(pool_idx, chosen_idx)
+    by_level = {}
+    for lv in np.unique(exc[chosen_idx]):
+        m = pool_all[exc[pool_all] == lv]
+        by_level[lv] = m[score[m] < np.median(score[pool_idx[exc[pool_idx] == lv]])]
+    used = set()
+    out = []
+    for j in chosen_idx:
+        cand = by_level.get(exc[j], np.empty(0, int))
+        if cand.size == 0:
+            continue
+        order = cand[np.argsort(np.abs(sw[cand] - sw[j]), kind="stable")]
+        for c in order:
+            if int(c) not in used:
+                used.add(int(c)); out.append(int(c)); break
+    rng.shuffle(out)
+    return np.array(out, dtype=int)
+
+
+def _spin_integrals(elec_props, spin: int, n_other: int):
+    """(h1, same-spin (pq|rs), opposite-spin reference Coulomb J_ref[p,q]) for spin 0=alpha / 1=beta."""
+    gab = np.asarray(elec_props.two_body_tensor_ab)
+    ref = slice(0, n_other)
+    if spin == 0:
+        return (np.asarray(elec_props.one_body_tensor), np.asarray(elec_props.two_body_tensor),
+                np.einsum("pqjj->pq", gab[:, :, ref, ref]))
+    return (np.asarray(elec_props.one_body_tensor_b), np.asarray(elec_props.two_body_tensor_bb),
+            np.einsum("jjpq->pq", gab[ref, ref]))
+
+
+def _rule_count(cfg, score_absent, n_list):
+    if cfg["rule"] == "eps":
+        return int((score_absent >= cfg["value"] * score_absent.max()).sum()) if score_absent.size else 0
+    if cfg["rule"] == "n":
+        return int(cfg["value"])
+    return int(round(cfg["value"] * n_list))
+
+
+def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryover_b, elec_props,
+                num_elec_a: int, num_elec_b: int, logger=None):
+    """Return the (alpha, beta) lists after the opt-in Plan F injection (unchanged when off)."""
+    cfg = fock_inject_config()
+    if cfg is None:
+        return ci_a, ci_b
+    step = recovery_step + 1
+    if (cfg["trials"] is not None and trial not in cfg["trials"]) or (
+            cfg["steps"] is not None and step not in cfg["steps"]):
+        return ci_a, ci_b
+    import time
+
+    norb = int(elec_props.num_orbitals)
+    nel = (num_elec_a, num_elec_b)
+    lists = [np.asarray(ci_a, dtype=np.int64), np.asarray(ci_b, dtype=np.int64)]
+    carry = [carry_ints(carryover_a, norb, nel[0]), carry_ints(carryover_b, norb, nel[1])]
+    rule_txt = f"{cfg['rule']}={cfg['value']}"
+    for k in range(2):
+        t0 = time.time()
+        cur = lists[k]
+        core = carry[k][:cfg["ncore"]]
+        if core.size == 0:
+            if logger is not None:
+                logger.info("[fock-inject] trial %d step %d spin %s: no carryover core; nothing injected",
+                            trial, step, "ab"[k])
+            continue
+        h1, g_same, other_j = _spin_integrals(elec_props, k, nel[1 - k])
+        ch, s, w = score_candidates(core, make_fock_of(h1, g_same, other_j), norb)
+        if cfg["score"] == "hci":
+            dch, ds, dw = score_doubles(carry[k][:cfg["ncore_d"]], g_same, norb, len(core))
+            ch, s, w = _merge_max(np.concatenate([ch, dch]), np.concatenate([s, ds]), np.concatenate([w, dw]))
+        hf = (1 << nel[k]) - 1
+        present = np.isin(ch, cur)
+        absent_idx = np.flatnonzero(~present)
+        s_abs = s[absent_idx]
+        n_rule = _rule_count(cfg, s_abs, len(cur))
+        n_present = int((s[present] >= cfg["value"] * s_abs.max()).sum()) if (
+            cfg["rule"] == "eps" and s_abs.size) else int(present.sum())
+        n_co = int(np.isin(cur[1:], carry[k][carry[k] != hf]).sum())
+        n_sampled = len(cur) - 1 - n_co
+        cap = max(min(int(cfg["fmax"] * n_sampled), len(cur) // 2 - 1), 0)
+        n_add = min(n_rule, cap, len(absent_idx))
+        order = absent_idx[np.argsort(-s_abs, kind="stable")]
+        chosen = order[:n_add]
+        if cfg["mode"] == "decoy" and n_add > 0:
+            seed = int(os.environ.get("SEED", "0").strip() or 0)
+            rng = np.random.default_rng([seed, trial, step, k])
+            chosen = pick_decoy(s, w, exc_level(ch, nel[k]), chosen, absent_idx, rng)
+            n_add = len(chosen)
+        if n_add > 0:
+            lists[k] = np.concatenate([cur[:len(cur) - n_add], ch[chosen]])
+        if logger is not None:
+            logger.info(
+                "[fock-inject] trial %d step %d spin %s: +%d (rule %s -> %d, cap %d, candidates %d, "
+                "already present %d, sampled %d, max %.4e (all %.4e), score %s, mode %s, mean exc %.2f, "
+                "dimension %d, %.1f s)",
+                trial, step, "ab"[k], n_add, rule_txt, n_rule, cap, len(ch), n_present, n_sampled,
+                float(s_abs.max()) if s_abs.size else 0.0, float(s.max()) if s.size else 0.0,
+                cfg["score"], cfg["mode"],
+                float(exc_level(ch[chosen], nel[k]).mean()) if n_add else 0.0,
+                len(lists[k]), time.time() - t0)
+    return lists[0].astype(np.longlong), lists[1].astype(np.longlong)

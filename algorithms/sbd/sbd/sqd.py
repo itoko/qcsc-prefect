@@ -31,7 +31,7 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
-from .staircase_probe import dump_recovery_step, freeze_subspace, modify_subspace
+from .staircase_probe import dump_recovery_step, fock_inject, freeze_subspace, modify_subspace
 from .staircase_probe import walker_seed as staircase_walker_seed
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
@@ -777,6 +777,10 @@ def walker_sqd(
                 )
                 # Plan E (SBD_INJECT_FILE / SBD_EXCLUDE_EXC; off by default): inject or drop strings.
                 ci_a, ci_b = modify_subspace(trial_index, ci_a, ci_b, num_elec_a, num_elec_b, logger=logger)
+                # Plan F (SBD_FOCK_INJECT_*; off by default): replace the sampled tail with strings
+                # coupled to this step's carryover by H (Fock singles / HCI doubles), current basis.
+                ci_a, ci_b = fock_inject(trial_index, recovery_step, ci_a, ci_b, carryover_a, carryover_b,
+                                         elec_props, num_elec_a, num_elec_b, logger=logger)
                 if batch == 0:
                     # [diag] excitation profile of batch 0 (make-or-break: a subspace dominated by
                     # >2 excitations cannot couple to HF and the energy stays at SCF).
