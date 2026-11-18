@@ -94,6 +94,7 @@ def main() -> None:
     t0 = time.perf_counter()
     params = FlowParameters(
         fcidump=C.FCIDUMP,
+        oo_method=method,  # OO type follows the solver method (uhf: independent alpha/beta)
         sqd_dim=args.sqd_dim,
         n_recovery_steps=1,          # sampling pass only; the pool is what we keep
         n_batches=1,

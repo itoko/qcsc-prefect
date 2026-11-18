@@ -325,6 +325,19 @@ class FlowParameters(BaseModel):
     # ── Orbital-optimization (two-step MCSCF) controls ───────────────────────────────────────
     # Orbital optimization runs between DE trials when the solver writes RDMs (solver.do_rdm != 0).
     # These govern the CASSCF-style stopping so the run halts at the physical minimum on its own.
+    oo_method: Literal["rhf", "uhf"] = Field(
+        default="rhf",
+        description=(
+            "Orbital-optimization type. 'rhf' (default): one rotation U shared by alpha and beta. "
+            "With the RHF solver (solver.method='rhf', spatial FCIDUMP) it uses the spin-summed "
+            "1-/2-RDM (the RHF binary's rdm2.txt); with the UHF solver it applies the same U to the "
+            "alpha and beta orbitals of the spin-orbital FCIDUMP (a warning is logged at start). "
+            "'uhf': independent alpha and beta rotations (the previous UHF behavior); requires "
+            "solver.method='uhf', the flow raises at start otherwise, since restricted integrals "
+            "cannot hold two orbital sets."
+        ),
+        title="OO Method",
+    )
     oo_grad_tol: float = Field(
         default=1e-3,
         description=(

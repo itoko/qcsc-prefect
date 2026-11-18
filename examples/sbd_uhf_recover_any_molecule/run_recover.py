@@ -297,6 +297,7 @@ def main() -> None:
 
     params = FlowParameters(
         fcidump=args.fcidump,
+        oo_method=args.method,  # OO type follows the solver method (uhf: independent alpha/beta)
         sqd_dim=args.sqd_dim,
         n_recovery_steps=args.recovery_steps,
         n_batches=args.n_batches,

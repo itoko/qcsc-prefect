@@ -68,6 +68,7 @@ def main() -> None:
     t0 = time.perf_counter()
     params = FlowParameters(
         fcidump=C.FCIDUMP,
+        oo_method=method,  # OO type follows the solver method (uhf: independent alpha/beta)
         sqd_dim=args.sqd_dim,
         n_recovery_steps=args.max_recovery,
         n_batches=args.n_batches,

@@ -20,7 +20,11 @@ from qcsc_workflow_utility.chem import (
     compute_molecular_integrals_from_uhf_fcidump,
     refresh_cc_seed,
 )
-from qcsc_workflow_utility.orbital_opt import optimize_orbitals, rotate_electronic_properties
+from qcsc_workflow_utility.orbital_opt import (
+    optimize_orbitals,
+    optimize_orbitals_rhf,
+    rotate_electronic_properties,
+)
 
 from .data_io import extend_table_artifact
 from .flow_params import FlowParameters
@@ -88,6 +92,27 @@ def _carry_sqd_occupancy(elec_props, sbd_result, logger, trial_index):
         float(occ[0].sum()), float(occ[1].sum()),
     )
     return elec_props.model_copy(update={"initial_occupancy": occ, "occupancy_rdm1": rdm1})
+
+
+def _check_oo_method(oo_method: str, unrestricted: bool, logger) -> None:
+    """Validate the OO type against the solver's RHF/UHF method at flow start.
+
+    RHF integrals hold one orbital set, so independent alpha/beta rotations (oo_method="uhf")
+    cannot be applied to them. One rotation on UHF orbitals (oo_method="rhf" with the UHF solver)
+    is allowed but differs from the previous UHF behavior, hence the warning.
+    """
+    if oo_method == "uhf" and not unrestricted:
+        raise ValueError(
+            "oo_method='uhf' needs the UHF solver (solver.method='uhf' with a spin-orbital "
+            "FCIDUMP): RHF integrals cannot hold separate alpha and beta rotations. Use "
+            "oo_method='rhf' with the RHF solver."
+        )
+    if oo_method == "rhf" and unrestricted:
+        logger.warning(
+            "oo_method='rhf' with the UHF solver: orbital optimization applies ONE rotation to "
+            "both the alpha and beta orbitals (restricted rotation of the UHF orbitals). Set "
+            "oo_method='uhf' for independent alpha/beta rotations (the previous UHF behavior)."
+        )
 
 
 MODULE_RNG = np.random.default_rng(seed=4574)
@@ -219,6 +244,8 @@ def riken_sqd_de(
     # integral computation (and the rest of the open-shell pipeline) from solver.method.
     unrestricted = getattr(solver, "method", "rhf") == "uhf"
     logger.info("Electronic-structure method: %s", "uhf" if unrestricted else "rhf")
+    oo_method = parameters.oo_method
+    _check_oo_method(oo_method, unrestricted, logger)
 
     # Orbital optimization runs between DE trials when the solver writes full RDMs (do_rdm != 0):
     # the best-walker RDMs rotate the Hamiltonian integrals so the next trial starts from an
@@ -226,8 +253,8 @@ def riken_sqd_de(
     # effect. See qcsc_workflow_utility.orbital_opt (Kreplin/Knowles/Werner, JCP 152, 074102 (2020)).
     do_orbital_opt = getattr(solver, "do_rdm", 0) != 0
     logger.info(
-        "Orbital optimization: %s (do_rdm=%d, iterations=%d)",
-        "enabled" if do_orbital_opt else "disabled",
+        "Orbital optimization: %s (oo_method=%s, do_rdm=%d, iterations=%d)",
+        "enabled" if do_orbital_opt else "disabled", oo_method,
         getattr(solver, "do_rdm", 0), parameters.de_params.iterations,
     )
 
@@ -362,7 +389,8 @@ def riken_sqd_de(
                 continue  # skip to next trial
 
             rdm1_aa = best_sbd_result.rdm1
-            rdm2_aa = best_sbd_result.rdm2
+            # RHF integrals take the spin-summed 2-RDM (one rotation); UHF the per-spin blocks.
+            rdm2_aa = best_sbd_result.rdm2 if unrestricted else best_sbd_result.rdm2_spin_summed
             if rdm1_aa is not None and rdm2_aa is not None:
                 rdm1_bb = best_sbd_result.rdm1_b if best_sbd_result.rdm1_b is not None else rdm1_aa
                 rdm2_ab = best_sbd_result.rdm2_ab if best_sbd_result.rdm2_ab is not None else rdm2_aa
@@ -371,9 +399,9 @@ def riken_sqd_de(
                 _nuc = float(elec_props.nuclear_repulsion_energy)
                 logger.info(
                     "Trial %d: running orbital optimization (norb=%d, unrestricted=%s, "
-                    "E_davidson source: elec=%.10f  total(+nuc)=%.10f  (nuc=%.6f); "
+                    "oo_method=%s, E_davidson source: elec=%.10f  total(+nuc)=%.10f  (nuc=%.6f); "
                     "RDM frozen only within this OO step) ...",
-                    i, elec_props.num_orbitals, unrestricted,
+                    i, elec_props.num_orbitals, unrestricted, oo_method,
                     float(_rdm_e), float(_rdm_e) + _nuc, _nuc,
                 )
 
@@ -413,6 +441,7 @@ def riken_sqd_de(
                             oo_maxiter=getattr(parameters, "oo_maxiter", 40),
                             resolve_backend=getattr(parameters, "oo_resolve_backend", "solve_fermion"),
                             davidson_solver=solver,
+                            restricted=oo_method == "rhf",
                             logger=logger,
                         )
                         logger.info(
@@ -426,7 +455,9 @@ def riken_sqd_de(
                             "e_davidson_source": float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
                             "e_oo_estimate": float(e_sc),
                             "method": "OO-SC",
-                            "method_detail": "JAX orbital step + fresh RDM each macro-step",
+                            "method_detail": (
+                                f"JAX orbital step + fresh RDM each macro-step; oo_method={oo_method}"
+                            ),
                         }
 
                         # OO_CHECK: the OO-SC orbital step may have converged on a truncated
@@ -504,13 +535,7 @@ def riken_sqd_de(
                     else getattr(parameters, "oo_grad_tol", 1e-5)
                 )
                 try:
-                    Ua, Ub, e_opt, grad_norm = optimize_orbitals(
-                        elec_props=elec_props,
-                        rdm1_aa=rdm1_aa,
-                        rdm1_bb=rdm1_bb,
-                        rdm2_aa=rdm2_aa,
-                        rdm2_ab=rdm2_ab,
-                        rdm2_bb=rdm2_bb,
+                    _oo_kwargs = dict(
                         # The native solver (main.cc) and solver_job.py both write the 2-RDM in
                         # prqs-storage (rdm2[p,r,q,s]=<p^dag r^dag s q>). optimize_orbitals defaults
                         # to "pqrs"; passing "pqrs"-stored data as prqs (or vice versa) applies a
@@ -532,6 +557,23 @@ def riken_sqd_de(
                         gtol=oo_gtol,
                         davidson_ref_energy=float(_rdm_e) if _rdm_e is not None else None,
                     )
+                    if unrestricted:
+                        Ua, Ub, e_opt, grad_norm = optimize_orbitals(
+                            elec_props=elec_props,
+                            rdm1_aa=rdm1_aa,
+                            rdm1_bb=rdm1_bb,
+                            rdm2_aa=rdm2_aa,
+                            rdm2_ab=rdm2_ab,
+                            rdm2_bb=rdm2_bb,
+                            restricted=oo_method == "rhf",
+                            **_oo_kwargs,
+                        )
+                    else:
+                        # RHF: one rotation from the spin-summed RDMs (gamma_a + gamma_b, rdm2.txt).
+                        Ua, e_opt, grad_norm = optimize_orbitals_rhf(
+                            elec_props, rdm1_aa + rdm1_bb, rdm2_aa, **_oo_kwargs,
+                        )
+                        Ub = Ua
                     e_solver = float(state.best_energy()) if state.best_energy() is not None else None
                     _nuc = float(elec_props.nuclear_repulsion_energy)
                     logger.info(
@@ -606,7 +648,10 @@ def riken_sqd_de(
                         "e_davidson_source": float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
                         "e_oo_estimate": float(e_opt),
                         "method": "trial-RDM",
-                        "method_detail": "L-BFGS-B objective; trial RDM frozen within OO step",
+                        "method_detail": (
+                            "L-BFGS-B objective; trial RDM frozen within OO step; "
+                            f"oo_method={oo_method}"
+                        ),
                     }
                     # NOT a true OO energy gain. e_solver is the best-so-far Davidson
                     # eigenvalue (variational, on the truncated CI subspace); e_opt is the
