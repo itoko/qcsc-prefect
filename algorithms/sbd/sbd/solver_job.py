@@ -15,6 +15,7 @@ from prefect.blocks.core import Block
 from pydantic import Field
 from pyscf.tools import fcidump
 from qcsc_prefect_executor.from_blocks import run_job_from_blocks
+from qcsc_workflow_utility.orbital_opt import spin_summed_rdms
 from qcsc_workflow_utility.uhf_fcidump import write_uhf_fcidump
 
 
@@ -38,7 +39,8 @@ class SBDResult:
 
     rdm2: np.ndarray | None = None
     """Alpha-alpha 2-particle reduced density matrix (L x L x L x L). Populated only with RDM
-    output. For UHF the mixed and beta-beta blocks live in ``rdm2_ab`` / ``rdm2_bb``."""
+    output for UHF; the mixed and beta-beta blocks live in ``rdm2_ab`` / ``rdm2_bb``. None for
+    RHF, which carries the spin-summed ``rdm2_spin_summed`` instead."""
 
     rdm1_b: np.ndarray | None = None
     """Beta 1-RDM (UHF only)."""
@@ -48,6 +50,11 @@ class SBDResult:
 
     rdm2_bb: np.ndarray | None = None
     """Beta-beta 2-RDM block (UHF only)."""
+
+    rdm2_spin_summed: np.ndarray | None = None
+    """Spin-summed 2-RDM aa + ab + ba + bb (RHF only, prqs storage), the input of the RHF orbital
+    optimization. Read from the RHF build's rdm2.txt, or summed from the per-spin files a solver
+    build without rdm2.txt writes."""
 
     carryover_bitstrings_b: np.ndarray | None = None
     """Beta carryover bitstrings (UHF only). None for RHF; alpha lives in carryover_bitstrings."""
@@ -284,6 +291,7 @@ def _read_rdm_file(path: Path, norb: int, rank: int) -> np.ndarray | None:
     to occupancy-only behavior). Convention written by the solver:
       rdm1_a.txt / rdm1_b.txt  ->  physicist's  gamma[p,q] = <q^dag p>
       rdm2_aa.txt / rdm2_ab.txt / rdm2_bb.txt  ->  physicist's prqs: rdm2[p,r,q,s] = <p^dag r^dag s q>
+      rdm2.txt (RHF build)     ->  their spin sum aa + ab + ba + bb, same prqs storage
     """
     if not path.is_file():
         return None
@@ -326,19 +334,34 @@ def _read_files(
 
     # Full RDMs for orbital optimization (written only when do_rdm != 0). Absent files -> None, so
     # a solver build that does not emit them degrades cleanly (orbital opt then no-ops upstream).
-    rdm1 = rdm2 = rdm1_b = rdm2_ab = rdm2_bb = None
+    rdm1 = rdm2 = rdm1_b = rdm2_ab = rdm2_bb = rdm2_spin_summed = None
     if do_rdm != 0:
         logger.debug("Reading RDM files (do_rdm=%d).", do_rdm)
         rdm1    = _read_rdm_file(work_dir / "rdm1_a.txt",  norb, rank=2)
-        rdm2    = _read_rdm_file(work_dir / "rdm2_aa.txt", norb, rank=4)
         rdm1_b  = _read_rdm_file(work_dir / "rdm1_b.txt",  norb, rank=2)
-        rdm2_ab = _read_rdm_file(work_dir / "rdm2_ab.txt", norb, rank=4)
-        rdm2_bb = _read_rdm_file(work_dir / "rdm2_bb.txt", norb, rank=4)
+        if method == "uhf":
+            rdm2    = _read_rdm_file(work_dir / "rdm2_aa.txt", norb, rank=4)
+            rdm2_ab = _read_rdm_file(work_dir / "rdm2_ab.txt", norb, rank=4)
+            rdm2_bb = _read_rdm_file(work_dir / "rdm2_bb.txt", norb, rank=4)
+        else:
+            # RHF: only the spin-summed 2-RDM is kept. The RHF build writes it as rdm2.txt; a build
+            # that writes only the per-spin blocks (older binaries, the upstream app used by the
+            # MPI build) gets them summed here.
+            rdm2_spin_summed = _read_rdm_file(work_dir / "rdm2.txt", norb, rank=4)
+            if rdm2_spin_summed is None:
+                blocks = [
+                    _read_rdm_file(work_dir / f"rdm2_{b}.txt", norb, rank=4)
+                    for b in ("aa", "ab", "bb")
+                ]
+                if all(b is not None for b in blocks) and rdm1 is not None and rdm1_b is not None:
+                    _, rdm2_spin_summed = spin_summed_rdms(
+                        rdm1, rdm1_b, *blocks, rdm2_notation="prqs"
+                    )
+                    logger.debug("rdm2.txt absent; summed rdm2_aa/ab/bb.txt instead.")
         logger.debug(
-            "RDM read: rdm1=%s rdm2=%s rdm1_b=%s rdm2_ab=%s rdm2_bb=%s",
-            None if rdm1 is None else rdm1.shape, None if rdm2 is None else rdm2.shape,
-            None if rdm1_b is None else rdm1_b.shape, None if rdm2_ab is None else rdm2_ab.shape,
-            None if rdm2_bb is None else rdm2_bb.shape,
+            "RDM read: rdm1=%s rdm1_b=%s rdm2=%s rdm2_ab=%s rdm2_bb=%s rdm2_spin_summed=%s",
+            *(None if r is None else r.shape
+              for r in (rdm1, rdm1_b, rdm2, rdm2_ab, rdm2_bb, rdm2_spin_summed)),
         )
 
     return SBDResult(
@@ -351,6 +374,7 @@ def _read_files(
         rdm1_b=rdm1_b,
         rdm2_ab=rdm2_ab,
         rdm2_bb=rdm2_bb,
+        rdm2_spin_summed=rdm2_spin_summed,
     )
 
 
