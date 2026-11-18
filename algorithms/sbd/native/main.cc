@@ -172,7 +172,8 @@ int main(int argc, char * argv[]) {
     // app: onebody = sum h1[io,jo]*one_p_rdm[s][io+L*jo]; twobody = 0.5*sum
     // I2(io,ia,jo,ja)*two_p_rdm[s][io+L*jo+L^2*ia+L^3*ja]):
     //   rdm1_a/b.txt  -> gamma[p,q] = <q^dag p>   (solver's one_p_rdm[s], no permutation)
-    //   rdm2_aa/ab/bb.txt -> prqs: rdm2[p,r,q,s] = <p^dag r^dag s q>  (solver's two_p_rdm block)
+    //   rdm2_aa/ab/bb.txt -> prqs: rdm2[p,r,q,s] = <p^dag r^dag s q>  (solver's two_p_rdm block;
+    //                        -D_UHF build). The RHF build writes their spin sum as rdm2.txt.
     // Column format: "i j value" (rank-2) / "i j k l value" (rank-4); Python reshapes row-major.
     if( do_rdm != 0 ) {
       auto write_rdm1 = [&](const std::string & fn, const std::vector<double> & r1) {
@@ -192,13 +193,36 @@ int main(int argc, char * argv[]) {
         ofs.close();
       };
       // one_p_rdm[0]=alpha, [1]=beta;  two_p_rdm blocks by (s + 2*t): 0=aa,1=ba,2=ab,3=bb.
+      // The per-spin 1-RDMs are written for both builds (L^2 values; the Python side takes the
+      // next trial's per-spin initial occupancies from their diagonals).
       write_rdm1("rdm1_a.txt",  one_p_rdm[0]);
       write_rdm1("rdm1_b.txt",  one_p_rdm[1]);
+#ifdef _UHF
       write_rdm2("rdm2_aa.txt", two_p_rdm[0]);
       write_rdm2("rdm2_ab.txt", two_p_rdm[2]);
       write_rdm2("rdm2_bb.txt", two_p_rdm[3]);
       std::cout << "Wrote RDM files (do_rdm=" << do_rdm << "): rdm1_a/b.txt, rdm2_aa/ab/bb.txt"
                 << std::endl;
+#else
+      // RHF: the restricted orbital optimization needs only the spin-summed 2-RDM
+      //   rdm2.txt -> prqs: G[p,r,q,s] = sum_{s,t} <p^dag_s r^dag_t s_t q_s> = aa + ba + ab + bb,
+      // i.e. the elementwise sum of the four blocks in the same layout (one L^4 file instead of
+      // three). Summed on the fly, so no extra L^4 buffer.
+      {
+        std::ofstream ofs("rdm2.txt"); ofs.precision(16);
+        for(int i=0; i<L; i++)
+          for(int j=0; j<L; j++)
+            for(int k=0; k<L; k++)
+              for(int l=0; l<L; l++) {
+                size_t idx = i + L*j + L*L*k + static_cast<size_t>(L)*L*L*l;
+                ofs << two_p_rdm[0][idx] + two_p_rdm[1][idx] + two_p_rdm[2][idx] + two_p_rdm[3][idx]
+                    << std::endl;
+              }
+        ofs.close();
+      }
+      std::cout << "Wrote RDM files (do_rdm=" << do_rdm << "): rdm1_a/b.txt, rdm2.txt (spin-summed)"
+                << std::endl;
+#endif
     }
 
     // ── In-process RDM-contracted energy (diagnostic; ported from tpb_main.cc:266-317) ──────

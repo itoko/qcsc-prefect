@@ -38,6 +38,10 @@ else
     echo "SBD repo already exists: $SBD_DIR"
 fi
 
+# Apply the opposite-spin (ab/ba) 2-RDM sign fix (idempotent). The kernel is shared by the RHF and
+# UHF builds, and the RHF orbital optimization sums the ab/ba blocks into the spin-summed rdm2.txt.
+"$SCRIPT_DIR/patches/apply_rdm_patches.sh" "$SBD_DIR" "$SCRIPT_DIR/patches/sbd-rdm-opposite-spin-sign.patch"
+
 # Clean previous build artifacts for this target only.
 rm -f "$SCRIPT_DIR"/*.o "$SCRIPT_DIR/$OUTBIN"
 

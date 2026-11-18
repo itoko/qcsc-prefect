@@ -12,6 +12,18 @@ The modified program generates the following output files:
 - `occ_b.txt`: Average occupancies of beta orbitals
 - `carryover.bin`: Carryover bitstrings in `uint8` format with big-endian ordering
 
+With `--rdm N` (`N != 0`, the solver block's `do_rdm`) it also writes the RDMs used by the orbital
+optimization between DE trials, one value per line in row-major order:
+- `rdm1_a.txt`, `rdm1_b.txt`: per-spin 1-RDMs (both builds)
+- UHF build (`-D_UHF`): `rdm2_aa.txt`, `rdm2_ab.txt`, `rdm2_bb.txt`, the per-spin 2-RDM blocks in
+  prqs storage, `rdm2[p,r,q,s] = <p^dag r^dag s q>`
+- RHF build: `rdm2.txt`, the spin-summed 2-RDM `aa + ab + ba + bb` in the same storage (one file
+  instead of three; the input of the RHF orbital optimization). The Python reader sums the
+  per-spin files when `rdm2.txt` is absent (older binaries, the upstream app of the MPI build).
+
+`build_sbd.sh`, `build_sbd_gpu.sh` and `build_sbd_fugaku.sh` apply the opposite-spin 2-RDM sign fix
+(`patches/`) after cloning, for both the RHF and the UHF build.
+
 These files are consumed by the Prefect integration block to construct a corresponding Python data class.
 
 ## Building the Executable on Miyabi

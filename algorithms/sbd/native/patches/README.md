@@ -61,6 +61,10 @@ patches/apply_rdm_patches.sh sbd     patches/sbd-rdm-opposite-spin-sign.patch
 patches/apply_rdm_patches.sh sbd_mpi patches/sbd_mpi-rdm-opposite-spin-sign.patch
 ```
 
+`build_sbd.sh`, `build_sbd_gpu.sh` and `build_sbd_fugaku.sh` (RHF and UHF builds) and
+`build_sbd_gpu_uhf_fixed.sh` run the first command after cloning. The RHF build needs it too: its
+spin-summed `rdm2.txt` includes the ab/ba blocks.
+
 Idempotent: re-running skips an already-applied patch. If upstream HEAD moves and the patch no
 longer applies, regenerate it:
 
