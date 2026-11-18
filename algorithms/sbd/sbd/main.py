@@ -57,6 +57,40 @@ def _apply_cc_refresh_and_reseed(elec_props, state, logger, trial_index):
     return refreshed, state
 
 
+def _carry_sqd_occupancy(elec_props, sbd_result, logger, trial_index):
+    """Take the next trial's initial occupancies from this trial's SQD result.
+
+    The occupancies are the diagonal of the best walker's per-spin 1-RDM (best batch of its best
+    recovery step). The 1-RDMs are kept on elec_props.occupancy_rdm1 so that an orbital rotation
+    before the next trial (OO) rotates them with the orbitals. Without RDM output (do_rdm == 0,
+    hence no OO either) the solver's orbital occupancies, the same diagonal, are used. With no
+    result the previous occupancies are kept.
+    """
+    if sbd_result is None:
+        logger.warning(
+            "Trial %d: no SQD result; keeping the previous initial occupancies.", trial_index
+        )
+        return elec_props
+    if sbd_result.rdm1 is not None:
+        g_a = np.asarray(sbd_result.rdm1, dtype=np.float64)
+        g_b = np.asarray(
+            sbd_result.rdm1_b if sbd_result.rdm1_b is not None else sbd_result.rdm1,
+            dtype=np.float64,
+        )
+        rdm1 = (g_a, g_b)
+        occ = (np.diag(g_a).copy(), np.diag(g_b).copy())
+    else:
+        rdm1 = None
+        occ = tuple(np.asarray(o, dtype=np.float64) for o in sbd_result.orbital_occupancies)
+    logger.info(
+        "Trial %d: next trial's initial occupancies from this trial's SQD %s: "
+        "sum_a=%.4f sum_b=%.4f",
+        trial_index, "1-RDM diagonal" if rdm1 is not None else "orbital occupancies",
+        float(occ[0].sum()), float(occ[1].sum()),
+    )
+    return elec_props.model_copy(update={"initial_occupancy": occ, "occupancy_rdm1": rdm1})
+
+
 MODULE_RNG = np.random.default_rng(seed=4574)
 THREAD_ENV = {
     "OMP_NUM_THREADS": "1",
@@ -275,6 +309,9 @@ def riken_sqd_de(
             ab_indices=ab_indices,
             state=state,
         )
+        # Trial 0 recovers from the HF 1/0 occupancies; every later trial from the previous
+        # trial's SQD 1-RDM (rotated with the orbitals if OO runs below).
+        elec_props = _carry_sqd_occupancy(elec_props, best_sbd_result, logger, i)
 
         logger.info(f"Current best energy = {state.best_energy()} (walker {state.best_index})")
 

@@ -87,13 +87,12 @@ def test_aufbau_reference_energy_matches_pyscf(reference):
 
 
 def test_task_matches_real_uccsd(reference):
-    """The integral-only task reproduces PySCF UCCSD on the real converged UHF: energy, t2, and
-    the diagonal of the correlated 1-RDM (the lambda equations must see the right ab/bb blocks)."""
+    """The integral-only task reproduces PySCF UCCSD t2 on the real converged UHF, and seeds the
+    occupancies with the HF 1/0 distribution of the index-aufbau determinant."""
     path, mf, _ = reference
     ref = cc.UCCSD(mf)
     ref.conv_tol = 1e-10
     ref.kernel()
-    dm_a, dm_b = ref.make_rdm1()
 
     ep = chem.compute_molecular_integrals_from_uhf_fcidump.fn(str(path))
     assert ep.unrestricted is True
@@ -102,8 +101,8 @@ def test_task_matches_real_uccsd(reference):
     np.testing.assert_allclose(ep.t2, ref.t2[0], atol=1e-6)
     np.testing.assert_allclose(ep.t2_ab, ref.t2[1], atol=1e-6)
     np.testing.assert_allclose(ep.t2_bb, ref.t2[2], atol=1e-6)
-    np.testing.assert_allclose(ep.initial_occupancy[0], np.diag(dm_a), atol=1e-6)
-    np.testing.assert_allclose(ep.initial_occupancy[1], np.diag(dm_b), atol=1e-6)
+    np.testing.assert_array_equal(ep.initial_occupancy[0], mf.mo_occ[0])
+    np.testing.assert_array_equal(ep.initial_occupancy[1], mf.mo_occ[1])
 
 
 def test_task_logs_reference_line(reference, capsys):

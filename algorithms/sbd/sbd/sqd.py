@@ -560,9 +560,10 @@ def walker_sqd(
     # samples (no re-sampling of the device); only the occupancies, and hence the recovered/
     # subsampled subspace, evolve. We keep the best (lowest-energy) pass.
     #
-    # avg_occ starts from the CCSD natural-orbital occupancies (per-spin for UHF) and is refreshed
-    # each pass from the SBD solver's orbital_occupancies. n_recovery_steps=1 reproduces the
-    # previous single-pass behavior exactly.
+    # avg_occ starts from elec_props.initial_occupancy (per-spin): the HF 1/0 occupancies in trial
+    # 0, the previous trial's SQD 1-RDM diagonal afterwards (main._carry_sqd_occupancy). It is
+    # refreshed each pass from the SBD solver's orbital_occupancies. n_recovery_steps=1 reproduces
+    # the previous single-pass behavior exactly.
     avg_occ = elec_props.initial_occupancy
 
     # ---- checkpoint / resume ----------------------------------------------------------------

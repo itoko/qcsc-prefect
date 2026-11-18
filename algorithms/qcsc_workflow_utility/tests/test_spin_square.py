@@ -258,7 +258,8 @@ def test_uhf_fcidump_sidecar_loaded(tmp_path, monkeypatch):
 
 
 def test_cc_refresh_keeps_overlap():
-    """refresh_cc_seed (used by OO_INIT and the OO_TO_LUCJ stagnation refresh) carries ab_overlap."""
+    """refresh_cc_seed (used by OO_INIT and the OO_TO_LUCJ stagnation refresh) carries ab_overlap
+    and the occupancy seed (initial_occupancy / occupancy_rdm1) unchanged."""
     import qcsc_workflow_utility.chem as chem
     from qcsc_workflow_utility.chem import ElectronicProperties
 
@@ -276,6 +277,11 @@ def test_cc_refresh_keeps_overlap():
         num_orbitals=n, num_electrons=mol.nelec, open_shell=False, spin_sq=0.0,
         unrestricted=True, ab_overlap=s_ab,
     )
+    g = np.diag(np.linspace(0.9, 0.1, n))
+    ep = ep.model_copy(update={"initial_occupancy": (np.diag(g), np.diag(g)),
+                               "occupancy_rdm1": (g, g)})
     new = chem.refresh_cc_seed(ep)
     assert new is not None
     np.testing.assert_allclose(new.ab_overlap, s_ab)
+    np.testing.assert_array_equal(new.initial_occupancy[0], np.diag(g))
+    np.testing.assert_array_equal(new.occupancy_rdm1[1], g)

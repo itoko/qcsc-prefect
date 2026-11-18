@@ -88,16 +88,18 @@ class TestElectronicPropertiesConsistency:
         assert len(ep.initial_occupancy[0]) == norb
         assert len(ep.initial_occupancy[1]) == norb
 
-    def test_occupancies_are_fractional_for_correlated_uhf(self):
-        """The UHF occupancy seed (from the correlated UCCSD 1-RDM diagonal) must be FRACTIONAL for
-        a correlated system -- integer 0/1 occupancies give configuration recovery no signal and
-        collapse the SQD subspace to bare HF (a past failure mode)."""
+    def test_initial_occupancies_are_hf(self):
+        """The first trial's occupancy seed is the HF 1/0 distribution of the index-aufbau
+        determinant (later trials take it from the previous SQD 1-RDM, in main.py)."""
         ep = chem.compute_molecular_integrals_from_geometry.fn(
             atom=H4_STRETCHED, basis="sto-3g", unrestricted=True, spin=0
         )
-        occ_a, occ_b = np.asarray(ep.initial_occupancy[0]), np.asarray(ep.initial_occupancy[1])
-        frac = np.sum((occ_a > 0.01) & (occ_a < 0.99)) + np.sum((occ_b > 0.01) & (occ_b < 0.99))
-        assert frac > 0, "no fractional occupancies -> recovery has no correlation signal"
+        na, nb = ep.num_electrons
+        expect_a = np.r_[np.ones(na), np.zeros(ep.num_orbitals - na)]
+        expect_b = np.r_[np.ones(nb), np.zeros(ep.num_orbitals - nb)]
+        np.testing.assert_array_equal(ep.initial_occupancy[0], expect_a)
+        np.testing.assert_array_equal(ep.initial_occupancy[1], expect_b)
+        assert ep.occupancy_rdm1 is None
 
     def test_electron_count_matches_2sz(self):
         """(na, nb) must match the requested 2Sz for open-shell references."""
