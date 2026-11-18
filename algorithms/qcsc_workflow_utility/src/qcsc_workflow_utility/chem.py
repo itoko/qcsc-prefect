@@ -128,7 +128,7 @@ def _build_property(
     # Get PySCF logs dumped into in-memory buffer
     get_run_logger().info(buf.getvalue())
 
-    return ElectronicProperties(
+    props = ElectronicProperties(
         one_body_tensor=h1,
         two_body_tensor=h2,
         t2=t2,
@@ -141,6 +141,13 @@ def _build_property(
         open_shell=num_elec_a != num_elec_b,
         spin_sq=spin_sq,
     )
+
+    # Opt-in initial orbital optimization: RHF -> CCSD -> OO -> CCSD refresh.
+    # Default off (OO_INIT unset/0).
+    if os.environ.get("OO_INIT", "0") == "1":
+        props = _apply_initial_oo_rhf(props, mycc)
+
+    return props
 
 
 def _build_property_from_uhf_integrals(
@@ -236,7 +243,7 @@ def _apply_initial_oo(
 ) -> ElectronicProperties:
     """Insert one orbital-optimization step between the initial UHF-reference UCCSD and the t2 seed.
 
-    Opt-in via ``OO_INIT=1`` (UHF path only). Flow:
+    Opt-in via ``OO_INIT=1`` (UHF path; the RHF path is :func:`_apply_initial_oo_rhf`). Flow:
 
         reference (FCIDUMP orbitals) -> UCCSD (already run; 1-/2-RDM in hand)
                -> OO (rotate orbitals with the fixed UCCSD RDM, two-step MCSCF)
@@ -263,16 +270,13 @@ def _apply_initial_oo(
         rotate_electronic_properties,
     )
 
-    logger = get_run_logger()
     e_cc_before = float(mycc.e_tot)
 
     # UCCSD spin-block 2-RDM in PySCF "pqrs" (chemist) storage. make_rdm1() already matches the
     # physicist convention optimize_orbitals expects (dm1[p,q] = <q^dag p>), so no transpose.
     d2aa, d2ab, d2bb = mycc.make_rdm2()
 
-    gtol = float(os.environ.get("OO_GRAD_TOL", "1e-5"))
-    trust = float(os.environ.get("OO_TRUST", "0.5"))
-    maxiter = int(os.environ.get("OO_MAXITER", "300"))
+    gtol, trust, maxiter = _initial_oo_settings()
 
     # Inner L-BFGS-B convergence (scipy pgtol) is driven by the shared OO_GRAD_TOL knob (default
     # 1e-5), identical to the DE-loop and SC OO paths.
@@ -290,6 +294,37 @@ def _apply_initial_oo(
     )
 
     props_rot = rotate_electronic_properties(props, Ua, Ub)
+    return _accept_initial_oo(
+        props, props_rot, "UCCSD", e_cc_before, e_oo, grad_norm, trust, gtol,
+    )
+
+
+def _initial_oo_settings() -> tuple[float, float, int]:
+    """OO_INIT thresholds ``(gtol, trust, maxiter)``, shared by name and default with the DE-loop
+    OO (OO_GRAD_TOL / OO_TRUST / OO_MAXITER)."""
+    return (
+        float(os.environ.get("OO_GRAD_TOL", "1e-5")),
+        float(os.environ.get("OO_TRUST", "0.5")),
+        int(os.environ.get("OO_MAXITER", "300")),
+    )
+
+
+def _accept_initial_oo(
+    props: ElectronicProperties,
+    props_rot: ElectronicProperties,
+    cc_label: str,
+    e_cc_before: float,
+    e_oo: float,
+    grad_norm: float,
+    trust: float,
+    gtol: float,
+) -> ElectronicProperties:
+    """Refresh CC in the rotated basis and keep the rotation only if the CC energy did not rise.
+
+    Returns the refreshed rotated properties, or ``props`` (the un-rotated reference) when the
+    refreshed CC energy is higher than ``e_cc_before`` (+1e-6 Ha), NaN, or the refresh failed.
+    """
+    logger = get_run_logger()
     props_new, e_cc_after = refresh_cc_seed(props_rot, return_energy=True)
 
     if (
@@ -299,19 +334,67 @@ def _apply_initial_oo(
         and e_cc_after <= e_cc_before + 1e-6
     ):
         logger.info(
-            "OO_INIT accepted: E(UCCSD before OO)=%.10f  E_oo(fixed-RDM, total)=%.10f  "
-            "|grad|=%.3e  E(UCCSD after OO)=%.10f  dE=%+.3e Ha  (trust=%.3g, gtol=%.1e).",
-            e_cc_before, e_oo, grad_norm, e_cc_after, e_cc_after - e_cc_before, trust, gtol,
+            "OO_INIT accepted: E(%s before OO)=%.10f  E_oo(fixed-RDM, total)=%.10f  "
+            "|grad|=%.3e  E(%s after OO)=%.10f  dE=%+.3e Ha  (trust=%.3g, gtol=%.1e).",
+            cc_label, e_cc_before, e_oo, grad_norm, cc_label, e_cc_after,
+            e_cc_after - e_cc_before, trust, gtol,
         )
         return props_new
 
     logger.warning(
-        "OO_INIT rejected (no energy gain / NaN): E(UCCSD before OO)=%.10f  E_oo=%.10f  "
-        "|grad|=%.3e  E(UCCSD after OO)=%s  -> keeping pre-OO reference/UCCSD.",
-        e_cc_before, e_oo, grad_norm,
-        f"{e_cc_after:.10f}" if e_cc_after is not None else "None",
+        "OO_INIT rejected (no energy gain / NaN): E(%s before OO)=%.10f  E_oo=%.10f  "
+        "|grad|=%.3e  E(%s after OO)=%s  -> keeping pre-OO reference/%s.",
+        cc_label, e_cc_before, e_oo, grad_norm, cc_label,
+        f"{e_cc_after:.10f}" if e_cc_after is not None else "None", cc_label,
     )
     return props
+
+
+def _apply_initial_oo_rhf(
+    props: ElectronicProperties,
+    mycc: "cc.ccsd.CCSD",
+) -> ElectronicProperties:
+    """RHF counterpart of :func:`_apply_initial_oo` (opt-in via ``OO_INIT=1``).
+
+        RHF (FCIDUMP orbitals) -> CCSD (already run) -> OO with the fixed spin-summed CCSD RDMs
+               (one rotation for both spins) -> CCSD refresh in the rotated basis.
+
+    Same thresholds and accept/reject energy guard as the UHF path. Closed-shell only: the RHF
+    CC refresh (:func:`_refresh_cc_seed_rhf`) builds a doubly occupied reference.
+    """
+    from qcsc_workflow_utility.orbital_opt import (
+        optimize_orbitals_rhf,
+        rotate_electronic_properties,
+    )
+
+    logger = get_run_logger()
+    if props.open_shell:
+        logger.warning(
+            "OO_INIT skipped: the RHF path supports closed-shell references only (nelec=%s).",
+            props.num_electrons,
+        )
+        return props
+
+    e_cc_before = float(mycc.e_tot)
+    # Spin-summed CCSD RDMs in the MO basis of props. make_rdm1() matches the physicist
+    # convention (dm1[p,q] = <q^dag p>); make_rdm2() is dm2[p,q,r,s] = <p^dag r^dag s q>, i.e.
+    # "pqrs" storage.
+    dm1 = np.asarray(mycc.make_rdm1())
+    dm2 = np.asarray(mycc.make_rdm2())
+
+    gtol, trust, maxiter = _initial_oo_settings()
+    U, e_oo, grad_norm = optimize_orbitals_rhf(
+        props, dm1, dm2,
+        rdm2_notation="pqrs",
+        gtol=gtol,
+        trust_radius=trust,
+        maxiter=maxiter,
+    )
+
+    props_rot = rotate_electronic_properties(props, U)
+    return _accept_initial_oo(
+        props, props_rot, "CCSD", e_cc_before, e_oo, grad_norm, trust, gtol,
+    )
 
 
 @task(
