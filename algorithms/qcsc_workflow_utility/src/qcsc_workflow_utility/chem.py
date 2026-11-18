@@ -73,6 +73,21 @@ class ElectronicProperties(BaseModel):
     # coincide at load time (identity; e.g. rhf2uhf input); orbital rotations update it as
     # Ua^T S_ab Ub (rotate_electronic_properties).
     ab_overlap: NpStrict2DArrayF64 | None = None
+    # Per-spin 1-RDMs (alpha, beta) that initial_occupancy was taken from, in the current orbital
+    # basis. None while initial_occupancy is the HF 1/0 seed. Set between DE trials from the
+    # previous trial's SQD result; rotate_electronic_properties rotates them as U^T gamma U and
+    # recomputes initial_occupancy as their diagonal, so the occupancies follow the orbitals.
+    occupancy_rdm1: tuple[NpStrict2DArrayF64, NpStrict2DArrayF64] | None = None
+
+
+def hf_occupancy(norb: int, nelec: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-spin occupancies of the index-aufbau HF determinant: 1 for the lowest ``na`` alpha /
+    ``nb`` beta orbitals, 0 otherwise. Initial occupancies for configuration recovery."""
+    occ_a = np.zeros(norb, dtype=np.float64)
+    occ_b = np.zeros(norb, dtype=np.float64)
+    occ_a[: nelec[0]] = 1.0
+    occ_b[: nelec[1]] = 1.0
+    return occ_a, occ_b
 
 
 def _build_property(
@@ -110,16 +125,6 @@ def _build_property(
     mycc.kernel()
     t2 = mycc.t2
 
-    # Per-MO occupancies for configuration recovery. recover_configurations expects the mean
-    # occupancy of MO p IN THE BASIS THE BITSTRINGS LIVE IN (the canonical MO basis the circuit and
-    # integrals use), i.e. the DIAGONAL of the 1-RDM in that basis -- NOT the sorted eigenvalues
-    # (natural-orbital occupation numbers in a different basis), which would misassign the bias to
-    # the wrong orbitals. The RDM must come from the *correlated* CCSD (mycc), not the SCF object
-    # (mf.make_rdm1() is idempotent -> integer 0/1 occupancies, which give recovery no fractional
-    # signal and collapse the SQD subspace to bare Hartree-Fock).
-    rdm1_ccsd = mycc.make_rdm1()
-    occ_ccsd = np.diag(rdm1_ccsd) / 2.0  # spatial-orbital occ (0-2) -> per-spin (0-1)
-
     # Get PySCF logs dumped into in-memory buffer
     get_run_logger().info(buf.getvalue())
 
@@ -127,7 +132,9 @@ def _build_property(
         one_body_tensor=h1,
         two_body_tensor=h2,
         t2=t2,
-        initial_occupancy=(occ_ccsd, occ_ccsd),
+        # Configuration recovery starts from the HF 1/0 occupancies; from the second DE trial on,
+        # main.py replaces them with the diagonal of the previous trial's SQD 1-RDM.
+        initial_occupancy=hf_occupancy(norb, (num_elec_a, num_elec_b)),
         nuclear_repulsion_energy=nuclear_repulsion_energy,
         num_orbitals=norb,
         num_electrons=(num_elec_a, num_elec_b),
@@ -153,10 +160,10 @@ def _build_property_from_uhf_integrals(
     The orbitals are taken as given (they are built OUTSIDE the workflow, e.g. by rhf2uhf /
     rhf2bsuhf): the reference is the index-aufbau determinant (lowest ``na`` alpha / ``nb`` beta
     orbitals), represented by a mock UHF (mo_coeff = I, see :func:`_build_mock_uhf`). UCCSD is run
-    cold on that reference to seed the LUCJ ansatz (t2) and configuration recovery (diagonal of
-    the correlated 1-RDM). The alpha blocks go into the base ElectronicProperties fields; beta /
-    mixed blocks go into the optional *_b / *_ab / *_bb fields. ``OO_INIT=1`` then applies one
-    initial orbital-optimization step (:func:`_apply_initial_oo`).
+    cold on that reference to seed the LUCJ ansatz (t2); configuration recovery starts from the
+    HF 1/0 occupancies of that determinant. The alpha blocks go into the base ElectronicProperties
+    fields; beta / mixed blocks go into the optional *_b / *_ab / *_bb fields. ``OO_INIT=1`` then
+    applies one initial orbital-optimization step (:func:`_apply_initial_oo`).
 
     Returns ``(props, E_ref, E_UCCSD, UCCSD converged)`` (total energies, including ``ecore``).
     """
@@ -168,7 +175,9 @@ def _build_property_from_uhf_integrals(
         one_body_tensor_b=np.ascontiguousarray(h1_b, dtype=np.float64),
         two_body_tensor_ab=np.ascontiguousarray(h2_ab, dtype=np.float64),
         two_body_tensor_bb=np.ascontiguousarray(h2_bb, dtype=np.float64),
-        initial_occupancy=(np.zeros(norb), np.zeros(norb)),
+        # Configuration recovery starts from the HF 1/0 occupancies; from the second DE trial on,
+        # main.py replaces them with the diagonal of the previous trial's SQD 1-RDM.
+        initial_occupancy=hf_occupancy(norb, nelec),
         nuclear_repulsion_energy=float(ecore),
         num_orbitals=norb,
         num_electrons=(num_elec_a, num_elec_b),
@@ -199,15 +208,6 @@ def _build_property_from_uhf_integrals(
     mycc.kernel(eris=eris)
     t2_aa, t2_ab, t2_bb = mycc.t2
 
-    # Per-spin occupancies from the *correlated* UCCSD 1-RDM (in MO basis). These must be
-    # fractional: configuration recovery downstream uses them to bias sampled bitstrings toward the
-    # physically important (near-HF) configurations; the SCF RDM is idempotent (integer 0/1) and
-    # gives recovery no signal. Use the DIAGONAL (per-MO occupancy in the basis the bitstrings are
-    # measured in), not the sorted natural-orbital eigenvalues, which live in a rotated basis.
-    dm_cc_a, dm_cc_b = mycc.make_rdm1()
-    occ_a = np.diag(dm_cc_a)
-    occ_b = np.diag(dm_cc_b)
-
     # Get PySCF logs dumped into in-memory buffer
     get_run_logger().info(buf.getvalue())
 
@@ -216,13 +216,13 @@ def _build_property_from_uhf_integrals(
             "t2": t2_aa,
             "t2_ab": t2_ab,
             "t2_bb": t2_bb,
-            "initial_occupancy": (occ_a, occ_b),
         }
     )
 
     # Opt-in initial orbital optimization: reference -> UCCSD -> OO -> UCCSD refresh.
     # Default off (OO_INIT unset/0).
     if os.environ.get("OO_INIT", "0") == "1":
+        dm_cc_a, dm_cc_b = mycc.make_rdm1()
         props = _apply_initial_oo(props, mycc, dm_cc_a, dm_cc_b)
 
     return props, e_ref, float(mycc.e_tot), bool(mycc.converged)
@@ -240,7 +240,7 @@ def _apply_initial_oo(
 
         reference (FCIDUMP orbitals) -> UCCSD (already run; 1-/2-RDM in hand)
                -> OO (rotate orbitals with the fixed UCCSD RDM, two-step MCSCF)
-               -> UCCSD refresh in the rotated basis (fresh t2 / occupancy seed).
+               -> UCCSD refresh in the rotated basis (fresh t2 seed).
 
     OO needs a *correlated* RDM: a converged SCF density already satisfies the generalized
     Brillouin condition (zero orbital gradient), so an SCF-RDM-driven OO cannot move. UCCSD
@@ -453,9 +453,9 @@ def compute_molecular_integrals_from_uhf_fcidump(
 
     The file (format: :mod:`qcsc_workflow_utility.uhf_fcidump`, as written by rhf2uhf /
     rhf2bsuhf) already carries the MO-basis spin-block integrals of the chosen reference; the
-    reference determinant is the lowest ``na`` alpha / ``nb`` beta orbitals by index. UCCSD (t2
-    seed + initial occupancy) and the optional ``OO_INIT=1`` step are run on top of it from the
-    integrals alone (mock UHF, see :func:`_build_mock_uhf`).
+    reference determinant is the lowest ``na`` alpha / ``nb`` beta orbitals by index (also the
+    HF 1/0 initial occupancy). UCCSD (t2 seed) and the optional ``OO_INIT=1`` step are run on top
+    of it from the integrals alone (mock UHF, see :func:`_build_mock_uhf`).
 
     Args:
         fcidump_file: Interleaved spin-orbital FCIDUMP (header NORB = spatial orbitals).
@@ -499,10 +499,11 @@ def refresh_cc_seed(
     """Re-run CCSD/UCCSD on the current (rotated) integrals and return updated ElectronicProperties.
 
     This is the CC-refresh step for OO_TO_LUCJ=1: after orbital optimization rotates the
-    Hamiltonian, solve CC in the new basis so that t2 and initial_occupancy match the rotated
-    integrals. Uses the previous t2 amplitudes (from elec_props) as warm-start initial guess
-    so that UCCSD converges faster in the rotated basis. Returns a new ElectronicProperties
-    with updated t2/occupancy fields, or None if amplitudes contain NaN.
+    Hamiltonian, solve CC in the new basis so that t2 matches the rotated integrals. Uses the
+    previous t2 amplitudes (from elec_props) as warm-start initial guess so that UCCSD converges
+    faster in the rotated basis. Returns a new ElectronicProperties with updated t2 fields, or None
+    if amplitudes contain NaN. initial_occupancy (and occupancy_rdm1) are carried over unchanged:
+    they come from the HF 1/0 seed or the previous SQD 1-RDM, not from CC.
 
     If ``return_energy`` is True, returns ``(props_or_None, e_tot_or_None)`` instead: the
     refreshed UCCSD/CCSD total energy accompanies the properties (used by the OO_INIT energy
@@ -592,18 +593,16 @@ def _refresh_cc_seed_rhf(
         mycc.e_corr, np.linalg.norm(t1_new), np.linalg.norm(t2_new),
     )
 
-    rdm1_cc = mycc.make_rdm1()
-    occ_new = np.diag(rdm1_cc) / 2.0
-
-    if np.any(np.isnan(t2_new)) or np.any(np.isnan(occ_new)):
-        log.warning("CC refresh (RHF): NaN detected in amplitudes or occupancy. Discarding.")
+    if np.any(np.isnan(t2_new)):
+        log.warning("CC refresh (RHF): NaN detected in amplitudes. Discarding.")
         return (None, None) if return_energy else None
 
     props = ElectronicProperties(
         one_body_tensor=elec_props.one_body_tensor,
         two_body_tensor=elec_props.two_body_tensor,
         t2=t2_new,
-        initial_occupancy=(occ_new, occ_new),
+        initial_occupancy=elec_props.initial_occupancy,
+        occupancy_rdm1=elec_props.occupancy_rdm1,
         nuclear_repulsion_energy=elec_props.nuclear_repulsion_energy,
         num_orbitals=norb,
         num_electrons=elec_props.num_electrons,
@@ -798,17 +797,8 @@ def _refresh_cc_seed_uhf(
         np.linalg.norm(t2_aa_new), np.linalg.norm(t2_ab_new), np.linalg.norm(t2_bb_new),
     )
 
-    # NaN check BEFORE make_rdm1: lambda equation crashes on NaN amplitudes
     if any(np.any(np.isnan(x)) or np.any(np.isinf(x)) for x in [t2_aa_new, t2_ab_new, t2_bb_new]):
         log.warning("CC refresh (UHF): NaN/Inf detected in amplitudes. Discarding.")
-        return (None, None) if return_energy else None
-
-    dm_a, dm_b = mycc.make_rdm1()
-    occ_a_new = np.diag(dm_a)
-    occ_b_new = np.diag(dm_b)
-
-    if any(np.any(np.isnan(x)) for x in [occ_a_new, occ_b_new]):
-        log.warning("CC refresh (UHF): NaN detected in occupancy. Discarding.")
         return (None, None) if return_energy else None
 
     props = ElectronicProperties(
@@ -820,7 +810,8 @@ def _refresh_cc_seed_uhf(
         two_body_tensor_bb=elec_props.two_body_tensor_bb,
         t2_ab=t2_ab_new,
         t2_bb=t2_bb_new,
-        initial_occupancy=(occ_a_new, occ_b_new),
+        initial_occupancy=elec_props.initial_occupancy,
+        occupancy_rdm1=elec_props.occupancy_rdm1,
         nuclear_repulsion_energy=elec_props.nuclear_repulsion_energy,
         num_orbitals=elec_props.num_orbitals,
         num_electrons=elec_props.num_electrons,

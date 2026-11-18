@@ -479,6 +479,33 @@ class TestOrbitalOpt:
             f"diff={abs(e_check-e_opt):.2e}"
         )
 
+    def test_T12_rotate_ep_rotates_occupancy_rdm1(self, oh_data):
+        """occupancy_rdm1 があれば U^T γ U に回転し、initial_occupancy はその対角になる。
+        無ければ（HF 1/0 の初期値）initial_occupancy はそのまま。"""
+        ep, _, rdm1_aa, rdm1_bb, *_ = oh_data
+        norb = ep.num_orbitals
+        rng = np.random.default_rng(0)
+        Ua, _ = np.linalg.qr(rng.standard_normal((norb, norb)))
+        Ub, _ = np.linalg.qr(rng.standard_normal((norb, norb)))
+
+        ep_rdm = ep.model_copy(update={
+            "initial_occupancy": (np.diag(rdm1_aa).copy(), np.diag(rdm1_bb).copy()),
+            "occupancy_rdm1": (rdm1_aa, rdm1_bb),
+        })
+        ep_new = rotate_electronic_properties(ep_rdm, Ua, Ub)
+        np.testing.assert_allclose(ep_new.occupancy_rdm1[0], Ua.T @ rdm1_aa @ Ua, atol=1e-12)
+        np.testing.assert_allclose(ep_new.occupancy_rdm1[1], Ub.T @ rdm1_bb @ Ub, atol=1e-12)
+        np.testing.assert_allclose(ep_new.initial_occupancy[0], np.diag(Ua.T @ rdm1_aa @ Ua))
+        np.testing.assert_allclose(ep_new.initial_occupancy[1], np.diag(Ub.T @ rdm1_bb @ Ub))
+        na, nb = ep.num_electrons
+        assert ep_new.initial_occupancy[0].sum() == pytest.approx(na)
+        assert ep_new.initial_occupancy[1].sum() == pytest.approx(nb)
+
+        ep_hf = rotate_electronic_properties(ep, Ua, Ub)
+        assert ep_hf.occupancy_rdm1 is None
+        np.testing.assert_array_equal(ep_hf.initial_occupancy[0], ep.initial_occupancy[0])
+        np.testing.assert_array_equal(ep_hf.initial_occupancy[1], ep.initial_occupancy[1])
+
     # ─── T6: RHF パス ──────────────────────────────────────────────────────
     def test_T6_rhf_path(self, h2_rhf_data):
         """RHF (unrestricted=False) で optimize_orbitals が動作することを確認。

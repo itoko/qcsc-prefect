@@ -613,9 +613,10 @@ def rotate_electronic_properties(
     both one- and two-body tensors.  For UHF, Ua rotates alpha integrals, Ub
     rotates beta integrals, and the mixed (αβ) block uses (Ua, Ub) together.
 
-    The ``t2`` amplitudes and ``initial_occupancy`` are intentionally NOT rotated
-    because they are used only to initialize the SQD subspace; the RDMs (occupancies)
-    produced by the solver are self-consistently updated each iteration.
+    The ``t2`` amplitudes are intentionally NOT rotated because they are used only to
+    initialize the SQD subspace. ``initial_occupancy`` follows the orbitals when it was taken
+    from a 1-RDM (``occupancy_rdm1`` set): the 1-RDMs are rotated as U^T gamma U and the new
+    occupancies are their diagonal. The HF 1/0 seed (``occupancy_rdm1`` None) is kept as is.
     """
     from qcsc_workflow_utility.chem import ElectronicProperties
 
@@ -645,11 +646,20 @@ def rotate_electronic_properties(
         h2_ab_new = None
         h2_bb_new = None
 
+    if elec_props.occupancy_rdm1 is not None:
+        g_a, g_b = (np.asarray(g) for g in elec_props.occupancy_rdm1)
+        occupancy_rdm1 = (rot1(g_a, Ua), rot1(g_b, Ub if elec_props.unrestricted else Ua))
+        initial_occupancy = (np.diag(occupancy_rdm1[0]).copy(), np.diag(occupancy_rdm1[1]).copy())
+    else:
+        occupancy_rdm1 = None
+        initial_occupancy = elec_props.initial_occupancy
+
     return ElectronicProperties(
         one_body_tensor=h1_a_new,
         two_body_tensor=h2_aa_new,
         t2=elec_props.t2,
-        initial_occupancy=elec_props.initial_occupancy,
+        initial_occupancy=initial_occupancy,
+        occupancy_rdm1=occupancy_rdm1,
         nuclear_repulsion_energy=elec_props.nuclear_repulsion_energy,
         num_orbitals=elec_props.num_orbitals,
         num_electrons=elec_props.num_electrons,
