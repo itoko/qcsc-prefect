@@ -2,6 +2,8 @@
 
 import io
 import os
+import re
+import time
 import warnings
 from typing import Annotated
 
@@ -578,6 +580,8 @@ def compute_molecular_integrals_from_uhf_fcidump(
 def refresh_cc_seed(
     elec_props: ElectronicProperties,
     return_energy: bool = False,
+    return_info: bool = False,
+    warm_start: bool = True,
 ):
     """Re-run CCSD/UCCSD on the current (rotated) integrals and return updated ElectronicProperties.
 
@@ -591,19 +595,69 @@ def refresh_cc_seed(
     If ``return_energy`` is True, returns ``(props_or_None, e_tot_or_None)`` instead: the
     refreshed UCCSD/CCSD total energy accompanies the properties (used by the OO_INIT energy
     guard). Default False preserves the original single-value return for existing callers.
+
+    If ``return_info`` is True, a convergence record (dict, see :func:`_cc_info`) is appended to
+    the return value: ``(props_or_None, info)``, or ``(props_or_None, e_tot_or_None, info)`` with
+    ``return_energy``. The PySCF CC log (verbose 4, one line per cycle) is then captured into
+    ``info["log"]`` instead of going to stdout. ``warm_start=False`` starts from PySCF's default
+    (MP2) guess instead of the previous t2 (closed-loop SQD-OO uses it for the initial circuit).
     """
     import logging
 
     log = logging.getLogger(__name__)
-    norb = elec_props.num_orbitals
-    nelec_a, nelec_b = elec_props.num_electrons
 
     max_cycle = int(os.environ.get("SEED_CCSD_MAX_CYCLE", "200"))
 
     if elec_props.unrestricted:
-        return _refresh_cc_seed_uhf(elec_props, log, max_cycle, return_energy)
+        return _refresh_cc_seed_uhf(
+            elec_props, log, max_cycle, return_energy, return_info, warm_start
+        )
     else:
-        return _refresh_cc_seed_rhf(elec_props, log, max_cycle, return_energy)
+        return _refresh_cc_seed_rhf(
+            elec_props, log, max_cycle, return_energy, return_info, warm_start
+        )
+
+
+# One PySCF CC iteration line (pyscf/cc/ccsd.py kernel, logged at verbose >= 4).
+_CC_CYCLE_RE = re.compile(
+    r"cycle = (\d+)\s+E_corr\([^)]*\) = (\S+)\s+dE = (\S+)\s+norm\(t1,t2\) = (\S+)"
+)
+
+
+def _cc_info(
+    mycc, method: str, warm_start: bool, wall: float, log_text: str, t1_norm: float, t2_norm: float
+) -> dict:
+    """Convergence record of one CC solve: flags, last-cycle changes and the per-cycle history
+    ``[(cycle, E_corr, dE, norm(t1,t2)), ...]`` parsed from the PySCF log."""
+    history = [
+        (int(c), float(e), float(de), float(nt))
+        for c, e, de, nt in _CC_CYCLE_RE.findall(log_text)
+    ]
+    return {
+        "method": method,
+        "converged": bool(mycc.converged),
+        "cycles": int(getattr(mycc, "cycles", len(history))),
+        "max_cycle": int(mycc.max_cycle),
+        "conv_tol": float(mycc.conv_tol),
+        "conv_tol_normt": float(mycc.conv_tol_normt),
+        "e_tot": float(mycc.e_tot),
+        "e_corr": float(mycc.e_corr),
+        "de_last": history[-1][2] if history else float("nan"),
+        "norm_t_last": history[-1][3] if history else float("nan"),
+        "t1_norm": float(t1_norm),
+        "t2_norm": float(t2_norm),
+        "warm_start": bool(warm_start),
+        "wall_s": float(wall),
+        "history": history,
+        "log": log_text,
+    }
+
+
+def _refresh_result(props, e_tot, info, return_energy: bool, return_info: bool):
+    out = (props, e_tot) if return_energy else (props,)
+    if return_info:
+        out = out + (info,)
+    return out if len(out) > 1 else out[0]
 
 
 def _refresh_cc_seed_rhf(
@@ -611,6 +665,8 @@ def _refresh_cc_seed_rhf(
     log,
     max_cycle: int,
     return_energy: bool = False,
+    return_info: bool = False,
+    warm_start: bool = True,
 ) -> ElectronicProperties | None:
     """CC refresh for RHF."""
     norb = elec_props.num_orbitals
@@ -660,25 +716,42 @@ def _refresh_cc_seed_rhf(
     mycc = cc.CCSD(mf)
     mycc.max_cycle = max_cycle
     mycc.diis_space = 12
+    cc_buf = None
+    if return_info:
+        cc_buf = io.StringIO()
+        mycc.verbose = 4
+        mycc.stdout = cc_buf
 
-    # Warm-start: use old t2 as initial guess for faster convergence in rotated basis.
-    t2_old = np.asarray(elec_props.t2)
-    t1_init = np.zeros((nelec_a, norb - nelec_a))
-    log.info("CC refresh (RHF): warm-start with old ||t2||=%.4e", np.linalg.norm(t2_old))
-    mycc.kernel(t1=t1_init, t2=t2_old)
+    t_start = time.perf_counter()
+    if warm_start:
+        # Warm-start: use old t2 as initial guess for faster convergence in rotated basis.
+        t2_old = np.asarray(elec_props.t2)
+        t1_init = np.zeros((nelec_a, norb - nelec_a))
+        log.info("CC refresh (RHF): warm-start with old ||t2||=%.4e", np.linalg.norm(t2_old))
+        mycc.kernel(t1=t1_init, t2=t2_old)
+    else:
+        log.info("CC refresh (RHF): cold start (PySCF default MP2 guess)")
+        mycc.kernel()
+    wall = time.perf_counter() - t_start
 
     if not mycc.converged:
         log.warning("CC refresh (RHF): CCSD did not converge after %d cycles. Using unconverged amplitudes.", max_cycle)
 
     t1_new, t2_new = mycc.t1, mycc.t2
     log.info(
-        "CC refresh (RHF): converged. E_corr=%.6f ||t1||=%.4e ||t2||=%.4e",
+        "CC refresh (RHF): %s. E_corr=%.6f ||t1||=%.4e ||t2||=%.4e",
+        "converged" if mycc.converged else "NOT converged",
         mycc.e_corr, np.linalg.norm(t1_new), np.linalg.norm(t2_new),
+    )
+    info = (
+        _cc_info(mycc, "RCCSD", warm_start, wall, cc_buf.getvalue(),
+                 np.linalg.norm(t1_new), np.linalg.norm(t2_new))
+        if return_info else None
     )
 
     if np.any(np.isnan(t2_new)):
         log.warning("CC refresh (RHF): NaN detected in amplitudes. Discarding.")
-        return (None, None) if return_energy else None
+        return _refresh_result(None, None, info, return_energy, return_info)
 
     props = ElectronicProperties(
         one_body_tensor=elec_props.one_body_tensor,
@@ -692,7 +765,7 @@ def _refresh_cc_seed_rhf(
         open_shell=elec_props.open_shell,
         spin_sq=elec_props.spin_sq,
     )
-    return (props, float(mycc.e_tot)) if return_energy else props
+    return _refresh_result(props, float(mycc.e_tot), info, return_energy, return_info)
 
 
 def _build_mock_uhf(
@@ -825,6 +898,8 @@ def _refresh_cc_seed_uhf(
     log,
     max_cycle: int,
     return_energy: bool = False,
+    return_info: bool = False,
+    warm_start: bool = True,
 ) -> ElectronicProperties | None:
     """CC refresh for UHF.
 
@@ -843,6 +918,11 @@ def _refresh_cc_seed_uhf(
     mycc.max_cycle = max_cycle
     mycc.diis_space = 12
     mycc.diis_start_cycle = 20
+    cc_buf = None
+    if return_info:
+        cc_buf = io.StringIO()
+        mycc.verbose = 4
+        mycc.stdout = cc_buf
 
     log.info(
         "CC refresh (UHF): e_uhf=%.6f norb=%d nelec=(%d,%d) "
@@ -853,19 +933,25 @@ def _refresh_cc_seed_uhf(
 
     eris = make_eris(mycc)
 
-    # Warm-start: use old t1/t2 as initial guess for faster convergence.
-    t2_aa_old = np.asarray(elec_props.t2)
-    t2_ab_old = np.asarray(elec_props.t2_ab)
-    t2_bb_old = np.asarray(elec_props.t2_bb)
-    nocc_a, nocc_b = nelec_a, nelec_b
-    nvir_a, nvir_b = norb - nocc_a, norb - nocc_b
-    t1_a_init = np.zeros((nocc_a, nvir_a))
-    t1_b_init = np.zeros((nocc_b, nvir_b))
-    log.info(
-        "CC refresh (UHF): warm-start with old ||t2aa||=%.4e ||t2ab||=%.4e ||t2bb||=%.4e",
-        np.linalg.norm(t2_aa_old), np.linalg.norm(t2_ab_old), np.linalg.norm(t2_bb_old),
-    )
-    mycc.kernel(t1=(t1_a_init, t1_b_init), t2=(t2_aa_old, t2_ab_old, t2_bb_old), eris=eris)
+    t_start = time.perf_counter()
+    if warm_start:
+        # Warm-start: use old t1/t2 as initial guess for faster convergence.
+        t2_aa_old = np.asarray(elec_props.t2)
+        t2_ab_old = np.asarray(elec_props.t2_ab)
+        t2_bb_old = np.asarray(elec_props.t2_bb)
+        nocc_a, nocc_b = nelec_a, nelec_b
+        nvir_a, nvir_b = norb - nocc_a, norb - nocc_b
+        t1_a_init = np.zeros((nocc_a, nvir_a))
+        t1_b_init = np.zeros((nocc_b, nvir_b))
+        log.info(
+            "CC refresh (UHF): warm-start with old ||t2aa||=%.4e ||t2ab||=%.4e ||t2bb||=%.4e",
+            np.linalg.norm(t2_aa_old), np.linalg.norm(t2_ab_old), np.linalg.norm(t2_bb_old),
+        )
+        mycc.kernel(t1=(t1_a_init, t1_b_init), t2=(t2_aa_old, t2_ab_old, t2_bb_old), eris=eris)
+    else:
+        log.info("CC refresh (UHF): cold start (PySCF default MP2 guess)")
+        mycc.kernel(eris=eris)
+    wall = time.perf_counter() - t_start
 
     if not mycc.converged:
         log.warning("CC refresh (UHF): UCCSD did not converge after %d cycles. Using unconverged amplitudes.", max_cycle)
@@ -879,10 +965,18 @@ def _refresh_cc_seed_uhf(
         np.linalg.norm(t1_a_new), np.linalg.norm(t1_b_new),
         np.linalg.norm(t2_aa_new), np.linalg.norm(t2_ab_new), np.linalg.norm(t2_bb_new),
     )
+    info = (
+        _cc_info(
+            mycc, "UCCSD", warm_start, wall, cc_buf.getvalue(),
+            np.sqrt(sum(np.linalg.norm(x) ** 2 for x in (t1_a_new, t1_b_new))),
+            np.sqrt(sum(np.linalg.norm(x) ** 2 for x in (t2_aa_new, t2_ab_new, t2_bb_new))),
+        )
+        if return_info else None
+    )
 
     if any(np.any(np.isnan(x)) or np.any(np.isinf(x)) for x in [t2_aa_new, t2_ab_new, t2_bb_new]):
         log.warning("CC refresh (UHF): NaN/Inf detected in amplitudes. Discarding.")
-        return (None, None) if return_energy else None
+        return _refresh_result(None, None, info, return_energy, return_info)
 
     props = ElectronicProperties(
         one_body_tensor=elec_props.one_body_tensor,
@@ -903,6 +997,6 @@ def _refresh_cc_seed_uhf(
         spin_sq=elec_props.spin_sq,
         ab_overlap=elec_props.ab_overlap,
     )
-    return (props, float(mycc.e_tot)) if return_energy else props
+    return _refresh_result(props, float(mycc.e_tot), info, return_energy, return_info)
 
 

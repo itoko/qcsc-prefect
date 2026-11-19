@@ -26,6 +26,7 @@ from qcsc_workflow_utility.orbital_opt import (
     rotate_electronic_properties,
 )
 
+from . import closed_loop
 from .data_io import extend_table_artifact
 from .flow_params import FlowParameters
 from .lucj import initialize_ucj_parameters
@@ -300,8 +301,51 @@ def riken_sqd_de(
     # fire CC refresh to break out of the determinant-space bottleneck.
     _consecutive_oo_skips = 0
 
+    # Opt-in state restore / save between jobs (closed-loop SQD-OO and Batch resume;
+    # sbd/closed_loop.py). Unset SBD_STATE_FROM / SBD_STATE_SAVE_DIR -> nothing changes.
+    _rotation = closed_loop.CumulativeRotation(elec_props.num_orbitals)
+    _start_trial = 0
+    _state_from = closed_loop.state_from_env()
+    _state_dir = closed_loop.state_save_dir()
+    _cl_active = bool(_state_from or _state_dir)
+    _state_carry = None
+    if _state_from:
+        _start_trial, elec_props, state, _rotation, _loop = closed_loop.load_state(
+            _state_from, OptimizerState,
+            norb=elec_props.num_orbitals, unrestricted=unrestricted,
+        )
+        do_orbital_opt = do_orbital_opt and _loop["do_orbital_opt"]
+        _oo_prediction = _loop["oo_prediction"]
+        _state_carry = closed_loop.carry_entries(_state_from)
+        logger.info(
+            "[state] restored state before trial %d from %s (best=%s, carryover rows=%d, "
+            "t2 from CC at iteration %s, converged=%s)",
+            _start_trial, _state_from, state.best_energy(), len(state.carryover),
+            _loop["cc"].get("iteration", "n/a"), _loop["cc"].get("converged", "n/a"),
+        )
+        if _start_trial >= parameters.de_params.iterations:
+            logger.warning(
+                "[state] restored trial %d >= iterations %d: no trial will run.",
+                _start_trial, parameters.de_params.iterations,
+            )
+
+    def _save_state(trial: int) -> None:
+        if not _state_dir:
+            return
+        try:
+            closed_loop.save_state(
+                closed_loop.state_path(_state_dir, trial), trial, elec_props, state, _rotation,
+                do_orbital_opt=do_orbital_opt, oo_prediction=_oo_prediction,
+                carry=_state_carry, logger=logger,
+            )
+        except Exception:
+            logger.exception("[state] saving the state before trial %d failed.", trial)
+            raise
+
     # Start differential evoluation
-    for i in range(parameters.de_params.iterations):
+    for i in range(_start_trial, parameters.de_params.iterations):
+        if i > _start_trial:
+            _save_state(i)
         logger.info(f"Running differential evolution trial {i}")
 
         state, best_sbd_result = differential_evolution_trial(
@@ -317,6 +361,14 @@ def riken_sqd_de(
         elec_props = _carry_sqd_occupancy(elec_props, best_sbd_result, logger, i)
 
         logger.info(f"Current best energy = {state.best_energy()} (walker {state.best_index})")
+        if _cl_active:
+            logger.info(
+                "[cl-trial] trial=%d E_trial=%s best=%s",
+                i,
+                f"{float(best_sbd_result.energy) + float(elec_props.nuclear_repulsion_energy):.10f}"
+                if best_sbd_result is not None and best_sbd_result.energy is not None else "nan",
+                f"{state.best_energy():.10f}" if state.best_energy() is not None else "nan",
+            )
 
         # ── OO effect tracking: compare previous OO prediction with this trial's actual energy ──
         # Also detect OO saturation: when Davidson improvement is small but the prediction gap
@@ -595,6 +647,10 @@ def riken_sqd_de(
                     _elec_props_before_oo = elec_props
                     elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                     logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
+                    _rot_before_oo = _rotation.snapshot()
+                    _rotation.apply(Ua, Ub)
+                    if _cl_active:
+                        logger.info("[cl-rot] trial=%d %s", i, closed_loop.rotation_summary(Ua, Ub, _rotation))
 
                     # OO_CHECK: re-diagonalize the SAME determinant subspace with the
                     # ROTATED H to get the true energy after OO (without re-sampling).
@@ -632,6 +688,7 @@ def riken_sqd_de(
                                 )
                                 if _e_check > _rdm_e:
                                     elec_props = _elec_props_before_oo
+                                    _rotation.restore(_rot_before_oo)
                                     _oo_prediction = None
                                     logger.warning(
                                         "Trial %d: OO_CHECK energy increased by %.3e Ha "
@@ -690,6 +747,8 @@ def riken_sqd_de(
                     i, "None" if rdm1_aa is None else "present",
                 )
 
+    if parameters.de_params.iterations > _start_trial:
+        _save_state(parameters.de_params.iterations)
     return state.best_energy()
 
 
