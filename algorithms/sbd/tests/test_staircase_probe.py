@@ -425,6 +425,12 @@ def test_fock_inject_off_and_filters(ham, monkeypatch):
 
 def test_fock_inject_eps_rule_tail_and_cap(ham, monkeypatch):
     (la, ca), (lb, cb) = _inject_case(ham, np.random.default_rng(4))
+    # Make the top-scoring candidate of each spin already present (kept from an earlier injection):
+    # the threshold must still come from it.
+    for k, (cur, co, ne) in enumerate(((la, ca, NA_F), (lb, cb, NB_F))):
+        h1, g, oj = sp._spin_integrals(ham, k, (NB_F, NA_F)[k])
+        ch, s, _ = sp.score_candidates(sp.carry_ints(co, NORB_F, ne), sp.make_fock_of(h1, g, oj), NORB_F)
+        cur[-1] = ch[np.argmax(s)] if ch[np.argmax(s)] not in set(cur.tolist()) else cur[-1]
     monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.3")
     fa, fb = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
     for k, (cur, co, new, ne) in enumerate(((la, ca, fa, NA_F), (lb, cb, fb, NB_F))):
@@ -432,7 +438,7 @@ def test_fock_inject_eps_rule_tail_and_cap(ham, monkeypatch):
         h1, g, oj = sp._spin_integrals(ham, k, (NB_F, NA_F)[k])
         ch, s, _ = sp.score_candidates(core, sp.make_fock_of(h1, g, oj), NORB_F)
         absent = ~np.isin(ch, cur)
-        want = set(ch[absent & (s >= 0.3 * s[absent].max())].tolist())
+        want = set(ch[absent & (s >= 0.3 * s.max())].tolist())     # threshold from the max over ALL candidates
         cap = min(int(0.5 * (len(cur) - 13)), len(cur) // 2 - 1)
         n_add = min(len(want), cap)
         assert n_add > 0 and len(new) == len(cur) and len(set(new.tolist())) == len(new)
@@ -441,6 +447,7 @@ def test_fock_inject_eps_rule_tail_and_cap(ham, monkeypatch):
         assert set(added.tolist()) <= want and not np.isin(added, cur).any()
         if len(want) <= cap:
             assert set(added.tolist()) == want
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.01")                                # rule > cap
     monkeypatch.setenv("SBD_FOCK_INJECT_FMAX", "0.1")                                # cap = 0.1 * 40 = 4
     fa, _ = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
     assert len(set(fa.tolist()) - set(la.tolist())) == 4

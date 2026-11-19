@@ -518,7 +518,9 @@ def dump_rotation(trial: int, ua, ub, tracker: RotationTracker, *, e_davidson_to
 # (Slater-Condon single-excitation element); SBD_FOCK_INJECT_SCORE=hci adds same-spin doubles of
 # the top SBD_FOCK_INJECT_NCORE_D core strings, s_D = max_r w_r |(ai|bj) - (aj|bi)| (same units).
 # How many (per spin; exactly one of):
-#   SBD_FOCK_INJECT_EPS=e    candidates not in the list with s >= e * max s (max over those absent)
+#   SBD_FOCK_INJECT_EPS=e    candidates not in the list with s >= e * max s (max over ALL candidates,
+#                            including those already in the list, so strings kept from earlier
+#                            injections do not lower the threshold)
 #   SBD_FOCK_INJECT_N=n      the top n absent candidates
 #   SBD_FOCK_INJECT_FRAC=f   the top f * len(list) absent candidates
 # capped at min(SBD_FOCK_INJECT_FMAX (0.5) * n_sampled, len(list) // 2 - 1), n_sampled = len(list)
@@ -681,9 +683,9 @@ def _spin_integrals(elec_props, spin: int, n_other: int):
             np.einsum("jjpq->pq", gab[ref, ref]))
 
 
-def _rule_count(cfg, score_absent, n_list):
+def _rule_count(cfg, score_absent, s_max, n_list):
     if cfg["rule"] == "eps":
-        return int((score_absent >= cfg["value"] * score_absent.max()).sum()) if score_absent.size else 0
+        return int((score_absent >= cfg["value"] * s_max).sum())
     if cfg["rule"] == "n":
         return int(cfg["value"])
     return int(round(cfg["value"] * n_list))
@@ -724,9 +726,9 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
         present = np.isin(ch, cur)
         absent_idx = np.flatnonzero(~present)
         s_abs = s[absent_idx]
-        n_rule = _rule_count(cfg, s_abs, len(cur))
-        n_present = int((s[present] >= cfg["value"] * s_abs.max()).sum()) if (
-            cfg["rule"] == "eps" and s_abs.size) else int(present.sum())
+        s_max = float(s.max())
+        n_rule = _rule_count(cfg, s_abs, s_max, len(cur))
+        n_present = int((s[present] >= cfg["value"] * s_max).sum()) if cfg["rule"] == "eps" else int(present.sum())
         n_co = int(np.isin(cur[1:], carry[k][carry[k] != hf]).sum())
         n_sampled = len(cur) - 1 - n_co
         cap = max(min(int(cfg["fmax"] * n_sampled), len(cur) // 2 - 1), 0)
@@ -743,10 +745,10 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
         if logger is not None:
             logger.info(
                 "[fock-inject] trial %d step %d spin %s: +%d (rule %s -> %d, cap %d, candidates %d, "
-                "already present %d, sampled %d, max %.4e (all %.4e), score %s, mode %s, mean exc %.2f, "
+                "already present %d, sampled %d, max %.4e (absent %.4e), score %s, mode %s, mean exc %.2f, "
                 "dimension %d, %.1f s)",
                 trial, step, "ab"[k], n_add, rule_txt, n_rule, cap, len(ch), n_present, n_sampled,
-                float(s_abs.max()) if s_abs.size else 0.0, float(s.max()) if s.size else 0.0,
+                s_max, float(s_abs.max()) if s_abs.size else 0.0,
                 cfg["score"], cfg["mode"],
                 float(exc_level(ch[chosen], nel[k]).mean()) if n_add else 0.0,
                 len(lists[k]), time.time() - t0)
