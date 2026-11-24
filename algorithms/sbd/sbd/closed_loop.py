@@ -22,6 +22,7 @@ from the file alone, so the integrals the job loads from the FCIDUMP are only ch
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -86,6 +87,41 @@ def state_from_env() -> str:
 
 def state_save_dir() -> str:
     return os.environ.get("SBD_STATE_SAVE_DIR", "").strip()
+
+
+def loader_skip_enabled() -> bool:
+    """``SBD_STATE_SKIP_LOADER=0`` keeps loading the FCIDUMP when a state is restored (the old behaviour)."""
+    return os.environ.get("SBD_STATE_SKIP_LOADER", "1").strip() != "0"
+
+
+def file_sha1(path: str, chunk: int = 1 << 24) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def state_fcidump_check(path: str, fcidump: str) -> tuple[bool, str]:
+    """Whether the state at ``path`` was built from ``fcidump`` (the ``fcidump_sha1`` in its meta,
+    written by cl_sample.py init and carried along by every saved state).
+
+    (True, reason): the sha1 matches, so the job may skip the FCIDUMP loader (the restore replaces
+    every field the loader returns). (False, reason): the state records no sha1; load the FCIDUMP as
+    before. Raises ValueError when the sha1 differs (the state belongs to another system).
+    """
+    with np.load(path, allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"])) if "meta" in z.files else {}
+    want = meta.get("fcidump_sha1")
+    if not want:
+        return False, f"{os.path.basename(path)} records no fcidump_sha1"
+    got = file_sha1(fcidump)
+    if got != want:
+        raise ValueError(
+            f"state file {path} was built from an FCIDUMP with sha1 {want[:12]}, "
+            f"but {fcidump} has sha1 {got[:12]}"
+        )
+    return True, f"fcidump_sha1 {got[:12]} matches {os.path.basename(path)}"
 
 
 def state_path(directory: str, trial: int) -> str:

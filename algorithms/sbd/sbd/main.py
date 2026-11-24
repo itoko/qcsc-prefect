@@ -259,9 +259,21 @@ def riken_sqd_de(
         getattr(solver, "do_rdm", 0), parameters.de_params.iterations,
     )
 
+    # Restoring a state built from this FCIDUMP (meta fcidump_sha1): the restore below replaces every
+    # field the loader returns, and only num_orbitals is used before it, so skip the loader and its
+    # CCSD (closed-loop GPU jobs, Batch resume). SBD_STATE_SKIP_LOADER=0 loads the FCIDUMP anyway.
+    _state_from = closed_loop.state_from_env()
+    _skip_loader = False
+    if _state_from and closed_loop.loader_skip_enabled():
+        _skip_loader, _why = closed_loop.state_fcidump_check(_state_from, parameters.fcidump)
+        logger.info("[state] %s the FCIDUMP loader: %s",
+                    "skipping" if _skip_loader else "running", _why)
+
     # UHF input is a spin-orbital FCIDUMP whose orbitals were built outside the workflow
     # (rhf2uhf / rhf2bsuhf); it is loaded as-is (no SCF). RHF keeps the spatial-orbital path.
-    if unrestricted:
+    if _skip_loader:
+        elec_props = closed_loop.elec_props_from_raw(closed_loop.read_raw(_state_from))
+    elif unrestricted:
         elec_props = compute_molecular_integrals_from_uhf_fcidump(
             fcidump_file=parameters.fcidump,
         )
@@ -305,7 +317,6 @@ def riken_sqd_de(
     # sbd/closed_loop.py). Unset SBD_STATE_FROM / SBD_STATE_SAVE_DIR -> nothing changes.
     _rotation = closed_loop.CumulativeRotation(elec_props.num_orbitals)
     _start_trial = 0
-    _state_from = closed_loop.state_from_env()
     _state_dir = closed_loop.state_save_dir()
     _cl_active = bool(_state_from or _state_dir)
     _state_carry = None

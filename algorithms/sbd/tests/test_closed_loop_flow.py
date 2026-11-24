@@ -10,6 +10,9 @@ what is tested:
   * The restored run continues the "OO effect" bookkeeping (the previous OO prediction) and logs
     [cl-trial] / [cl-rot] / [state] lines with the right trial numbers.
   * Without the two variables nothing is written.
+  * A state that records the FCIDUMP's sha1 skips the FCIDUMP loader (and its CCSD) and ends in the
+    same states as a run that loads it; a state without the sha1 loads it; a different FCIDUMP stops
+    the job.
 """
 
 from __future__ import annotations
@@ -73,15 +76,21 @@ def flow(monkeypatch):
     monkeypatch.setattr(main.SBDSolverJob, "load",
                         classmethod(lambda cls, name: SimpleNamespace(method="rhf", do_rdm=1,
                                                                        solver_mode="gpu")))
-    monkeypatch.setattr(main, "compute_molecular_integrals_from_fcidump",
-                        lambda fcidump_file: _ep())
+    calls = []
+
+    def loader(fcidump_file):
+        calls.append(fcidump_file)
+        return _ep()
+
+    monkeypatch.setattr(main, "compute_molecular_integrals_from_fcidump", loader)
     monkeypatch.setattr(main, "differential_evolution_trial", _fake_trial)
     monkeypatch.setattr(main, "optimize_orbitals_rhf", _fake_oo)
-    for k in ("OO_CHECK", "OO_TRUST", "OO_MAXITER", "OO_GRAD_TOL", "SBD_STATE_KEEP_EVERY"):
+    for k in ("OO_CHECK", "OO_TRUST", "OO_MAXITER", "OO_GRAD_TOL", "SBD_STATE_KEEP_EVERY",
+              "SBD_STATE_SKIP_LOADER"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("OO_SKIP_NONBEST", "0")
 
-    def run(iterations, state_from=None, save_dir=None):
+    def run(iterations, state_from=None, save_dir=None, fcidump="unused"):
         if state_from:
             monkeypatch.setenv("SBD_STATE_FROM", str(state_from))
         else:
@@ -90,19 +99,22 @@ def flow(monkeypatch):
             monkeypatch.setenv("SBD_STATE_SAVE_DIR", str(save_dir))
         else:
             monkeypatch.delenv("SBD_STATE_SAVE_DIR", raising=False)
-        p = FlowParameters(fcidump="unused", solver_block_ref="sbd_solver_job/x", oo_method="rhf",
+        p = FlowParameters(fcidump=fcidump, solver_block_ref="sbd_solver_job/x", oo_method="rhf",
                            oo_refire_every_trial=True,
                            de_params=DEParameters(num_walkers=1, iterations=iterations))
         return main.riken_sqd_de.fn(p)
 
+    run.calls = calls
     return run
 
 
-def _state0(path):
+def _state0(path, fcidump_sha1=None):
     ep = _ep()
     st = main.OptimizerState.from_parameters(num_walkers=1, norb=N, n_aa_params=N - 1,
                                              n_ab_params=1, n_reps=2)
-    closed_loop.write_raw(str(path), closed_loop.state_to_raw(0, ep, st, closed_loop.CumulativeRotation(N)))
+    meta = {"fcidump_sha1": fcidump_sha1} if fcidump_sha1 else None
+    closed_loop.write_raw(str(path), closed_loop.state_to_raw(0, ep, st, closed_loop.CumulativeRotation(N),
+                                                              meta=meta))
     return path
 
 
@@ -139,3 +151,44 @@ def test_off_without_variables(tmp_path, flow, monkeypatch):
     monkeypatch.chdir(tmp_path)
     flow(2)
     assert not list(tmp_path.rglob("state_t*.npz"))
+
+
+def _fcidump(tmp_path, text="fake FCIDUMP\n"):
+    f = tmp_path / "fcidump.txt"
+    f.write_text(text)
+    return f
+
+
+def test_loader_skipped_when_sha1_matches(tmp_path, flow, monkeypatch, caplog):
+    fd = _fcidump(tmp_path)
+    s0 = _state0(tmp_path / "state_t000.npz", closed_loop.file_sha1(str(fd)))
+    caplog.set_level(logging.INFO, logger="test_closed_loop_flow")
+    flow(3, s0, tmp_path / "skip", fcidump=str(fd))
+    assert flow.calls == []
+    assert any(r.getMessage().startswith("[state] skipping the FCIDUMP loader") for r in caplog.records)
+    # chained: each job restores the previous job's file (the meta, with the sha1, is carried along)
+    e_chain = flow(4, tmp_path / "skip" / "state_t003.npz", tmp_path / "skip", fcidump=str(fd))
+    assert flow.calls == []
+    monkeypatch.setenv("SBD_STATE_SKIP_LOADER", "0")
+    e_load = flow(4, s0, tmp_path / "load", fcidump=str(fd))
+    assert flow.calls == [str(fd)]
+    assert e_chain == e_load
+    for i in (1, 2, 3, 4):
+        _same(tmp_path / "skip" / f"state_t{i:03d}.npz", tmp_path / "load" / f"state_t{i:03d}.npz")
+
+
+def test_loader_runs_without_sha1(tmp_path, flow, caplog):
+    s0 = _state0(tmp_path / "state_t000.npz")
+    caplog.set_level(logging.INFO, logger="test_closed_loop_flow")
+    flow(1, s0, tmp_path / "out")
+    assert flow.calls == ["unused"]
+    assert any(r.getMessage().startswith("[state] running the FCIDUMP loader") for r in caplog.records)
+
+
+def test_other_fcidump_stops(tmp_path, flow):
+    fd = _fcidump(tmp_path)
+    s0 = _state0(tmp_path / "state_t000.npz", closed_loop.file_sha1(str(fd)))
+    fd.write_text("another system\n")
+    with pytest.raises(ValueError, match="sha1"):
+        flow(1, s0, tmp_path / "out", fcidump=str(fd))
+    assert flow.calls == []
