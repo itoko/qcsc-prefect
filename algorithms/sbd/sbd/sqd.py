@@ -269,6 +269,22 @@ def _excitation_summary(ci_strings: np.ndarray, num_elec: int) -> str:
     )
 
 
+def _saved_pool_path(saved_paths: list[str], walker_index: int, trial_index: int) -> str:
+    """The saved pool a quantum_source='saved' trial reads.
+
+    Default: one pool per walker when given, else the first one shared by all walkers.
+    ``SBD_SAVED_PER_TRIAL`` (opt-in, e.g. ``file:///.../pool_batch10M.batch{trial:02d}.npz``): a
+    format string with ``{trial}``; trial i reads its own pool (the Batch-100K control of the
+    closed-loop study: trial i uses device job i of the initial pool).
+    """
+    per_trial = os.environ.get("SBD_SAVED_PER_TRIAL", "").strip()
+    if per_trial:
+        if "{trial" not in per_trial:
+            raise ValueError(f"SBD_SAVED_PER_TRIAL={per_trial!r} has no {{trial}} field")
+        return per_trial.format(trial=trial_index)
+    return saved_paths[walker_index] if walker_index < len(saved_paths) else saved_paths[0]
+
+
 @task(
     task_run_name="run_sqd_#{trial_index:02d}-{walker_index}",
 )
@@ -522,7 +538,10 @@ def walker_sqd(
         # walkers vary only the LUCJ parameters, so diagonalizing every walker from the shared pool
         # is correct (and required for num_walkers > 1 with a single persisted pool, e.g. the
         # orbital-optimization DE runs).
-        pool_path = saved_paths[walker_index] if walker_index < len(saved_paths) else saved_paths[0]
+        pool_path = _saved_pool_path(saved_paths, walker_index, trial_index)
+        if os.environ.get("SBD_SAVED_PER_TRIAL", "").strip():
+            logger.info("[saved] per-trial pool (SBD_SAVED_PER_TRIAL) for trial %d: %s",
+                        trial_index, pool_path)
         logger.info("Loading saved sample pool for walker %d: %s", walker_index, pool_path)
         packed = load_ndarray(pool_path, "packed_bits")
         num_bits = int(load_ndarray(pool_path, "num_bits")[0])
