@@ -692,8 +692,12 @@ def _rule_count(cfg, score_absent, s_max, n_list):
 
 
 def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryover_b, elec_props,
-                num_elec_a: int, num_elec_b: int, logger=None):
-    """Return the (alpha, beta) lists after the opt-in Plan F injection (unchanged when off)."""
+                num_elec_a: int, num_elec_b: int, logger=None, protect=None):
+    """Return the (alpha, beta) lists after the opt-in Plan F injection (unchanged when off).
+
+    ``protect`` (Plan Q; default None = unchanged): per-spin strings that the tail replacement must
+    not drop, i.e. those Plan E (SBD_INJECT_FILE) just added at the tail of the same list. They are
+    moved to just after the HF string and are not counted as sampled."""
     cfg = fock_inject_config()
     if cfg is None:
         return ci_a, ci_b
@@ -717,6 +721,11 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
                 logger.info("[fock-inject] trial %d step %d spin %s: no carryover core; nothing injected",
                             trial, step, "ab"[k])
             continue
+        n_prot = 0
+        if protect is not None and len(protect[k]):
+            keep = np.isin(cur[1:], np.asarray(protect[k], dtype=np.int64))
+            n_prot = int(keep.sum())
+            cur = np.concatenate([cur[:1], cur[1:][keep], cur[1:][~keep]])
         h1, g_same, other_j = _spin_integrals(elec_props, k, nel[1 - k])
         ch, s, w = score_candidates(core, make_fock_of(h1, g_same, other_j), norb)
         if cfg["score"] == "hci":
@@ -730,7 +739,7 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
         n_rule = _rule_count(cfg, s_abs, s_max, len(cur))
         n_present = int((s[present] >= cfg["value"] * s_max).sum()) if cfg["rule"] == "eps" else int(present.sum())
         n_co = int(np.isin(cur[1:], carry[k][carry[k] != hf]).sum())
-        n_sampled = len(cur) - 1 - n_co
+        n_sampled = len(cur) - 1 - n_co - n_prot
         cap = max(min(int(cfg["fmax"] * n_sampled), len(cur) // 2 - 1), 0)
         n_add = min(n_rule, cap, len(absent_idx))
         order = absent_idx[np.argsort(-s_abs, kind="stable")]
@@ -753,3 +762,119 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
                 float(exc_level(ch[chosen], nel[k]).mean()) if n_add else 0.0,
                 len(lists[k]), time.time() - t0)
     return lists[0].astype(np.longlong), lists[1].astype(np.longlong)
+
+
+# ── Plan Q (c): where each subspace string came from ─────────────────────────
+#
+# SBD_DUMP_ORIGIN=1 (off by default): for batch 0 of every recovery step, classify each alpha / beta
+# string of the subspace that is diagonalized, and log one line per spin:
+#   [origin] trial T step S spin a: total=... hf=1 carryover=... sample=... recovered=... seed=...
+#            inject_e=... inject_f=... other=...
+# "sample" = the string is in the raw pool with the right electron count (before recovery);
+# "recovered" = it only appears after configuration recovery; "carryover" = forced from the previous
+# step's carryover; "seed" = CISD seed; inject_e / inject_f = added by Plan E (SBD_INJECT_FILE) /
+# Plan F (SBD_FOCK_INJECT_*). Membership is tested in that priority (hf, injections, carryover,
+# sample, recovered, seed).
+# A registry (origin_first.npz in SBD_ORIGIN_DIR, default FE4S4_CKPT_DIR) keeps the FIRST origin of
+# every string ever diagonalized; after the solve the carryover is looked up in it:
+#   [origin-co] trial T step S spin a: n=... first: sample=... recovered=... inject_f=... pre=...
+# ("pre" = entered before this run started, e.g. from a branch / state restore).
+# SBD_DUMP_ORIGIN_TRIALS (spec as SBD_DUMP_RDM_TRIALS) also writes origin_tTTT_rS.npz with the
+# lists, their codes, the carryover and its first-origin codes.
+
+ORIGIN_NAMES = ("hf", "carryover", "sample", "recovered", "seed", "inject_e", "inject_f", "other", "pre")
+_OC = {n: i for i, n in enumerate(ORIGIN_NAMES)}
+
+
+def origin_enabled() -> bool:
+    return os.environ.get("SBD_DUMP_ORIGIN", "").strip() == "1"
+
+
+def _origin_dir() -> str:
+    return (os.environ.get("SBD_ORIGIN_DIR", "").strip()
+            or os.environ.get("FE4S4_CKPT_DIR", "").strip() or ".")
+
+
+def classify_origin(strings, *, num_elec: int, inject_e=(), inject_f=(), carryover=(), sample=(),
+                    recovered=(), seed=()) -> np.ndarray:
+    """Origin code (index into ORIGIN_NAMES) of each string, in the priority order above."""
+    s = np.asarray(strings, dtype=np.int64)
+    code = np.full(s.shape, _OC["other"], dtype=np.int8)
+    for name, members in (("seed", seed), ("recovered", recovered), ("sample", sample),
+                          ("carryover", carryover), ("inject_f", inject_f), ("inject_e", inject_e)):
+        m = np.asarray(members, dtype=np.int64)
+        if m.size:
+            code[np.isin(s, m)] = _OC[name]
+    code[s == (1 << num_elec) - 1] = _OC["hf"]
+    return code
+
+
+def origin_counts(code: np.ndarray, names=ORIGIN_NAMES[:-1]) -> str:
+    c = np.bincount(np.asarray(code, dtype=np.int64), minlength=len(ORIGIN_NAMES))
+    return f"total={int(c.sum())} " + " ".join(f"{n}={int(c[_OC[n]])}" for n in names)
+
+
+def _registry_path(walker: int) -> str:
+    return os.path.join(_origin_dir(), f"origin_first_w{walker}.npz")
+
+
+def update_origin_registry(walker: int, trial: int, lists, codes) -> list:
+    """Add strings not yet in the registry with their current code; return the registry per spin
+    as (keys, codes) sorted by key."""
+    path = _registry_path(walker)
+    reg = []
+    old = dict(np.load(path)) if os.path.exists(path) else {}
+    out = {}
+    for k in range(2):
+        keys = old.get(f"keys_{'ab'[k]}", np.empty(0, dtype=np.int64))
+        cds = old.get(f"code_{'ab'[k]}", np.empty(0, dtype=np.int8))
+        trs = old.get(f"trial_{'ab'[k]}", np.empty(0, dtype=np.int64))
+        s = np.asarray(lists[k], dtype=np.int64)
+        new = ~np.isin(s, keys)
+        keys = np.concatenate([keys, s[new]])
+        cds = np.concatenate([cds, np.asarray(codes[k], dtype=np.int8)[new]])
+        trs = np.concatenate([trs, np.full(int(new.sum()), trial, dtype=np.int64)])
+        order = np.argsort(keys, kind="stable")
+        keys, cds, trs = keys[order], cds[order], trs[order]
+        out.update({f"keys_{'ab'[k]}": keys, f"code_{'ab'[k]}": cds, f"trial_{'ab'[k]}": trs})
+        reg.append((keys, cds))
+    os.makedirs(_origin_dir(), exist_ok=True)
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, **out)
+    os.replace(tmp, path)
+    return reg
+
+
+def first_origin(strings, registry) -> np.ndarray:
+    """First-origin codes of ``strings`` from one spin's (keys, codes); "pre" if never seen."""
+    keys, cds = registry
+    s = np.asarray(strings, dtype=np.int64)
+    code = np.full(s.shape, _OC["pre"], dtype=np.int8)
+    if keys.size and s.size:
+        pos = np.clip(np.searchsorted(keys, s), 0, keys.size - 1)
+        hit = keys[pos] == s
+        code[hit] = cds[pos[hit]]
+    return code
+
+
+def origin_dump_enabled(trial: int) -> bool:
+    if not origin_enabled():
+        return False
+    spec = os.environ.get("SBD_DUMP_ORIGIN_TRIALS", "").strip()
+    if not spec:
+        return False
+    trials = parse_trials(spec)
+    return trials is None or trial in trials
+
+
+def dump_origin(trial: int, step: int, walker: int, lists, codes, carry, carry_first, logger=None) -> str:
+    path = os.path.join(_origin_dir(), f"origin_t{trial:03d}_r{step}_w{walker}.npz")
+    os.makedirs(_origin_dir(), exist_ok=True)
+    np.savez(path, ci_a=np.asarray(lists[0], dtype=np.int64), ci_b=np.asarray(lists[1], dtype=np.int64),
+             code_a=codes[0], code_b=codes[1],
+             carry_a=np.asarray(carry[0], dtype=np.int64), carry_b=np.asarray(carry[1], dtype=np.int64),
+             carry_first_a=carry_first[0], carry_first_b=carry_first[1],
+             names=np.asarray(ORIGIN_NAMES))
+    if logger is not None:
+        logger.info("[origin] trial %d step %d: wrote %s", trial, step, path)
+    return path

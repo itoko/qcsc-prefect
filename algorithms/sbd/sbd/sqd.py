@@ -33,6 +33,7 @@ from .np_type_extension import (
 from .solver_job import SBDResult, SBDSolverJob
 from .staircase_probe import dump_recovery_step, fock_inject, freeze_subspace, modify_subspace
 from .staircase_probe import walker_seed as staircase_walker_seed
+from . import staircase_probe as _probe
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
@@ -570,6 +571,15 @@ def walker_sqd(
     raw_bitstrings, raw_probs = bit_array_to_arrays(bit_array)
     norb = elec_props.num_orbitals
     num_elec_a, num_elec_b = elec_props.num_electrons
+    # Plan Q (SBD_DUMP_ORIGIN=1; off by default): per-spin strings of the raw pool that already have
+    # the right electron count before configuration recovery ("sample" origin).
+    _raw_ints = None
+    if _probe.origin_enabled():
+        _ra, _rb = _spin_halves_as_ints(raw_bitstrings, norb)
+        _raw_ints = tuple(
+            u[np.array([bin(int(v)).count("1") for v in u], dtype=np.int64) == ne]
+            for u, ne in ((np.unique(_ra), num_elec_a), (np.unique(_rb), num_elec_b))
+        )
 
     # SQD self-consistency configuration-recovery loop.
     #
@@ -794,12 +804,36 @@ def walker_sqd(
                 ci_a, ci_b = freeze_subspace(
                     trial_index, f"r{recovery_step}_b{batch}", ci_a, ci_b, logger=logger
                 )
+                _ci_drawn = (ci_a, ci_b)
                 # Plan E (SBD_INJECT_FILE / SBD_EXCLUDE_EXC; off by default): inject or drop strings.
                 ci_a, ci_b = modify_subspace(trial_index, ci_a, ci_b, num_elec_a, num_elec_b, logger=logger)
+                _ci_e = (ci_a, ci_b)
+                # Strings Plan E just added (Plan Q B arms) are kept by Plan F's tail replacement below.
+                _inj_e = tuple(np.setdiff1d(_ci_e[k], _ci_drawn[k]) for k in range(2))
                 # Plan F (SBD_FOCK_INJECT_*; off by default): replace the sampled tail with strings
                 # coupled to this step's carryover by H (Fock singles / HCI doubles), current basis.
                 ci_a, ci_b = fock_inject(trial_index, recovery_step, ci_a, ci_b, carryover_a, carryover_b,
-                                         elec_props, num_elec_a, num_elec_b, logger=logger)
+                                         elec_props, num_elec_a, num_elec_b, logger=logger,
+                                         protect=_inj_e if (len(_inj_e[0]) or len(_inj_e[1])) else None)
+                if batch == 0 and _probe.origin_enabled():
+                    # Plan Q (SBD_DUMP_ORIGIN=1; off by default): where each string came from.
+                    _origin_lists = (ci_a, ci_b)
+                    _origin_codes = []
+                    _post_ints = _spin_halves_as_ints(bitstrings_post, norb)
+                    for _k, _ne in enumerate((num_elec_a, num_elec_b)):
+                        _raw = _raw_ints[_k]
+                        _origin_codes.append(_probe.classify_origin(
+                            _origin_lists[_k], num_elec=_ne,
+                            inject_e=_inj_e[_k],
+                            inject_f=np.setdiff1d(_origin_lists[_k], _ci_e[_k]),
+                            carryover=_probe.carry_ints((carryover_a, carryover_b)[_k], norb, _ne),
+                            sample=_raw, recovered=_post_ints[_k],
+                            seed=_cisd_strings(norb, _ne, seed_cisd) if seed_cisd else (),
+                        ))
+                        logger.info("[origin] trial %d step %d spin %s: %s", trial_index, recovery_step + 1,
+                                    "ab"[_k], _probe.origin_counts(_origin_codes[_k]))
+                    _origin_registry = _probe.update_origin_registry(
+                        walker_index, trial_index, _origin_lists, _origin_codes)
                 if batch == 0:
                     # [diag] excitation profile of batch 0 (make-or-break: a subspace dominated by
                     # >2 excitations cannot couple to HF and the energy stays at SCF).
@@ -824,6 +858,22 @@ def walker_sqd(
                     carryover_b=sbd_result.carryover_bitstrings_b,
                     norb=norb,
                 )
+                if batch == 0 and _probe.origin_enabled():
+                    try:
+                        _co_ints = (
+                            _probe.carry_ints(sbd_result.carryover_bitstrings, norb, num_elec_a),
+                            _probe.carry_ints(sbd_result.carryover_bitstrings_b, norb, num_elec_b),
+                        )
+                        _co_first = [_probe.first_origin(_co_ints[_k], _origin_registry[_k]) for _k in range(2)]
+                        for _k in range(2):
+                            logger.info("[origin-co] trial %d step %d spin %s: n=%d first: %s",
+                                        trial_index, recovery_step + 1, "ab"[_k], len(_co_ints[_k]),
+                                        _probe.origin_counts(_co_first[_k], _probe.ORIGIN_NAMES))
+                        if _probe.origin_dump_enabled(trial_index):
+                            _probe.dump_origin(trial_index, recovery_step + 1, walker_index, _origin_lists,
+                                               _origin_codes, _co_ints, _co_first, logger=logger)
+                    except Exception:
+                        logger.exception("[origin] carryover lookup failed (continuing).")
                 this_net_dim = int(len(ci_a) * len(ci_b))
                 this_save_kwargs = dict(alphadets=ci_a, betadets=ci_b)
             else:

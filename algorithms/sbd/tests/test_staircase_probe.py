@@ -23,7 +23,8 @@ ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD
        "SBD_DUMP_RECOVERY_STEPS", "SBD_INJECT_FILE", "SBD_INJECT_TRIALS", "SBD_INJECT_N", "SBD_EXCLUDE_EXC",
        "SBD_DUMP_ROT_DIR", "SEED", "SBD_FOCK_INJECT_EPS", "SBD_FOCK_INJECT_N", "SBD_FOCK_INJECT_FRAC",
        "SBD_FOCK_INJECT_FMAX", "SBD_FOCK_INJECT_SCORE", "SBD_FOCK_INJECT_MODE", "SBD_FOCK_INJECT_NCORE",
-       "SBD_FOCK_INJECT_NCORE_D", "SBD_FOCK_INJECT_TRIALS", "SBD_FOCK_INJECT_STEPS")
+       "SBD_FOCK_INJECT_NCORE_D", "SBD_FOCK_INJECT_TRIALS", "SBD_FOCK_INJECT_STEPS",
+       "SBD_DUMP_ORIGIN", "SBD_DUMP_ORIGIN_TRIALS", "SBD_ORIGIN_DIR")
 
 
 @pytest.fixture(autouse=True)
@@ -479,3 +480,56 @@ def test_fock_inject_n_frac_decoy_hci(ham, monkeypatch):
     singles = {par & ~(1 << i) | (1 << a) for par in core.tolist() for i in range(NORB_F) for a in range(NORB_F)
                if (par >> i) & 1 and not (par >> a) & 1}
     assert len(added) == 15 and added - singles                                     # some same-spin doubles
+
+
+# ── Plan Q: protected Plan E strings, origin of the subspace strings ─────────
+
+def test_fock_inject_keeps_protected_strings(ham, monkeypatch):
+    (la, ca), (lb, cb) = _inject_case(ham, np.random.default_rng(6))
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "6")
+    base_a, base_b = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F)
+    # protect=None is the old behaviour; an empty protect list too
+    np.testing.assert_array_equal(base_a, sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F, protect=None)[0])
+    prot = (la[-3:], lb[-2:])                       # what Plan E would just have put at the tail
+    fa, fb = sp.fock_inject(5, 0, la, lb, ca, cb, ham, NA_F, NB_F, protect=prot)
+    for cur, new, pr in ((la, fa, prot[0]), (lb, fb, prot[1])):
+        assert len(new) == len(cur) and len(set(new.tolist())) == len(new)
+        assert set(pr.tolist()) <= set(new.tolist())                       # Plan E strings survive
+        assert set(cur[:13].tolist()) <= set(new.tolist())                 # HF + carryover kept
+        assert new[0] == cur[0]
+        assert len(set(new.tolist()) - set(cur.tolist())) == 6
+
+
+def test_classify_origin_priority_and_counts():
+    ne = 3
+    hf = 0b0111
+    strings = np.array([hf, 0b1011, 0b1101, 0b1110, 0b10011, 0b10101, 0b11001, 0b100011], dtype=np.int64)
+    code = sp.classify_origin(strings, num_elec=ne, inject_e=[0b100011], inject_f=[0b11001],
+                              carryover=[0b1011, hf], sample=[0b1101, 0b1011], recovered=[0b1110, 0b1101],
+                              seed=[0b10011])
+    names = [sp.ORIGIN_NAMES[c] for c in code]
+    assert names == ["hf", "carryover", "sample", "recovered", "seed", "other", "inject_f", "inject_e"]
+    txt = sp.origin_counts(code)
+    assert txt.startswith("total=8 ") and "carryover=1" in txt and "pre=" not in txt
+    c = np.bincount(code, minlength=len(sp.ORIGIN_NAMES))
+    assert c.sum() == len(strings)
+
+
+def test_origin_registry_keeps_first_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("SBD_ORIGIN_DIR", str(tmp_path))
+    oc = {n: i for i, n in enumerate(sp.ORIGIN_NAMES)}
+    reg = sp.update_origin_registry(0, 0, (np.array([7, 11]), np.array([3])),
+                                    (np.array([oc["hf"], oc["sample"]]), np.array([oc["hf"]])))
+    # trial 1: 11 is now carryover (keeps "sample"), 13 is new (recovered)
+    reg = sp.update_origin_registry(0, 1, (np.array([7, 11, 13]), np.array([3, 5])),
+                                    (np.array([oc["hf"], oc["carryover"], oc["recovered"]]),
+                                     np.array([oc["hf"], oc["inject_f"]])))
+    fa = sp.first_origin(np.array([13, 11, 99]), reg[0])
+    assert [sp.ORIGIN_NAMES[c] for c in fa] == ["recovered", "sample", "pre"]
+    assert sp.ORIGIN_NAMES[sp.first_origin(np.array([5]), reg[1])[0]] == "inject_f"
+    z = np.load(tmp_path / "origin_first_w0.npz")
+    assert z["trial_a"][list(z["keys_a"]).index(13)] == 1
+    monkeypatch.setenv("SBD_DUMP_ORIGIN", "1")
+    assert not sp.origin_dump_enabled(1)
+    monkeypatch.setenv("SBD_DUMP_ORIGIN_TRIALS", "1,5")
+    assert sp.origin_dump_enabled(1) and not sp.origin_dump_enabled(2)
