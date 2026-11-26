@@ -31,6 +31,8 @@ from .np_type_extension import (
     NpStrict2DArrayBool,
 )
 from .solver_job import SBDResult, SBDSolverJob
+from .staircase_probe import dump_recovery_step, fock_inject, freeze_subspace, modify_subspace
+from .staircase_probe import walker_seed as staircase_walker_seed
 from .prefect_qiskit_patch import apply_twirling_patch
 from .transpile_custom import (
     find_optimal_layout,
@@ -621,10 +623,11 @@ def walker_sqd(
     # under the threaded (concurrent) task runner. Derive a deterministic, per-(trial, walker)
     # seed -- reusing the same Cantor-pairing offset as the random-source path above -- so runs stay
     # reproducible while every walker is independent.
-    walker_seed = int(
-        random_seed
-        + ((trial_index + walker_index) * (trial_index + walker_index + 1) // 2 + walker_index)
-    )
+    # (staircase study: SBD_TRIAL0_SEED, off by default, swaps the seed of trial 0 only)
+    walker_seed = staircase_walker_seed(random_seed, trial_index, walker_index)
+    if trial_index == 0 and os.environ.get("SBD_TRIAL0_SEED", "").strip():
+        logger.info("[trial0-seed] trial 0 subsampling seed from SBD_TRIAL0_SEED=%s (run seed %d)",
+                    os.environ["SBD_TRIAL0_SEED"], random_seed)
     walker_rng = np.random.default_rng(seed=walker_seed)
 
     best_energy: float | None = None
@@ -786,6 +789,17 @@ def walker_sqd(
                     recomb_boost=recomb_boost,
                     recomb_max_parents=recomb_max_parents,
                 )
+                # Staircase study D4 (SBD_FREEZE_SUBSPACE_AT; off by default): from that trial on,
+                # diagonalize the determinant lists drawn at that trial instead of the new draw.
+                ci_a, ci_b = freeze_subspace(
+                    trial_index, f"r{recovery_step}_b{batch}", ci_a, ci_b, logger=logger
+                )
+                # Plan E (SBD_INJECT_FILE / SBD_EXCLUDE_EXC; off by default): inject or drop strings.
+                ci_a, ci_b = modify_subspace(trial_index, ci_a, ci_b, num_elec_a, num_elec_b, logger=logger)
+                # Plan F (SBD_FOCK_INJECT_*; off by default): replace the sampled tail with strings
+                # coupled to this step's carryover by H (Fock singles / HCI doubles), current basis.
+                ci_a, ci_b = fock_inject(trial_index, recovery_step, ci_a, ci_b, carryover_a, carryover_b,
+                                         elec_props, num_elec_a, num_elec_b, logger=logger)
                 if batch == 0:
                     # [diag] excitation profile of batch 0 (make-or-break: a subspace dominated by
                     # >2 excitations cannot couple to HF and the energy stays at SCF).
@@ -1074,6 +1088,16 @@ def walker_sqd(
 
         # Feed the batch-averaged occupancies into the next recovery pass (self-consistency).
         avg_occ = (step_occ_a, step_occ_b)
+
+        # Plan D PD5 (SBD_DUMP_RECOVERY_STEPS; off by default): dump this step's RDMs / subspace.
+        try:
+            dump_recovery_step(
+                trial_index, recovery_step + 1, step_sbd_result, energy_total=energy,
+                occ_a=step_occ_a, occ_b=step_occ_b, ab_overlap=elec_props.ab_overlap,
+                logger=logger,
+            )
+        except Exception:  # a diagnostic dump must never stop the run
+            logger.exception("[dump] recovery %d: dump failed (continuing)", recovery_step + 1)
 
         # Persist checkpoint AFTER updating avg_occ so a resume re-enters at the NEXT step with the
         # occupancies this step produced. Atomic (tmp + replace) so a kill mid-write can't corrupt

@@ -29,6 +29,7 @@ from qcsc_workflow_utility.orbital_opt import (
 from . import closed_loop
 from .data_io import extend_table_artifact
 from .flow_params import FlowParameters
+from . import staircase_probe
 from .lucj import initialize_ucj_parameters
 from .np_type_extension import NpStrict2DArrayBool
 from .solver_job import SBDSolverJob
@@ -353,10 +354,37 @@ def riken_sqd_de(
             logger.exception("[state] saving the state before trial %d failed.", trial)
             raise
 
+    # Staircase study (PLAN_staircase_mechanism.md): the opt-in RDM dump (SBD_DUMP_RDM_DIR) reads
+    # the cumulative rotation from the input orbitals. Same object as the closed-loop one above, so
+    # a restored state (SBD_STATE_FROM) keeps its rotation in the dump too.
+    _rot_tracker = _rotation
+
+    # Opt-in branch restart (SBD_BRANCH_FROM): continue from the state saved before trial T by an
+    # earlier run (SBD_BRANCH_SAVE_AT). The integrals and t2 seed in the file replace the ones
+    # just built, so the restarted run sees exactly the original run's state at T.
+    # (_start_trial is 0 here unless SBD_STATE_FROM restored a state above; the two are exclusive.)
+    _branch_from = os.environ.get("SBD_BRANCH_FROM", "").strip()
+    if _branch_from:
+        if _state_from:
+            raise ValueError("SBD_BRANCH_FROM cannot be combined with SBD_STATE_FROM.")
+        _start_trial, elec_props, state, _branch_rot = staircase_probe.load_branch(
+            _branch_from, elec_props, OptimizerState, elec_props.num_orbitals
+        )
+        _rotation.c_a, _rotation.c_b = _branch_rot.c_a, _branch_rot.c_b
+        logger.info("[branch] restored state before trial %d from %s (best=%s)",
+                    _start_trial, _branch_from, state.best_energy())
+    _branch_save = staircase_probe.branch_save_trials()
+    _h2_prev = None  # (alphadets, betadets, E) of the previous trial, for SBD_H2_PROBE
+
     # Start differential evoluation
     for i in range(_start_trial, parameters.de_params.iterations):
         if i > _start_trial:
             _save_state(i)
+        if i in _branch_save:
+            try:
+                staircase_probe.save_branch(i, elec_props, state, _rot_tracker, logger=logger)
+            except Exception:
+                logger.exception("Trial %d: branch save failed (continuing).", i)
         logger.info(f"Running differential evolution trial {i}")
 
         state, best_sbd_result = differential_evolution_trial(
@@ -380,6 +408,44 @@ def riken_sqd_de(
                 if best_sbd_result is not None and best_sbd_result.energy is not None else "nan",
                 f"{state.best_energy():.10f}" if state.best_energy() is not None else "nan",
             )
+
+        # H2 probe (SBD_H2_PROBE=1; off by default): diagonalize the PREVIOUS trial's determinant
+        # lists with THIS trial's integrals, so the energy change splits exactly into an orbital
+        # part (S_{t-1}: h_{t-1} -> h_t) and a subspace part (h_t: S_{t-1} -> S_t). Diagnostic
+        # only: the result never feeds back into the run.
+        if staircase_probe.h2_probe_enabled() and best_sbd_result is not None:
+            if _h2_prev is not None:
+                try:
+                    import asyncio as _asyncio
+                    _pa, _pb, _pe_prev = _h2_prev
+                    _probe = _asyncio.run(solver.run(
+                        ci_strings=(_pa, _pb),
+                        one_body_tensor=elec_props.one_body_tensor,
+                        two_body_tensor=elec_props.two_body_tensor,
+                        norb=elec_props.num_orbitals,
+                        nelec=elec_props.num_electrons,
+                        one_body_tensor_b=elec_props.one_body_tensor_b,
+                        two_body_tensor_ab=elec_props.two_body_tensor_ab,
+                        two_body_tensor_bb=elec_props.two_body_tensor_bb,
+                    ))
+                    _nuc_p = float(elec_props.nuclear_repulsion_energy)
+                    _e_ss = float(_probe.energy)               # E(S_{t-1}, h_t)
+                    _e_now = float(best_sbd_result.energy)     # E(S_t, h_t)
+                    logger.info(
+                        "Trial %d: [h2-probe] E(S_t-1,h_t-1)=%.10f E(S_t-1,h_t)=%.10f E(S_t,h_t)=%.10f "
+                        "(total)  orbital part=%+.4f mHa  subspace part=%+.4f mHa  total dE=%+.4f mHa",
+                        i, _pe_prev + _nuc_p, _e_ss + _nuc_p, _e_now + _nuc_p,
+                        (_e_ss - _pe_prev) * 1e3, (_e_now - _e_ss) * 1e3, (_e_now - _pe_prev) * 1e3,
+                    )
+                    staircase_probe.dump_prev_subspace(i, _probe, logger=logger)
+                except Exception:
+                    logger.exception("Trial %d: H2 probe failed (continuing).", i)
+            _h2_prev = (
+                np.asarray(best_sbd_result.alphadets),
+                np.asarray(best_sbd_result.betadets if best_sbd_result.betadets is not None
+                           else best_sbd_result.alphadets),
+                float(best_sbd_result.energy),
+            ) if getattr(best_sbd_result, "alphadets", None) is not None else None
 
         # ── OO effect tracking: compare previous OO prediction with this trial's actual energy ──
         # Also detect OO saturation: when Davidson improvement is small but the prediction gap
@@ -409,6 +475,29 @@ def riken_sqd_de(
 
 
             _oo_prediction = None
+
+        # Opt-in dump of this trial's RDMs in the current basis (before this trial's OO). Written
+        # here so trials that skip OO are dumped too; the OO branch below adds Ua/Ub when it runs.
+        _dump_pending = (
+            best_sbd_result is not None and staircase_probe.dump_enabled(i)
+        )
+
+        def _dump(ua=None, ub=None, e_oo=None):
+            try:
+                staircase_probe.dump_trial(
+                    i, best_sbd_result, _rot_tracker,
+                    e_davidson_total=(
+                        float(best_sbd_result.energy) + float(elec_props.nuclear_repulsion_energy)
+                        if best_sbd_result.energy is not None else None
+                    ),
+                    ua=ua, ub=ub, e_oo=e_oo, ab_overlap=elec_props.ab_overlap, logger=logger,
+                )
+            except Exception:
+                logger.exception("Trial %d: RDM dump failed (continuing).", i)
+
+        # SBD_FREEZE_ORBITALS_AT (off by default): OO is still solved on this trial's RDMs, so the
+        # log records how much OO *could* gain from the new subspace, but the rotation is discarded.
+        _oo_probe_only = staircase_probe.orbitals_frozen(i)
 
         # ── Orbital optimization (between DE trials) ────────────────────────────
         # Rotate the Hamiltonian integrals using the best walker's RDMs so the next trial starts
@@ -449,6 +538,8 @@ def riken_sqd_de(
                         _best_e if _best_e is not None else float("nan"),
                         _consecutive_oo_skips, _stagnation_n,
                     )
+                if _dump_pending:
+                    _dump()
                 continue  # skip to next trial
 
             rdm1_aa = best_sbd_result.rdm1
@@ -597,6 +688,10 @@ def riken_sqd_de(
                     float(os.environ["OO_GRAD_TOL"]) if "OO_GRAD_TOL" in os.environ
                     else getattr(parameters, "oo_grad_tol", 1e-5)
                 )
+                # D6 (SBD_EARLY_OO_*; off by default): other OO settings for the first trials.
+                _early_oo = staircase_probe.early_oo_overrides(i)
+                if _early_oo:
+                    logger.info("Trial %d: [early-oo] OO settings overridden: %s", i, _early_oo)
                 try:
                     _oo_kwargs = dict(
                         # The native solver (main.cc) and solver_job.py both write the 2-RDM in
@@ -620,6 +715,7 @@ def riken_sqd_de(
                         gtol=oo_gtol,
                         davidson_ref_energy=float(_rdm_e) if _rdm_e is not None else None,
                     )
+                    _oo_kwargs.update(_early_oo)
                     if unrestricted:
                         Ua, Ub, e_opt, grad_norm = optimize_orbitals(
                             elec_props=elec_props,
@@ -655,6 +751,27 @@ def riken_sqd_de(
                     # floor needed -> valid for large systems. Whether a rotation actually lowers the
                     # variational energy is checked by OO_CHECK below (rolled back if it does not).
                     # (oo_gtol was read once above, before the optimize_orbitals call.)
+                    if _dump_pending:
+                        _dump(Ua, Ub, e_opt)
+                        _dump_pending = False
+                    if _oo_probe_only:
+                        logger.info(
+                            "Trial %d: [freeze-orbitals] OO potential on this trial's RDMs "
+                            "(rotation NOT applied; SBD_FREEZE_ORBITALS_AT=%s): "
+                            "E_oo - E_davidson = %+.4f mHa  |grad|=%.3e",
+                            i, os.environ.get("SBD_FREEZE_ORBITALS_AT"),
+                            (e_opt - (float(_rdm_e) + float(elec_props.nuclear_repulsion_energy))) * 1000,
+                            grad_norm,
+                        )
+                        continue
+                    try:  # Plan E (SBD_DUMP_ROT_DIR; off by default): per-trial rotation, no RDMs
+                        staircase_probe.dump_rotation(
+                            i, Ua, Ub, _rot_tracker,
+                            e_davidson_total=float(_rdm_e) + float(elec_props.nuclear_repulsion_energy),
+                            e_oo=e_opt, logger=logger,
+                        )
+                    except Exception:
+                        logger.exception("Trial %d: rotation dump failed (continuing).", i)
                     _elec_props_before_oo = elec_props
                     elec_props = rotate_electronic_properties(elec_props, Ua, Ub)
                     logger.info("Trial %d: Hamiltonian rotated for next trial.", i)
@@ -740,7 +857,8 @@ def riken_sqd_de(
                         f"{objective_gap:+.3e}" if objective_gap is not None else "n/a",
                         grad_norm, oo_gtol,
                     )
-                    if grad_norm < oo_gtol and not getattr(parameters, "oo_refire_every_trial", False):
+                    if (grad_norm < oo_gtol and not _early_oo
+                            and not getattr(parameters, "oo_refire_every_trial", False)):
                         logger.info(
                             "Trial %d: |grad|=%.3e < oo_gtol=%.1e -> orbitals stationary "
                             "(generalized Brillouin condition). Freezing basis.",
@@ -751,6 +869,8 @@ def riken_sqd_de(
                     logger.exception(
                         "Trial %d: orbital optimization failed; keeping current integrals.", i
                     )
+                    if _dump_pending:
+                        _dump()
             else:
                 logger.info(
                     "Trial %d: RDMs not available in SBDResult (rdm1=%s); skipping orbital opt. "
