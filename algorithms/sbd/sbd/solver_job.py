@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -186,6 +187,11 @@ def _build_solver_args(solver: "SBDSolverJob") -> list[str]:
     # large sqd_dim it is catastrophic (e.g. ~31 GB per walker at sqd_dim=5e8, which stalled the
     # solver on Lustre I/O until it hit the wall-time limit before finishing the diagonalization).
     # The solver skips the dump when the flag is absent (sbdiag.h: only writes if the path != "").
+    # Plan Q (opt-in, PLAN_quantum_residual.md §4(b) (i)): SBD_DUMP_WF=1 asks for the BINARY form
+    # (".bin": float64 W[ia, ib], row-major over the solver's sorted alpha / beta lists) in the job
+    # directory, for the exact (full-space) solve only -- 1.9 GB for Fe2S2, never for production.
+    if os.environ.get("SBD_DUMP_WF", "").strip() == "1":
+        args.extend(["--dump_matrix_form_wf", "wf_matrix.bin"])
     if solver.solver_mode == "gpu":
         args.extend(["--adetfile", "AlphaDets.bin", "--carryoverfile", "carryover.txt"])
     if solver.method == "uhf":
