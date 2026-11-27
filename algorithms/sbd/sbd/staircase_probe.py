@@ -529,6 +529,9 @@ def dump_rotation(trial: int, ua, ub, tracker: RotationTracker, *, e_davidson_to
 # weight, with a score below the median of their level (as Plan E pe2_make_inject.pick_decoy).
 # SBD_FOCK_INJECT_TRIALS / SBD_FOCK_INJECT_STEPS (1-based recovery steps) limit where (default all).
 # No carryover (trial 0 of cr1, step 1 of cronly) -> nothing injected.
+# Closed shell (RHF, elec_props.unrestricted False; PLAN_trypsin_rhf_fock.md §4-2): alpha and beta share
+# one list, so it is scored with the spin-summed integrals and injected once (log "spin r"); the
+# opposite-spin reference Coulomb comes from the same two_body_tensor.
 
 _FOCK_RULES = ("SBD_FOCK_INJECT_EPS", "SBD_FOCK_INJECT_N", "SBD_FOCK_INJECT_FRAC")
 
@@ -672,10 +675,19 @@ def pick_decoy(score, sw, exc, chosen_idx, pool_idx, rng):
     return np.array(out, dtype=int)
 
 
+def _restricted(elec_props) -> bool:
+    """Closed-shell (RHF) integrals: one spatial set for both spins. Objects without the flag are UHF."""
+    return not getattr(elec_props, "unrestricted", True)
+
+
 def _spin_integrals(elec_props, spin: int, n_other: int):
-    """(h1, same-spin (pq|rs), opposite-spin reference Coulomb J_ref[p,q]) for spin 0=alpha / 1=beta."""
-    gab = np.asarray(elec_props.two_body_tensor_ab)
+    """(h1, same-spin (pq|rs), opposite-spin reference Coulomb J_ref[p,q]) for spin 0=alpha / 1=beta
+    (RHF: the same spatial integrals for both spins)."""
     ref = slice(0, n_other)
+    if _restricted(elec_props):
+        g = np.asarray(elec_props.two_body_tensor)
+        return np.asarray(elec_props.one_body_tensor), g, np.einsum("pqjj->pq", g[:, :, ref, ref])
+    gab = np.asarray(elec_props.two_body_tensor_ab)
     if spin == 0:
         return (np.asarray(elec_props.one_body_tensor), np.asarray(elec_props.two_body_tensor),
                 np.einsum("pqjj->pq", gab[:, :, ref, ref]))
@@ -697,7 +709,10 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
 
     ``protect`` (Plan Q; default None = unchanged): per-spin strings that the tail replacement must
     not drop, i.e. those Plan E (SBD_INJECT_FILE) just added at the tail of the same list. They are
-    moved to just after the HF string and are not counted as sampled."""
+    moved to just after the HF string and are not counted as sampled.
+
+    Closed shell (RHF): pass the one list as both ``ci_a`` and ``ci_b``; it is injected once and
+    returned for both spins."""
     cfg = fock_inject_config()
     if cfg is None:
         return ci_a, ci_b
@@ -712,14 +727,16 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
     lists = [np.asarray(ci_a, dtype=np.int64), np.asarray(ci_b, dtype=np.int64)]
     carry = [carry_ints(carryover_a, norb, nel[0]), carry_ints(carryover_b, norb, nel[1])]
     rule_txt = f"{cfg['rule']}={cfg['value']}"
-    for k in range(2):
+    restricted = _restricted(elec_props)
+    spin_tag = "r" if restricted else "ab"
+    for k in range(1 if restricted else 2):
         t0 = time.time()
         cur = lists[k]
         core = carry[k][:cfg["ncore"]]
         if core.size == 0:
             if logger is not None:
                 logger.info("[fock-inject] trial %d step %d spin %s: no carryover core; nothing injected",
-                            trial, step, "ab"[k])
+                            trial, step, spin_tag[k])
             continue
         n_prot = 0
         if protect is not None and len(protect[k]):
@@ -756,11 +773,13 @@ def fock_inject(trial: int, recovery_step: int, ci_a, ci_b, carryover_a, carryov
                 "[fock-inject] trial %d step %d spin %s: +%d (rule %s -> %d, cap %d, candidates %d, "
                 "already present %d, sampled %d, max %.4e (absent %.4e), score %s, mode %s, mean exc %.2f, "
                 "dimension %d, %.1f s)",
-                trial, step, "ab"[k], n_add, rule_txt, n_rule, cap, len(ch), n_present, n_sampled,
+                trial, step, spin_tag[k], n_add, rule_txt, n_rule, cap, len(ch), n_present, n_sampled,
                 s_max, float(s_abs.max()) if s_abs.size else 0.0,
                 cfg["score"], cfg["mode"],
                 float(exc_level(ch[chosen], nel[k]).mean()) if n_add else 0.0,
                 len(lists[k]), time.time() - t0)
+    if restricted:
+        lists[1] = lists[0]
     return lists[0].astype(np.longlong), lists[1].astype(np.longlong)
 
 

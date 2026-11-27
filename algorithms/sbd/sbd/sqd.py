@@ -601,10 +601,14 @@ def walker_sqd(
     # steers the next pass (+ best energy + carryover). Persist that state after every step so the
     # run can restart mid-trajectory. Opt-in via FE4S4_CKPT_DIR; per-(trial,walker) file so
     # multi-walker runs don't clobber each other. Absent env -> exact previous behavior.
+    # The ckpt also keeps walker_rng's state (rng_state, JSON string) and the carryover the next step
+    # starts from (next_carryover), so an extended run follows the uninterrupted trajectory exactly
+    # (PLAN_trypsin_rhf_fock.md §4-3). Older ckpts without them: rng from the seed, best carryover.
     _ckpt_dir = os.environ.get("FE4S4_CKPT_DIR", "").strip()
     _ckpt_path = None
     _resume_step = 0
     _resume_best = None
+    _resume_rng = None
     if _ckpt_dir:
         os.makedirs(_ckpt_dir, exist_ok=True)
         _ckpt_path = os.path.join(_ckpt_dir, f"ckpt_t{trial_index:02d}_w{walker_index}.npz")
@@ -614,17 +618,24 @@ def walker_sqd(
                 avg_occ = (_ck["occ_a"], _ck["occ_b"])
                 _resume_step = int(_ck["next_step"])
                 _resume_best = float(_ck["best_energy"])
-                _co = _ck["carryover"]
-                if _co.size:
-                    carryover = _co.astype(bool)
+                if "next_carryover" in _ck.files:
+                    carryover = _ck["next_carryover"].astype(bool)
+                else:
+                    _co = _ck["carryover"]
+                    if _co.size:
+                        carryover = _co.astype(bool)
+                if "rng_state" in _ck.files:
+                    _resume_rng = json.loads(str(_ck["rng_state"]))
                 logger.info(
-                    "[ckpt] RESUME from %s: completed %d step(s), best_energy so far=%.6f",
+                    "[ckpt] RESUME from %s: completed %d step(s), best_energy so far=%.6f (%s)",
                     _ckpt_path, _resume_step, float(_ck["best_energy"]),
+                    "rng restored" if _resume_rng is not None else "rng from seed",
                 )
             except Exception as _cexc:  # a corrupt ckpt must never block a fresh start
                 logger.info("[ckpt] ignoring unreadable checkpoint %s (%s)", _ckpt_path, _cexc)
                 _resume_step = 0
                 _resume_best = None
+                _resume_rng = None
     # -----------------------------------------------------------------------------------------
 
     # Per-walker random generator. recover_configurations and the subsample routines must draw
@@ -639,6 +650,8 @@ def walker_sqd(
         logger.info("[trial0-seed] trial 0 subsampling seed from SBD_TRIAL0_SEED=%s (run seed %d)",
                     os.environ["SBD_TRIAL0_SEED"], random_seed)
     walker_rng = np.random.default_rng(seed=walker_seed)
+    if _resume_rng is not None:
+        walker_rng.bit_generator.state = _resume_rng  # continue the stream where the ckpt left it
 
     best_energy: float | None = None
     if _resume_best is not None:
@@ -890,6 +903,11 @@ def walker_sqd(
                     recomb_boost=recomb_boost,
                     recomb_max_parents=recomb_max_parents,
                 )
+                # Plan F on the closed-shell path (SBD_FOCK_INJECT_*; off by default): one list for
+                # both spins, injected once (PLAN_trypsin_rhf_fock.md §4-2).
+                ci_strings, _ = fock_inject(trial_index, recovery_step, ci_strings, ci_strings,
+                                            carryover[:, :norb], carryover[:, :norb], elec_props,
+                                            num_elec_a, num_elec_b, logger=logger)
                 if batch == 0:
                     logger.info("[diag] recovery %d/%d dets: %s", recovery_step + 1,
                                 n_recovery_steps, _excitation_summary(ci_strings, num_elec_a))
@@ -1167,6 +1185,9 @@ def walker_sqd(
                         next_step=np.int64(recovery_step + 1),
                         best_energy=np.float64(best_energy if best_energy is not None else 0.0),
                         carryover=np.asarray(_co_save, dtype=bool),
+                        next_carryover=np.asarray(
+                            step_carryover if step_carryover is not None else carryover, dtype=bool),
+                        rng_state=np.array(json.dumps(walker_rng.bit_generator.state)),
                     )
                 os.replace(_tmp, _ckpt_path)
                 logger.info("[ckpt] wrote %s (next_step=%d, best=%.6f)",
@@ -1200,6 +1221,9 @@ def walker_sqd(
                         next_step=np.int64(recovery_step + 1),
                         best_energy=np.float64(best_energy if best_energy is not None else 0.0),
                         carryover=np.asarray(_co_save, dtype=bool),
+                        next_carryover=np.asarray(
+                            step_carryover if step_carryover is not None else carryover, dtype=bool),
+                        rng_state=np.array(json.dumps(walker_rng.bit_generator.state)),
                     )
                 os.replace(_tmp, _ckpt_path)
                 logger.info("[ckpt] wrote %s (next_step=%d, best=%.6f)",

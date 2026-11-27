@@ -482,6 +482,113 @@ def test_fock_inject_n_frac_decoy_hci(ham, monkeypatch):
     assert len(added) == 15 and added - singles                                     # some same-spin doubles
 
 
+
+# ── TR plan: Fock / HCI injection on the closed-shell (RHF) path ─────────────
+
+NA_R = 4                                            # closed shell: 4 alpha + 4 beta in NORB_F orbitals
+
+
+@pytest.fixture
+def ham_r():
+    rng = np.random.default_rng(11)
+    h1 = rng.standard_normal((NORB_F, NORB_F)); h1 = h1 + h1.T
+    return SimpleNamespace(one_body_tensor=h1, two_body_tensor=_sym_eri(NORB_F, rng), num_orbitals=NORB_F,
+                           unrestricted=False, one_body_tensor_b=None, two_body_tensor_ab=None,
+                           two_body_tensor_bb=None)
+
+
+def _exact_h_rhf(ham, det_a, det_b, ket_a, ket_b):
+    """<det|H|ket> from PySCF's spin-restricted FCI contraction (bit i = orbital i)."""
+    from pyscf.fci import cistring, direct_spin1
+    n, ne = NORB_F, (NA_R, NA_R)
+    ns = cistring.num_strings(n, NA_R)
+    c = np.zeros((ns, ns))
+    c[cistring.str2addr(n, NA_R, ket_a), cistring.str2addr(n, NA_R, ket_b)] = 1.0
+    h2 = direct_spin1.absorb_h1e(ham.one_body_tensor, ham.two_body_tensor, n, ne, 0.5)
+    hc = direct_spin1.contract_2e(h2, c, n, ne)
+    return hc[cistring.str2addr(n, NA_R, det_a), cistring.str2addr(n, NA_R, det_b)]
+
+
+def test_rhf_fock_scores_are_exact_single_elements(ham_r):
+    par, ref = 0b01101001, (1 << NA_R) - 1
+    h1, g, oj = sp._spin_integrals(ham_r, 0, NA_R)
+    assert h1 is not None and g is not None and np.allclose(oj, np.einsum("pqjj->pq", g[:, :, :NA_R, :NA_R]))
+    ch, s, w = sp.score_candidates(np.array([par]), sp.make_fock_of(h1, g, oj), NORB_F)
+    assert len(ch) == NA_R * (NORB_F - NA_R) and np.all(w == 1.0)
+    for x, sx in zip(ch.tolist(), s.tolist()):
+        assert abs(_exact_h_rhf(ham_r, x, ref, par, ref)) == pytest.approx(sx, abs=1e-10)   # alpha excitation
+        assert abs(_exact_h_rhf(ham_r, ref, x, ref, par)) == pytest.approx(sx, abs=1e-10)   # same for beta
+
+
+def test_rhf_hci_double_scores_are_exact(ham_r):
+    par, ref = 0b01101001, (1 << NA_R) - 1
+    _, g, _ = sp._spin_integrals(ham_r, 0, NA_R)
+    ch, s, w = sp.score_doubles(np.array([par]), g, NORB_F, 1)
+    assert len(ch) == 6 * 6
+    for x, sx in zip(ch.tolist(), s.tolist()):
+        assert bin(x).count("1") == NA_R and bin(x ^ par).count("1") == 4
+        assert abs(_exact_h_rhf(ham_r, x, ref, par, ref)) == pytest.approx(sx, abs=1e-10)
+
+
+def _inject_case_r(rng):
+    """One closed-shell list [HF, carryover (12), sampled (40)] and the carryover rows."""
+    from itertools import combinations
+    hf = (1 << NA_R) - 1
+    pool = [sum(1 << i for i in c) for c in combinations(range(NORB_F), NA_R)]
+    pool = [x for x in pool if x != hf]
+    rng.shuffle(pool)
+    co, samp = pool[:12], pool[12:52]
+    return np.array([hf] + co + samp, dtype=np.int64), _bool_rows(co, NORB_F)
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *a):
+        self.lines.append(msg % a)
+
+
+@pytest.mark.parametrize("score", ["fock", "hci"])
+def test_rhf_fock_inject_one_list_once(ham_r, monkeypatch, score):
+    cur, co = _inject_case_r(np.random.default_rng(8))
+    off = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R)
+    assert off[0] is cur and off[1] is cur                                   # off: unchanged
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.1"); monkeypatch.setenv("SBD_FOCK_INJECT_SCORE", score)
+    log = _Log()
+    fa, fb = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R, logger=log)
+    np.testing.assert_array_equal(fa, fb)                                     # alpha list == beta list
+    assert len(fa) == len(cur) and len(set(fa.tolist())) == len(fa)
+    n_add = len(set(fa.tolist()) - set(cur.tolist()))
+    assert n_add > 0
+    np.testing.assert_array_equal(fa[:len(cur) - n_add], cur[:len(cur) - n_add])   # HF + carryover kept
+    assert len(log.lines) == 1 and " spin r: +%d " % n_add in log.lines[0]   # injected once
+    # The same selection as the UHF code would make for one spin with the same integrals.
+    h1, g, oj = sp._spin_integrals(ham_r, 0, NA_R)
+    core = sp.carry_ints(co, NORB_F, NA_R)
+    ch, s, w = sp.score_candidates(core, sp.make_fock_of(h1, g, oj), NORB_F)
+    if score == "hci":
+        dch, ds, dw = sp.score_doubles(core[:71], g, NORB_F, len(core))
+        ch, s, w = sp._merge_max(np.concatenate([ch, dch]), np.concatenate([s, ds]), np.concatenate([w, dw]))
+    absent = ~np.isin(ch, cur)
+    order = np.flatnonzero(absent)[np.argsort(-s[absent], kind="stable")]
+    want = (s[absent] >= 0.1 * s.max()).sum()
+    cap = min(int(0.5 * (len(cur) - 13)), len(cur) // 2 - 1)
+    np.testing.assert_array_equal(fa[len(cur) - n_add:], ch[order[:min(want, cap)]])
+    empty = np.zeros((0, NORB_F), bool)                                       # no carryover: nothing
+    fa, fb = sp.fock_inject(4, 0, cur, cur, empty, empty, ham_r, NA_R, NA_R)
+    np.testing.assert_array_equal(fa, cur); np.testing.assert_array_equal(fb, cur)
+
+
+def test_rhf_decoy_runs(ham_r, monkeypatch):
+    cur, co = _inject_case_r(np.random.default_rng(9))
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "6"); monkeypatch.setenv("SBD_FOCK_INJECT_MODE", "decoy")
+    monkeypatch.setenv("SEED", "42")
+    fa, fb = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R)
+    np.testing.assert_array_equal(fa, fb)
+    assert 0 < len(set(fa.tolist()) - set(cur.tolist())) <= 6 and len(fa) == len(cur)
+
+
 # ── Plan Q: protected Plan E strings, origin of the subspace strings ─────────
 
 def test_fock_inject_keeps_protected_strings(ham, monkeypatch):
