@@ -24,7 +24,7 @@ ENV = ("SBD_DUMP_RDM_DIR", "SBD_DUMP_RDM_TRIALS", "SBD_FREEZE_SUBSPACE_AT", "SBD
        "SBD_DUMP_ROT_DIR", "SEED", "SBD_FOCK_INJECT_EPS", "SBD_FOCK_INJECT_N", "SBD_FOCK_INJECT_FRAC",
        "SBD_FOCK_INJECT_FMAX", "SBD_FOCK_INJECT_SCORE", "SBD_FOCK_INJECT_MODE", "SBD_FOCK_INJECT_NCORE",
        "SBD_FOCK_INJECT_NCORE_D", "SBD_FOCK_INJECT_TRIALS", "SBD_FOCK_INJECT_STEPS",
-       "SBD_DUMP_ORIGIN", "SBD_DUMP_ORIGIN_TRIALS", "SBD_ORIGIN_DIR")
+       "SBD_DUMP_ORIGIN", "SBD_DUMP_ORIGIN_TRIALS", "SBD_ORIGIN_DIR", "SBD_FOCK_INJECT_MAXREF")
 
 
 @pytest.fixture(autouse=True)
@@ -480,6 +480,207 @@ def test_fock_inject_n_frac_decoy_hci(ham, monkeypatch):
     singles = {par & ~(1 << i) | (1 << a) for par in core.tolist() for i in range(NORB_F) for a in range(NORB_F)
                if (par >> i) & 1 and not (par >> a) & 1}
     assert len(added) == 15 and added - singles                                     # some same-spin doubles
+
+
+
+# ── TR plan: Fock / HCI injection on the closed-shell (RHF) path ─────────────
+
+NA_R = 4                                            # closed shell: 4 alpha + 4 beta in NORB_F orbitals
+
+
+@pytest.fixture
+def ham_r():
+    rng = np.random.default_rng(11)
+    h1 = rng.standard_normal((NORB_F, NORB_F)); h1 = h1 + h1.T
+    return SimpleNamespace(one_body_tensor=h1, two_body_tensor=_sym_eri(NORB_F, rng), num_orbitals=NORB_F,
+                           unrestricted=False, one_body_tensor_b=None, two_body_tensor_ab=None,
+                           two_body_tensor_bb=None)
+
+
+def _exact_h_rhf(ham, det_a, det_b, ket_a, ket_b):
+    """<det|H|ket> from PySCF's spin-restricted FCI contraction (bit i = orbital i)."""
+    from pyscf.fci import cistring, direct_spin1
+    n, ne = NORB_F, (NA_R, NA_R)
+    ns = cistring.num_strings(n, NA_R)
+    c = np.zeros((ns, ns))
+    c[cistring.str2addr(n, NA_R, ket_a), cistring.str2addr(n, NA_R, ket_b)] = 1.0
+    h2 = direct_spin1.absorb_h1e(ham.one_body_tensor, ham.two_body_tensor, n, ne, 0.5)
+    hc = direct_spin1.contract_2e(h2, c, n, ne)
+    return hc[cistring.str2addr(n, NA_R, det_a), cistring.str2addr(n, NA_R, det_b)]
+
+
+def test_rhf_fock_scores_are_exact_single_elements(ham_r):
+    par, ref = 0b01101001, (1 << NA_R) - 1
+    h1, g, oj = sp._spin_integrals(ham_r, 0, NA_R)
+    assert h1 is not None and g is not None and np.allclose(oj, np.einsum("pqjj->pq", g[:, :, :NA_R, :NA_R]))
+    ch, s, w = sp.score_candidates(np.array([par]), sp.make_fock_of(h1, g, oj), NORB_F)
+    assert len(ch) == NA_R * (NORB_F - NA_R) and np.all(w == 1.0)
+    for x, sx in zip(ch.tolist(), s.tolist()):
+        assert abs(_exact_h_rhf(ham_r, x, ref, par, ref)) == pytest.approx(sx, abs=1e-10)   # alpha excitation
+        assert abs(_exact_h_rhf(ham_r, ref, x, ref, par)) == pytest.approx(sx, abs=1e-10)   # same for beta
+
+
+def test_rhf_hci_double_scores_are_exact(ham_r):
+    par, ref = 0b01101001, (1 << NA_R) - 1
+    _, g, _ = sp._spin_integrals(ham_r, 0, NA_R)
+    ch, s, w = sp.score_doubles(np.array([par]), g, NORB_F, 1)
+    assert len(ch) == 6 * 6
+    for x, sx in zip(ch.tolist(), s.tolist()):
+        assert bin(x).count("1") == NA_R and bin(x ^ par).count("1") == 4
+        assert abs(_exact_h_rhf(ham_r, x, ref, par, ref)) == pytest.approx(sx, abs=1e-10)
+
+
+def _inject_case_r(rng):
+    """One closed-shell list [HF, carryover (12), sampled (40)] and the carryover rows."""
+    from itertools import combinations
+    hf = (1 << NA_R) - 1
+    pool = [sum(1 << i for i in c) for c in combinations(range(NORB_F), NA_R)]
+    pool = [x for x in pool if x != hf]
+    rng.shuffle(pool)
+    co, samp = pool[:12], pool[12:52]
+    return np.array([hf] + co + samp, dtype=np.int64), _bool_rows(co, NORB_F)
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *a):
+        self.lines.append(msg % a)
+
+
+@pytest.mark.parametrize("score", ["fock", "hci"])
+def test_rhf_fock_inject_one_list_once(ham_r, monkeypatch, score):
+    cur, co = _inject_case_r(np.random.default_rng(8))
+    off = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R)
+    assert off[0] is cur and off[1] is cur                                   # off: unchanged
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.1"); monkeypatch.setenv("SBD_FOCK_INJECT_SCORE", score)
+    log = _Log()
+    fa, fb = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R, logger=log)
+    np.testing.assert_array_equal(fa, fb)                                     # alpha list == beta list
+    assert len(fa) == len(cur) and len(set(fa.tolist())) == len(fa)
+    n_add = len(set(fa.tolist()) - set(cur.tolist()))
+    assert n_add > 0
+    np.testing.assert_array_equal(fa[:len(cur) - n_add], cur[:len(cur) - n_add])   # HF + carryover kept
+    assert len(log.lines) == 1 and " spin r: +%d " % n_add in log.lines[0]   # injected once
+    # The same selection as the UHF code would make for one spin with the same integrals.
+    h1, g, oj = sp._spin_integrals(ham_r, 0, NA_R)
+    core = sp.carry_ints(co, NORB_F, NA_R)
+    ch, s, w = sp.score_candidates(core, sp.make_fock_of(h1, g, oj), NORB_F)
+    if score == "hci":
+        dch, ds, dw = sp.score_doubles(core[:71], g, NORB_F, len(core))
+        ch, s, w = sp._merge_max(np.concatenate([ch, dch]), np.concatenate([s, ds]), np.concatenate([w, dw]))
+    absent = ~np.isin(ch, cur)
+    order = np.flatnonzero(absent)[np.argsort(-s[absent], kind="stable")]
+    want = (s[absent] >= 0.1 * s.max()).sum()
+    cap = min(int(0.5 * (len(cur) - 13)), len(cur) // 2 - 1)
+    np.testing.assert_array_equal(fa[len(cur) - n_add:], ch[order[:min(want, cap)]])
+    empty = np.zeros((0, NORB_F), bool)                                       # no carryover: nothing
+    fa, fb = sp.fock_inject(4, 0, cur, cur, empty, empty, ham_r, NA_R, NA_R)
+    np.testing.assert_array_equal(fa, cur); np.testing.assert_array_equal(fb, cur)
+
+
+def test_rhf_decoy_runs(ham_r, monkeypatch):
+    cur, co = _inject_case_r(np.random.default_rng(9))
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "6"); monkeypatch.setenv("SBD_FOCK_INJECT_MODE", "decoy")
+    monkeypatch.setenv("SEED", "42")
+    fa, fb = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R)
+    np.testing.assert_array_equal(fa, fb)
+    assert 0 < len(set(fa.tolist()) - set(cur.tolist())) <= 6 and len(fa) == len(cur)
+
+
+
+# ── TR plan W3: eps threshold relative to the excitation-raising moves (SBD_FOCK_INJECT_MAXREF=raise) ──
+
+def _exc(x, n):
+    return n - bin(int(x) & ((1 << n) - 1)).count("1")
+
+
+def _brute_raising(core, fock_of, g_same, n, core_d=None):
+    """max w_r * score over children whose excitation level is the parent's + 1 (singles) / + 2 (doubles)."""
+    best = 0.0
+    for r, par in enumerate(core.tolist()):
+        ch, sc, _ = sp.score_candidates(np.array([par]), fock_of, NORB_F)
+        keep = [x for x in range(len(ch)) if _exc(ch[x], n) == _exc(par, n) + 1]
+        if keep:
+            best = max(best, (len(core) - r) / len(core) * sc[keep].max())
+    if core_d is not None:
+        for r, par in enumerate(core_d.tolist()):
+            ch, sc, _ = sp.score_doubles(np.array([par]), g_same, NORB_F, 1)
+            keep = [x for x in range(len(ch)) if _exc(ch[x], n) == _exc(par, n) + 2]
+            if keep:
+                best = max(best, (len(core) - r) / len(core) * sc[keep].max())
+    return best
+
+
+@pytest.mark.parametrize("kind", ["rhf", "uhf_a", "uhf_b"])
+def test_raising_max_matches_bruteforce(ham, ham_r, kind):
+    rng = np.random.default_rng(12)
+    if kind == "rhf":
+        e, n, n_other, k = ham_r, NA_R, NA_R, 0
+    else:
+        e, k = ham, (0 if kind == "uhf_a" else 1)
+        n, n_other = (NA_F, NB_F) if k == 0 else (NB_F, NA_F)
+    from itertools import combinations
+    pool = [sum(1 << i for i in c) for c in combinations(range(NORB_F), n)]
+    core = np.array(rng.choice(pool, size=9, replace=False), dtype=np.int64)
+    h1, g, oj = sp._spin_integrals(e, k, n_other)
+    f = sp.make_fock_of(h1, g, oj)
+    assert sp.raising_max(core, f, NORB_F, n) == pytest.approx(_brute_raising(core, f, g, n), abs=1e-12)
+    got = sp.raising_max(core, f, NORB_F, n, g, core[:4], len(core))
+    assert got == pytest.approx(_brute_raising(core, f, g, n, core_d=core[:4]), abs=1e-12)
+
+
+def _rotated_rhf(ham_r):
+    """ham_r made HF-canonical (RHF Fock of orbitals 0..n-1 diagonal, orbital energies spread over -6..6), then
+    rotated inside the occupied and the virtual blocks only: HF unchanged, basis non-canonical, as after OO."""
+    g = ham_r.two_body_tensor
+    fock = ham_r.one_body_tensor + 2 * np.einsum("pqjj->pq", g[:, :, :NA_R, :NA_R]) - np.einsum("pjjq->pq", g[:, :NA_R, :NA_R, :])
+    h1 = ham_r.one_body_tensor - (fock - np.diag(np.diag(fock))) + np.diag(np.linspace(-6, 6, NORB_F))
+    u = scipy.linalg.block_diag(_rand_orth(NA_R, 3), _rand_orth(NORB_F - NA_R, 4))
+    return SimpleNamespace(one_body_tensor=u.T @ h1 @ u,
+                           two_body_tensor=np.einsum("pqrs,pa,qb,rc,sd->abcd", ham_r.two_body_tensor, u, u, u, u),
+                           num_orbitals=NORB_F, unrestricted=False, one_body_tensor_b=None,
+                           two_body_tensor_ab=None, two_body_tensor_bb=None)
+
+
+class _Log2:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *a):
+        self.lines.append(msg % a)
+
+
+def test_maxref_raise_threshold_and_default(ham_r, monkeypatch):
+    rot = _rotated_rhf(ham_r)
+    cur, co = _inject_case_r(np.random.default_rng(21))
+    monkeypatch.setenv("SBD_FOCK_INJECT_EPS", "0.3")
+    base = sp.fock_inject(4, 0, cur, cur, co, co, rot, NA_R, NA_R)[0]
+    monkeypatch.setenv("SBD_FOCK_INJECT_MAXREF", "all")
+    np.testing.assert_array_equal(base, sp.fock_inject(4, 0, cur, cur, co, co, rot, NA_R, NA_R)[0])   # default = all
+    monkeypatch.setenv("SBD_FOCK_INJECT_MAXREF", "raise")
+    log = _Log2()
+    ra, rb = sp.fock_inject(4, 0, cur, cur, co, co, rot, NA_R, NA_R, logger=log)
+    np.testing.assert_array_equal(ra, rb)
+    assert any(x.startswith("[fock-inject-ref] trial 4 step 1 spin r:") for x in log.lines)
+    # the count follows the rule with the raising-move max; candidates and their order are unchanged
+    core = sp.carry_ints(co, NORB_F, NA_R)
+    f = sp.make_fock_of(*sp._spin_integrals(rot, 0, NA_R))
+    ch, s, _ = sp.score_candidates(core, f, NORB_F)
+    s_ref = sp.raising_max(core, f, NORB_F, NA_R)
+    absent = ~np.isin(ch, cur)
+    order = np.flatnonzero(absent)[np.argsort(-s[absent], kind="stable")]
+    cap = min(int(0.5 * (len(cur) - 13)), len(cur) // 2 - 1)
+    want = min(int((s[absent] >= 0.3 * s_ref).sum()), cap)
+    n_add = len(set(ra.tolist()) - set(cur.tolist()))
+    assert n_add == want
+    np.testing.assert_array_equal(ra[len(cur) - n_add:], ch[order[:n_add]])
+    assert n_add >= len(set(base.tolist()) - set(cur.tolist()))
+    assert s.max() > s_ref                    # in the rotated basis the overall max is set by non-raising moves
+    monkeypatch.setenv("SBD_FOCK_INJECT_MAXREF", "bogus")
+    with pytest.raises(ValueError):
+        sp.fock_inject(4, 0, cur, cur, co, co, rot, NA_R, NA_R)
 
 
 # ── Plan Q: protected Plan E strings, origin of the subspace strings ─────────
