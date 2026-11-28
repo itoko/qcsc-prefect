@@ -377,9 +377,30 @@ def riken_sqd_de(
     _h2_prev = None  # (alphadets, betadets, E) of the previous trial, for SBD_H2_PROBE
 
     # Start differential evoluation
+    if closed_loop.sim_resample_enabled() and not _state_dir:
+        raise ValueError("SBD_SIM_RESAMPLE_CMD needs SBD_STATE_SAVE_DIR (the sampler reads the saved state)")
     for i in range(_start_trial, parameters.de_params.iterations):
         if i > _start_trial:
             _save_state(i)
+            if closed_loop.sim_resample_enabled():
+                # Plan QR C3 (SBD_SIM_RESAMPLE_CMD; off by default): draw this trial's pool from the state
+                # just saved (rotated integrals; the sampler re-solves CC there). Trial _start_trial reads the
+                # pool given for it in SBD_SAVED_PER_TRIAL (made beforehand, e.g. C1's).
+                import subprocess
+                import time as _time
+
+                _argv, _pool = closed_loop.sim_resample_argv(i, closed_loop.state_path(_state_dir, i))
+                _t = _time.perf_counter()
+                logger.info("[sim-resample] trial %d: %s", i, " ".join(_argv))
+                _r = subprocess.run(_argv, capture_output=True, text=True)
+                for _line in (_r.stdout or "").splitlines():
+                    if _line.startswith("[sim-"):
+                        logger.info("[sim-resample] trial %d: %s", i, _line)
+                if _r.returncode != 0 or not os.path.exists(_pool):
+                    logger.error("[sim-resample] trial %d failed (rc=%d): %s", i, _r.returncode,
+                                 (_r.stderr or "")[-2000:])
+                    raise RuntimeError(f"SBD_SIM_RESAMPLE_CMD failed for trial {i}")
+                logger.info("[sim-resample] trial %d: wrote %s (%.1f s)", i, _pool, _time.perf_counter() - _t)
         if i in _branch_save:
             try:
                 staircase_probe.save_branch(i, elec_props, state, _rot_tracker, logger=logger)

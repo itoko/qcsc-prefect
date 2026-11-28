@@ -204,3 +204,27 @@ def test_prune_keeps_every_nth_and_two_newest(tmp_path, monkeypatch):
     assert kept == [0, 5, 10, 11, 12]
     monkeypatch.delenv("SBD_STATE_KEEP_EVERY")
     assert closed_loop.prune_states(str(tmp_path), 13) == []
+
+
+# ── Plan QR C3: per-trial noiseless resampling command ─────────────────────────
+
+def test_sim_resample_argv(monkeypatch):
+    import sys
+
+    from sbd import closed_loop as cl
+
+    monkeypatch.delenv("SBD_SIM_RESAMPLE_CMD", raising=False)
+    assert not cl.sim_resample_enabled()
+    monkeypatch.setenv("SBD_SIM_RESAMPLE_CMD", "{python} /kit/sim_sample.py --state {state} --seed {seed} --out {out}")
+    monkeypatch.setenv("SBD_SAVED_PER_TRIAL", "file:///p/pool_t{trial:03d}.npz")
+    monkeypatch.setenv("SEED", "43")
+    assert cl.sim_resample_enabled()
+    argv, out = cl.sim_resample_argv(7, "/s/state_t007.npz")
+    assert out == "/p/pool_t007.npz"
+    assert argv == [sys.executable, "/kit/sim_sample.py", "--state", "/s/state_t007.npz", "--seed", "43007",
+                    "--out", "/p/pool_t007.npz"]
+    monkeypatch.setenv("SBD_SAVED_PER_TRIAL", "file:///p/pool.npz")
+    import pytest
+
+    with pytest.raises(ValueError):
+        cl.sim_resample_argv(7, "/s/state_t007.npz")

@@ -451,8 +451,11 @@ def _inject_strings(path: str):
     return _INJECT_CACHE[path]
 
 
-def modify_subspace(trial: int, ci_a, ci_b, num_elec_a: int, num_elec_b: int, logger=None):
-    """Return the (alpha, beta) lists after the opt-in exclusion / injection (unchanged when off)."""
+def modify_subspace(trial: int, ci_a, ci_b, num_elec_a: int, num_elec_b: int, logger=None, restricted=False):
+    """Return the (alpha, beta) lists after the opt-in exclusion / injection (unchanged when off).
+
+    ``restricted`` (Plan QR, closed shell): ``ci_a`` is the one list of both spins; only the file's
+    ``alpha`` column is used, the list is changed once (log "spin r") and returned for both spins."""
     excl = os.environ.get("SBD_EXCLUDE_EXC", "").strip() == "1"
     inj_path = os.environ.get("SBD_INJECT_FILE", "").strip()
     inj_trials = parse_trials(os.environ.get("SBD_INJECT_TRIALS")) if inj_path else set()
@@ -463,18 +466,20 @@ def modify_subspace(trial: int, ci_a, ci_b, num_elec_a: int, num_elec_b: int, lo
         return ci_a, ci_b
     lists = [np.asarray(ci_a, dtype=np.int64), np.asarray(ci_b, dtype=np.int64)]
     nel = (num_elec_a, num_elec_b)
+    spins = (0,) if restricted else (0, 1)
+    tag = "r" if restricted else "ab"
     if excl:
-        for k in range(2):
+        for k in spins:
             drop = _single_of_ref(lists[k], nel[k])
             lists[k] = lists[k][~drop]
             if logger is not None:
                 logger.info("[exclude] trial %d spin %s: dropped %d single excitations of the reference "
-                            "(%d strings left)", trial, "ab"[k], int(drop.sum()), len(lists[k]))
+                            "(%d strings left)", trial, tag[k], int(drop.sum()), len(lists[k]))
     if inj_on:
         path = resolve_seed_path(inj_path)
         files = _inject_strings(path)
         n_req = _env_int("SBD_INJECT_N")
-        for k in range(2):
+        for k in spins:
             cur = lists[k]
             present = set(cur.tolist())
             pop_ok = [int(s) for s in files[k].tolist() if bin(int(s)).count("1") == nel[k]]
@@ -485,9 +490,11 @@ def modify_subspace(trial: int, ci_a, ci_b, num_elec_a: int, num_elec_b: int, lo
                 lists[k] = np.concatenate([cur[:len(cur) - n_add], np.asarray(add[:n_add], dtype=np.int64)])
             if logger is not None:
                 logger.info("[inject] trial %d spin %s: +%d strings from %s (requested %s, %d already present, "
-                            "%d with wrong electron count; dimension %d)", trial, "ab"[k], n_add, path,
+                            "%d with wrong electron count; dimension %d)", trial, tag[k], n_add, path,
                             "all" if n_req is None else n_req, len(pop_ok) - len(add),
                             len(files[k]) - len(pop_ok), len(lists[k]))
+    if restricted:
+        lists[1] = lists[0]
     return lists[0].astype(np.longlong), lists[1].astype(np.longlong)
 
 

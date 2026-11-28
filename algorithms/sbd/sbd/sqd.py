@@ -903,11 +903,38 @@ def walker_sqd(
                     recomb_boost=recomb_boost,
                     recomb_max_parents=recomb_max_parents,
                 )
+                _ci_drawn_r = ci_strings
+                # Plan E / Plan QR B arms on the closed-shell path (SBD_INJECT_FILE; off by default):
+                # the file's alpha column is injected once into the one list.
+                ci_strings, _ = modify_subspace(trial_index, ci_strings, ci_strings, num_elec_a, num_elec_b,
+                                                logger=logger, restricted=True)
+                _ci_e_r = ci_strings
+                _inj_e_r = np.setdiff1d(_ci_e_r, _ci_drawn_r)
                 # Plan F on the closed-shell path (SBD_FOCK_INJECT_*; off by default): one list for
-                # both spins, injected once (PLAN_trypsin_rhf_fock.md §4-2).
+                # both spins, injected once (PLAN_trypsin_rhf_fock.md §4-2). Strings Plan E just added
+                # are kept by its tail replacement.
                 ci_strings, _ = fock_inject(trial_index, recovery_step, ci_strings, ci_strings,
                                             carryover[:, :norb], carryover[:, :norb], elec_props,
-                                            num_elec_a, num_elec_b, logger=logger)
+                                            num_elec_a, num_elec_b, logger=logger,
+                                            protect=(_inj_e_r, _inj_e_r) if len(_inj_e_r) else None)
+                if batch == 0 and _probe.origin_enabled():
+                    # Plan Q (SBD_DUMP_ORIGIN=1; off by default) on the closed-shell path: the one list
+                    # is drawn from both halves of the bitstrings, so "sample" / "recovered" use both.
+                    _post_r = _spin_halves_as_ints(bitstrings_post, norb)
+                    _code_r = _probe.classify_origin(
+                        ci_strings, num_elec=num_elec_a, inject_e=_inj_e_r,
+                        inject_f=np.setdiff1d(ci_strings, _ci_e_r),
+                        carryover=_probe.carry_ints(carryover[:, :norb], norb, num_elec_a),
+                        sample=np.union1d(_raw_ints[0], _raw_ints[1]),
+                        recovered=np.union1d(_post_r[0], _post_r[1]),
+                        seed=_cisd_strings(norb, num_elec_a, seed_cisd) if seed_cisd else (),
+                    )
+                    logger.info("[origin] trial %d step %d spin r: %s", trial_index, recovery_step + 1,
+                                _probe.origin_counts(_code_r))
+                    _origin_lists = (ci_strings, ci_strings)
+                    _origin_codes = [_code_r, _code_r]
+                    _origin_registry = _probe.update_origin_registry(
+                        walker_index, trial_index, _origin_lists, _origin_codes)
                 if batch == 0:
                     logger.info("[diag] recovery %d/%d dets: %s", recovery_step + 1,
                                 n_recovery_steps, _excitation_summary(ci_strings, num_elec_a))
@@ -921,6 +948,19 @@ def walker_sqd(
                     )
                 )
                 this_carryover = sbd_result.carryover_bitstrings
+                if batch == 0 and _probe.origin_enabled():
+                    try:
+                        _co_r = _probe.carry_ints(sbd_result.carryover_bitstrings, norb, num_elec_a)
+                        _co_first_r = _probe.first_origin(_co_r, _origin_registry[0])
+                        logger.info("[origin-co] trial %d step %d spin r: n=%d first: %s",
+                                    trial_index, recovery_step + 1, len(_co_r),
+                                    _probe.origin_counts(_co_first_r, _probe.ORIGIN_NAMES))
+                        if _probe.origin_dump_enabled(trial_index):
+                            _probe.dump_origin(trial_index, recovery_step + 1, walker_index, _origin_lists,
+                                               _origin_codes, (_co_r, _co_r), (_co_first_r, _co_first_r),
+                                               logger=logger)
+                    except Exception:
+                        logger.exception("[origin] carryover lookup failed (continuing).")
                 this_net_dim = int(len(ci_strings) ** 2)
                 this_save_kwargs = dict(alphadets=ci_strings)
 

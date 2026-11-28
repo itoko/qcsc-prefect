@@ -734,3 +734,32 @@ def test_origin_registry_keeps_first_origin(tmp_path, monkeypatch):
     assert not sp.origin_dump_enabled(1)
     monkeypatch.setenv("SBD_DUMP_ORIGIN_TRIALS", "1,5")
     assert sp.origin_dump_enabled(1) and not sp.origin_dump_enabled(2)
+
+
+# ── Plan QR: Plan E injection and its protection on the closed-shell path ─────
+
+def test_rhf_modify_subspace_injects_once(tmp_path, monkeypatch):
+    cur, _ = _inject_case_r(np.random.default_rng(12))
+    from itertools import combinations
+    pool = [sum(1 << i for i in c) for c in combinations(range(NORB_F), NA_R)]
+    new = [x for x in pool if x not in set(cur.tolist())][:5]
+    f = tmp_path / "inj.npz"
+    np.savez(f, alpha=np.array(new), beta=np.array(pool[:3]))          # beta column must be ignored
+    monkeypatch.setenv("SBD_INJECT_FILE", str(f)); monkeypatch.setenv("SBD_INJECT_TRIALS", "10")
+    log = _Log()
+    fa, fb = sp.modify_subspace(10, cur, cur, NA_R, NA_R, logger=log, restricted=True)
+    np.testing.assert_array_equal(fa, fb)
+    assert set(fa.tolist()) - set(cur.tolist()) == set(new) and len(fa) == len(cur)
+    assert len(log.lines) == 1 and " spin r: +5 " in log.lines[0]
+    assert sp.modify_subspace(9, cur, cur, NA_R, NA_R, restricted=True)[0] is not None   # other trial: unchanged
+    np.testing.assert_array_equal(sp.modify_subspace(9, cur, cur, NA_R, NA_R, restricted=True)[0], cur)
+
+
+def test_rhf_fock_inject_keeps_protected(ham_r, monkeypatch):
+    cur, co = _inject_case_r(np.random.default_rng(13))
+    monkeypatch.setenv("SBD_FOCK_INJECT_N", "6")
+    prot = cur[-4:]
+    fa, fb = sp.fock_inject(4, 0, cur, cur, co, co, ham_r, NA_R, NA_R, protect=(prot, prot))
+    np.testing.assert_array_equal(fa, fb)
+    assert set(prot.tolist()) <= set(fa.tolist()) and set(cur[:13].tolist()) <= set(fa.tolist())
+    assert len(set(fa.tolist()) - set(cur.tolist())) == 6 and len(fa) == len(cur)

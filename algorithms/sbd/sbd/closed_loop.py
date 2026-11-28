@@ -89,6 +89,32 @@ def state_save_dir() -> str:
     return os.environ.get("SBD_STATE_SAVE_DIR", "").strip()
 
 
+def sim_resample_argv(trial: int, state_file: str, *, cmd: str | None = None, per_trial: str | None = None,
+                      seed: str | None = None) -> tuple[list[str], str]:
+    """Plan QR C3 (opt-in): the command that draws trial ``trial``'s pool from the state saved before it.
+
+    ``SBD_SIM_RESAMPLE_CMD`` is a template with ``{python}`` (this interpreter), ``{state}`` (state_tNNN.npz),
+    ``{out}`` (the pool trial ``trial`` reads, from ``SBD_SAVED_PER_TRIAL`` without ``file://``),
+    ``{trial}`` and ``{seed}`` (``SEED`` x 1000 + trial). Returns (argv, out path)."""
+    import shlex
+    import sys
+
+    cmd = os.environ.get("SBD_SIM_RESAMPLE_CMD", "").strip() if cmd is None else cmd
+    per_trial = os.environ.get("SBD_SAVED_PER_TRIAL", "").strip() if per_trial is None else per_trial
+    if not per_trial or "{trial" not in per_trial:
+        raise ValueError("SBD_SIM_RESAMPLE_CMD needs SBD_SAVED_PER_TRIAL with a {trial} field")
+    out = per_trial.format(trial=trial)
+    out = out[len("file://"):] if out.startswith("file://") else out
+    base = os.environ.get("SEED", "0").strip() if seed is None else seed
+    s = int(base or 0) * 1000 + trial
+    argv = shlex.split(cmd.format(python=sys.executable, state=state_file, out=out, trial=trial, seed=s))
+    return argv, out
+
+
+def sim_resample_enabled() -> bool:
+    return bool(os.environ.get("SBD_SIM_RESAMPLE_CMD", "").strip())
+
+
 def loader_skip_enabled() -> bool:
     """``SBD_STATE_SKIP_LOADER=0`` keeps loading the FCIDUMP when a state is restored (the old behaviour)."""
     return os.environ.get("SBD_STATE_SKIP_LOADER", "1").strip() != "0"
