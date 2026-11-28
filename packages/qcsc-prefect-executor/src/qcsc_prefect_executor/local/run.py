@@ -23,7 +23,9 @@ def _truncate_log(text: str) -> str:
         # solver output (e.g. the last Davidson iterations) is not lost. Unset/0: unchanged.
         tail = int(os.environ.get("QCSC_LOCAL_LOG_TAIL", "0") or 0)
         cut = len(text) - MAX_LOG_SIZE
-        if tail > 0 and cut > tail:
+        if tail > 0 and cut <= tail:
+            return text  # the rest fits in the tail: nothing is dropped
+        if tail > 0:
             return (text[:MAX_LOG_SIZE] + f"... (truncated {cut - tail} chars; last {tail} chars follow)\n"
                     + text[-tail:])
         return text[:MAX_LOG_SIZE] + f"... (truncated {cut} chars)"

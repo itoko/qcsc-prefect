@@ -17,6 +17,8 @@ def test_tail_kept(monkeypatch):
     out = local_run._truncate_log(text)
     assert out.startswith("a" * local_run.MAX_LOG_SIZE + "... (truncated 309 chars; last 100 chars follow)\n")
     assert out.endswith(text[-100:]) and out.endswith("LAST LINE")
-    # a cut shorter than the tail: plain truncation (nothing to skip)
+    # the part beyond the head fits in the tail: the whole text is kept
     short = "a" * local_run.MAX_LOG_SIZE + "b" * 50
-    assert local_run._truncate_log(short).endswith("... (truncated 50 chars)")
+    assert local_run._truncate_log(short) == short
+    exact = "a" * local_run.MAX_LOG_SIZE + "b" * 100
+    assert local_run._truncate_log(exact) == exact
