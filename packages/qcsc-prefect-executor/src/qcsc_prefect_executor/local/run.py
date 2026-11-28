@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,14 @@ MAX_LOG_SIZE = 10_000
 
 def _truncate_log(text: str) -> str:
     if len(text) > MAX_LOG_SIZE:
-        return text[:MAX_LOG_SIZE] + f"... (truncated {len(text) - MAX_LOG_SIZE} chars)"
+        # QCSC_LOCAL_LOG_TAIL=N (opt-in): also keep the last N characters, so the end of a long
+        # solver output (e.g. the last Davidson iterations) is not lost. Unset/0: unchanged.
+        tail = int(os.environ.get("QCSC_LOCAL_LOG_TAIL", "0") or 0)
+        cut = len(text) - MAX_LOG_SIZE
+        if tail > 0 and cut > tail:
+            return (text[:MAX_LOG_SIZE] + f"... (truncated {cut - tail} chars; last {tail} chars follow)\n"
+                    + text[-tail:])
+        return text[:MAX_LOG_SIZE] + f"... (truncated {cut} chars)"
     return text
 
 
